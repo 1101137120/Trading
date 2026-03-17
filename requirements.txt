@@ -1,0 +1,7 @@
+certifi>=2023.0.0
+shioaji>=1.1.0
+pandas>=2.0.0
+numpy>=1.24.0
+pyyaml>=6.0
+schedule>=1.2.0
+rich>=13.0.0

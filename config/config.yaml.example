@@ -1,0 +1,71 @@
+# 複製此檔為 config.yaml 並填入設定
+# 注意：config.yaml 不可提交到 git
+
+broker:
+  api_key: ""          # 填入你的 API Key
+  secret_key: ""       # 填入你的 Secret Key
+  ca_path: ""          # 憑證路徑，例如 /path/to/Sinopac.pfx
+  ca_passwd: ""        # 憑證密碼
+  person_id: ""        # 身分證字號（activate_ca 用）
+  simulation: true     # true = 模擬模式，false = 正式下單
+
+# 大盤趨勢過濾：熊市時暫停開新倉
+market_filter:
+  enabled: true           # 是否啟用
+  proxy_code: "0050"     # 大盤代理（0050 元大台灣50）
+  ma_period: 20          # 均線週期，收盤 > MA 才允許多單
+
+risk:
+  max_positions: 5             # 最多同時持倉檔數
+  max_position_pct: 0.20       # 單一持倉最大佔總資金比例 (20%)
+  stop_loss_pct: 0.05          # 停損比例 (5%)
+  take_profit_pct: 0.15        # 停利比例 (15%)
+  max_daily_loss_pct: 0.03     # 單日最大虧損比例 (3%)
+  min_order_value: 10000       # 最小下單金額（元）
+  max_order_value: 500000      # 最大單筆下單金額（元）
+
+screener:
+  exchanges: ["TSE", "OTC"]    # 篩選交易所
+  min_price: 10.0              # 最低股價
+  max_price: 1000.0            # 最高股價
+  min_volume: 1000             # 最低成交量（張）
+  min_avg_volume_5d: 2000      # 5日均量最低門檻（張）
+  max_stocks: 50               # 每次最多篩選幾檔
+
+strategies:
+  active: ["momentum", "breakout"]  # 啟用的策略，可選: momentum, mean_reversion, breakout
+
+  momentum:
+    rsi_period: 14
+    rsi_oversold: 35
+    rsi_overbought: 65
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    lookback_days: 30
+
+  mean_reversion:
+    bb_period: 20
+    bb_std: 2.0
+    rsi_period: 14
+    rsi_low: 30
+    rsi_high: 70
+    lookback_days: 30
+
+  breakout:
+    volume_multiplier: 2.0     # 成交量為均量幾倍以上才算突破
+    price_breakout_pct: 0.02   # 突破前高幾%才算突破
+    lookback_days: 20
+    confirm_days: 3            # 確認突破所需天數
+
+schedule:
+  market_open: "09:00"
+  market_close: "13:30"
+  scan_interval_minutes: 30   # 每幾分鐘掃描一次
+  rebalance_time: "09:15"     # 開盤後幾分鐘開始執行
+
+logging:
+  level: "INFO"               # DEBUG / INFO / WARNING / ERROR
+  file: "logs/trading.log"
+  max_bytes: 10485760         # 10 MB
+  backup_count: 5
