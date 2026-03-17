@@ -19,6 +19,9 @@ risk:
   consecutive_loss_pause:
     count: 3           # 連續虧損幾次後暫停開倉
     pause_minutes: 60  # 暫停時間（分鐘）
+  trailing_stop:
+    activation_pct: 0.10   # 獲利達 10% 後啟動移動停損
+    trail_pct: 0.05         # 從最高點回落 5% 出場
 
 value_screener:
   max_pe: 20
@@ -73,6 +76,7 @@ schedule:
   market_close: "13:30"
   scan_interval_minutes: 30
   heartbeat_interval_minutes: 30  # 心跳通知間隔（分鐘）
+  fast_exit_interval_minutes: 2   # 快速出場監控間隔（分鐘）
   # holidays: ["2025-09-01"]  # 可追加颱風假等，格式 YYYY-MM-DD
 
 logging:

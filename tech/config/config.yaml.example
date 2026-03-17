@@ -24,6 +24,9 @@ risk:
   consecutive_loss_pause:
     count: 3           # 連續虧損幾次後暫停開倉
     pause_minutes: 60  # 暫停時間（分鐘）
+  trailing_stop:
+    activation_pct: 0.07   # 獲利達 7% 後啟動移動停損
+    trail_pct: 0.04         # 從最高點回落 4% 出場
 
 screener:
   exchanges: ["TSE", "OTC"]
@@ -65,6 +68,7 @@ schedule:
   scan_interval_minutes: 30
   rebalance_time: "09:15"
   heartbeat_interval_minutes: 30  # 心跳通知間隔（分鐘）
+  fast_exit_interval_minutes: 2   # 快速出場監控間隔（分鐘）
   # holidays: ["2025-09-01"]  # 可追加颱風假等，格式 YYYY-MM-DD
 
 logging:

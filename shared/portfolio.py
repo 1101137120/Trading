@@ -42,6 +42,9 @@ class Position:
     take_profit: float
     current_price: float = 0.0
     trade_ref: object = None
+    # 移動停損
+    trailing_active: bool = False
+    highest_price: float = 0.0     # 啟動後追蹤的最高價
 
     @property
     def pnl(self) -> float:
@@ -151,7 +154,21 @@ class Portfolio:
     def update_price(self, code: str, price: float):
         with self._lock:
             if code in self.positions:
-                self.positions[code].current_price = price
+                pos = self.positions[code]
+                pos.current_price = price
+                # 移動停損：啟動判斷與最高價更新
+                trail_cfg = self.risk_cfg.get("trailing_stop", {})
+                activation = trail_cfg.get("activation_pct", 0)
+                if activation > 0:
+                    if not pos.trailing_active and pos.pnl_pct >= activation:
+                        pos.trailing_active = True
+                        pos.highest_price = price
+                        logger.info(
+                            f"移動停損啟動 {pos.code}：獲利 {pos.pnl_pct:.1%} 達門檻，"
+                            f"最高價追蹤起點 {price}"
+                        )
+                    elif pos.trailing_active and price > pos.highest_price:
+                        pos.highest_price = price
 
     def update_prices(self, prices: dict[str, float]):
         with self._lock:
@@ -261,7 +278,8 @@ class Portfolio:
                 {"code": p.code, "direction": p.direction, "quantity": p.quantity,
                  "entry_price": p.entry_price, "entry_time": p.entry_time.isoformat(),
                  "stop_loss": p.stop_loss, "take_profit": p.take_profit,
-                 "current_price": p.current_price}
+                 "current_price": p.current_price,
+                 "trailing_active": p.trailing_active, "highest_price": p.highest_price}
                 for p in self.positions.values()
             ],
             "pending_orders": [
@@ -290,6 +308,8 @@ class Portfolio:
                     entry_time=datetime.fromisoformat(d["entry_time"]),
                     stop_loss=d["stop_loss"], take_profit=d["take_profit"],
                     current_price=d.get("current_price", d["entry_price"]),
+                    trailing_active=d.get("trailing_active", False),
+                    highest_price=d.get("highest_price", 0.0),
                 )
                 positions[d["code"]] = pos
             pending = {}

@@ -414,6 +414,16 @@ class ValueTradingSystem:
 
         self.portfolio.add_pending_sell(code, trade, pos.quantity)
 
+    def _fast_exit_check(self):
+        """快速出場監控（每 2 分鐘）：補強 Tick 延遲或中斷時的出場空窗"""
+        if not self.portfolio.positions and not self.portfolio.pending_sells:
+            return
+        if not self.broker.ensure_connected():
+            return
+        self._drain_exit_queue()
+        self._check_pending_sells()
+        self._check_exit_conditions_via_snapshot()
+
     def _write_heartbeat(self):
         import json as _json
         path = PROJECT_ROOT / "data" / "heartbeat.json"
@@ -441,16 +451,25 @@ class ValueTradingSystem:
     def _print_summary(self):
         summary = self.portfolio.summary()
         if self.portfolio.positions:
+            trail_cfg = self.config.get("risk", {}).get("trailing_stop", {})
+            trail_pct = trail_cfg.get("trail_pct", 0)
             table = Table(title="持倉摘要", show_header=True)
             table.add_column("代碼", style="cyan")
             table.add_column("張數")
             table.add_column("成本", justify="right")
             table.add_column("現價", justify="right")
             table.add_column("損益", justify="right")
+            table.add_column("移停", justify="right")
             for code, pos in self.portfolio.positions.items():
                 clr = "green" if pos.pnl >= 0 else "red"
+                if pos.trailing_active and trail_pct:
+                    trail_price = pos.highest_price * (1 - trail_pct)
+                    trail_str = f"[yellow]{trail_price:.2f}[/yellow]"
+                else:
+                    trail_str = "-"
                 table.add_row(code, str(pos.quantity), f"{pos.entry_price:.2f}",
-                             f"{pos.current_price:.2f}", f"[{clr}]{pos.pnl:+,.0f}[/{clr}]")
+                             f"{pos.current_price:.2f}", f"[{clr}]{pos.pnl:+,.0f}[/{clr}]",
+                             trail_str)
             console.print(table)
         if self.portfolio.pending_orders:
             ptable = Table(title="掛單追蹤", show_header=True)
@@ -525,6 +544,11 @@ def main():
 
     hb_interval = config["schedule"].get("heartbeat_interval_minutes", 30)
     schedule.every(hb_interval).minutes.do(system._write_heartbeat)
+
+    exit_interval = config["schedule"].get("fast_exit_interval_minutes", 2)
+    schedule.every(exit_interval).minutes.do(
+        lambda: system._fast_exit_check() if is_trading_hours(config) else None
+    )
 
     console.print(f"[bold green]排程啟動，每 {interval} 分鐘掃描[/bold green]")
     if not is_trading_day(config):

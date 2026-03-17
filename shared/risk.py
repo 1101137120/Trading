@@ -31,6 +31,15 @@ class RiskManager:
         return True
 
     def check_exit_conditions(self, position) -> str | None:
+        # 移動停損（優先於固定停損，保護已累積的獲利）
+        trail_cfg = self.cfg.get("trailing_stop", {})
+        if position.trailing_active and trail_cfg:
+            trail_pct = trail_cfg.get("trail_pct", 0.03)
+            if position.highest_price > 0:
+                trail_stop = round(position.highest_price * (1 - trail_pct), 2)
+                if position.current_price <= trail_stop:
+                    return "trailing_stop"
+
         if position.should_stop_loss:
             return "stop_loss"
         if position.should_take_profit:
