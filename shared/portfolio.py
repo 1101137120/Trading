@@ -87,6 +87,8 @@ class Portfolio:
         self.consecutive_losses: int = 0
         self.cooldown_until: Optional[datetime] = None
         self.notifier: Optional["Notifier"] = None
+        # 賣出重試計數（停牌 / 連續跌停保護）
+        self.sell_retries: dict[str, int] = {}
 
     def update_capital(self, balance: float):
         with self._lock:
@@ -107,6 +109,7 @@ class Portfolio:
         with self._lock:
             pos = self.positions.pop(code, None)
             self._pending_exits.discard(code)
+            self.sell_retries.pop(code, None)
             self._recalc_available()
         if pos:
             pos.current_price = exit_price
@@ -234,12 +237,33 @@ class Portfolio:
             self.pending_sells.pop(code, None)
         self.remove_position(code, fill_price)
 
-    def fail_sell(self, code: str):
-        """賣出失敗：清除掛單記錄，解除退出標記允許下次重試"""
+    def fail_sell(self, code: str) -> bool:
+        """
+        賣出失敗處理。
+        回傳 True = 已達重試上限（凍結，需人工介入）
+        回傳 False = 正常失敗，下週期繼續重試
+        """
+        threshold = self.risk_cfg.get("max_sell_retries", 5)
         with self._lock:
             self.pending_sells.pop(code, None)
-            self._pending_exits.discard(code)
-        logger.error(f"賣出失敗: {code}，已解除退出標記，下週期重試")
+            self.sell_retries[code] = self.sell_retries.get(code, 0) + 1
+            retries = self.sell_retries[code]
+            escalated = retries >= threshold
+            if not escalated:
+                self._pending_exits.discard(code)  # 允許下週期重試
+            # 已達上限：保留 _pending_exits，讓 try_mark_exit 持續回傳 False，停止自動觸發
+
+        if escalated:
+            msg = (
+                f"賣出 {code} 已連續失敗 {retries} 次，"
+                "疑似停牌或連續跌停，停止自動重試，請人工確認"
+            )
+            logger.critical(msg)
+            if self.notifier:
+                self.notifier.notify(f"🆘 {msg}")
+        else:
+            logger.error(f"賣出失敗: {code}（第 {retries} 次），下週期重試")
+        return escalated
 
     def can_open_position(self, order_value: float) -> bool:
         # 每日熔斷
@@ -345,6 +369,12 @@ class Portfolio:
         self.circuit_broken = False
         self.consecutive_losses = 0
         self.cooldown_until = None
+        # 解凍昨日因停牌/跌停卡住的持倉，給新的一天重試機會
+        if self.sell_retries:
+            for code in list(self.sell_retries.keys()):
+                self._pending_exits.discard(code)
+            self.sell_retries.clear()
+            logger.info("賣出重試計數已重置，昨日卡單持倉可重新嘗試出場")
         logger.info("每日狀態重置")
 
     def _recalc_available(self):

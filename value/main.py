@@ -13,6 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+import fcntl
+import os
 import time
 import queue
 import signal
@@ -32,6 +34,7 @@ from shared.portfolio import Portfolio, Position, PendingOrder
 from shared.risk import RiskManager
 from shared.feed import MarketDataFeed
 from shared.notifier import Notifier
+from shared.exdiv_checker import ExDividendChecker
 from tech.market_filter import MarketFilter
 from tech.strategies.engine import StrategyEngine
 from value.screener.value_scanner import ValueScanner
@@ -77,6 +80,7 @@ class ValueTradingSystem:
         self.portfolio = Portfolio(config, persist_path=persist_path)
         self.risk = RiskManager(config)
         self.notifier = Notifier(config)
+        self.exdiv = ExDividendChecker()
         self.feed: MarketDataFeed = None
         self.value_scanner: ValueScanner = None
         self.engine: StrategyEngine = None
@@ -177,6 +181,8 @@ class ValueTradingSystem:
         pos = self.portfolio.get_position(code)
         if pos is None:
             return
+        if self.exdiv.is_ex_dividend_today(code):
+            return
         reason = self.risk.check_exit_conditions(pos)
         if reason and self.portfolio.try_mark_exit(code):
             self._exit_queue.put((code, reason))
@@ -262,13 +268,13 @@ class ValueTradingSystem:
                 self.portfolio.confirm_sell(code, fill_price, fill_qty)
                 self.notifier.notify(f"✅ 平倉成交 {code} @ {fill_price:.2f}")
             elif status == "Dead":
-                self.logger.error(f"賣出委託失敗 {code}，將於下週期重試")
-                self.portfolio.fail_sell(code)
-                self.notifier.notify(f"🚨 賣出失敗 {code}，已解除標記，下週期重試")
+                escalated = self.portfolio.fail_sell(code)
+                if not escalated:
+                    self.notifier.notify(f"🚨 賣出失敗 {code}，下週期重試")
             elif datetime.now() - placed_time > timeout:
-                self.logger.error(f"賣出委託逾時 {code}，解除標記重試")
-                self.portfolio.fail_sell(code)
-                self.notifier.notify(f"⚠️ 賣出逾時 {code}，下週期重試，請注意持倉")
+                escalated = self.portfolio.fail_sell(code)
+                if not escalated:
+                    self.notifier.notify(f"⚠️ 賣出逾時 {code}，下週期重試，請注意持倉")
 
     def _check_pending_orders(self):
         if not self.portfolio.pending_orders:
@@ -314,6 +320,9 @@ class ValueTradingSystem:
             with self.portfolio._lock:
                 already_queued = code in self.portfolio._pending_exits
             if already_queued:
+                continue
+            if self.exdiv.is_ex_dividend_today(code):
+                self.logger.debug(f"{code} 今日除息，跳過快照停損檢查")
                 continue
             snap = self.feed.get_snapshot(code)
             if not snap:
@@ -486,6 +495,19 @@ class ValueTradingSystem:
         )
 
 
+def _acquire_instance_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = open(lock_path, "w")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd.write(str(os.getpid()))
+        fd.flush()
+        return fd
+    except BlockingIOError:
+        fd.close()
+        return None
+
+
 def main():
     global _running
     signal.signal(signal.SIGINT, signal_handler)
@@ -504,6 +526,13 @@ def main():
     mode = "模擬" if config["broker"].get("simulation") else "正式"
     dry = " [DRY-RUN]" if args.dry_run else ""
     console.rule(f"[bold]價值投資（價值+技術雙重篩選）| {mode}模式{dry}[/bold]")
+
+    _lock_fd = None
+    if not args.scan_only:
+        _lock_fd = _acquire_instance_lock(PROJECT_ROOT / "data" / ".trading.lock")
+        if _lock_fd is None:
+            console.print("[bold red]錯誤：已有另一個 value 實例在執行中，請確認後再啟動[/bold red]")
+            sys.exit(1)
 
     if args.scan_only:
         # scan-only 不需連券商，僅用證交所/櫃買資料

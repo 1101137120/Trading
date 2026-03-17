@@ -22,6 +22,7 @@ risk:
   trailing_stop:
     activation_pct: 0.10   # 獲利達 10% 後啟動移動停損
     trail_pct: 0.05         # 從最高點回落 5% 出場
+  max_sell_retries: 5      # 賣出失敗達此次數後停止自動重試，需人工確認
 
 value_screener:
   max_pe: 20
