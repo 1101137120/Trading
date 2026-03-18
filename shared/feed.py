@@ -124,5 +124,12 @@ class MarketDataFeed:
                 logger.warning(f"批次快照失敗 (batch {i}): {e}")
         return result
 
+    def get_snapshots_by_codes(self, codes: list) -> dict:
+        """批次取得多個代碼的快照，比逐一呼叫 get_snapshot 更有效率"""
+        contracts = [c for code in codes if (c := self._get_contract(code)) is not None]
+        if not contracts:
+            return {}
+        return self.get_batch_snapshots(contracts)
+
     def clear_cache(self):
         self._cache.clear()

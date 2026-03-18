@@ -70,6 +70,7 @@ schedule:
   rebalance_time: "09:15"
   heartbeat_interval_minutes: 30  # 心跳通知間隔（分鐘）
   fast_exit_interval_minutes: 2   # 快速出場監控間隔（分鐘）
+  force_close_minutes_before_close: 0  # 0=停用；設為 10 表示 13:20 強制平倉所有持倉（防隔夜風險）
   # holidays: ["2025-09-01"]  # 可追加颱風假等，格式 YYYY-MM-DD
 
 logging:

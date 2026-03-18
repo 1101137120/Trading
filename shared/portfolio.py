@@ -2,6 +2,7 @@
 Portfolio 模組：追蹤持倉、計算損益、管理帳戶狀態
 """
 import json
+import os
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -313,10 +314,13 @@ class Portfolio:
                 for po in self.pending_orders.values()
             ],
         }
+        tmp = path.with_suffix(".tmp")
         try:
-            path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, path)   # 原子操作，防止 crash 造成檔案損毀
         except Exception as e:
             logger.error(f"持倉存檔失敗: {e}")
+            tmp.unlink(missing_ok=True)
 
     def load_from_file(self, path: Path = None) -> tuple[dict, dict]:
         path = path or self._persist_path

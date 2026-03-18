@@ -382,16 +382,17 @@ class TradingSystem:
     def _check_exit_conditions_via_snapshot(self):
         if not self.portfolio.positions:
             return
-        for code in list(self.portfolio.positions.keys()):
-            with self.portfolio._lock:
-                already_queued = code in self.portfolio._pending_exits
-            if already_queued:
-                continue
-            # 除息日跳過停損檢查
-            if self.exdiv.is_ex_dividend_today(code):
-                self.logger.debug(f"{code} 今日除息，跳過快照停損檢查")
-                continue
-            snap = self.feed.get_snapshot(code)
+        with self.portfolio._lock:
+            pending = set(self.portfolio._pending_exits)
+        codes_to_check = [
+            code for code in list(self.portfolio.positions.keys())
+            if code not in pending and not self.exdiv.is_ex_dividend_today(code)
+        ]
+        if not codes_to_check:
+            return
+        snapshots = self.feed.get_snapshots_by_codes(codes_to_check)
+        for code in codes_to_check:
+            snap = snapshots.get(code)
             if not snap:
                 continue
             price = snap["close"]
@@ -506,6 +507,18 @@ class TradingSystem:
             self._check_exit_conditions_via_snapshot()
         except Exception as e:
             self.logger.exception(f"快速出場檢查例外: {e}")
+
+    def _force_close_all(self):
+        """收盤前強制平倉所有持倉（由 force_close_minutes_before_close 設定觸發）"""
+        if not self.portfolio.positions:
+            return
+        count = len(self.portfolio.positions)
+        self.logger.warning(f"收盤前強制平倉：共 {count} 筆")
+        self.notifier.notify(f"🔔 收盤前強制平倉，共 {count} 筆持倉")
+        for code in list(self.portfolio.positions.keys()):
+            pos = self.portfolio.get_position(code)
+            if pos and self.portfolio.try_mark_exit(code):
+                self._execute_sell(code, pos, "force_close")
 
     def _open_market_check(self):
         """開盤後立即執行快照出場檢查，防護隔夜跳空跌破停損"""
@@ -673,6 +686,15 @@ def main():
         datetime.strptime(config["schedule"]["market_open"], "%H:%M") + timedelta(minutes=1)
     ).strftime("%H:%M")
     schedule.every().day.at(open_check_time).do(system._open_market_check)
+
+    force_close_min = config["schedule"].get("force_close_minutes_before_close", 0)
+    if force_close_min > 0:
+        fc_time = (
+            datetime.strptime(config["schedule"]["market_close"], "%H:%M")
+            - timedelta(minutes=force_close_min)
+        ).strftime("%H:%M")
+        schedule.every().day.at(fc_time).do(system._force_close_all)
+        console.print(f"[dim]收盤前 {force_close_min} 分鐘強制平倉排程：{fc_time}[/dim]")
 
     console.print(f"[bold green]排程啟動，每 {interval} 分鐘掃描[/bold green]")
     if is_trading_hours(config):
