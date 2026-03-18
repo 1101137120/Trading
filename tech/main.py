@@ -256,38 +256,42 @@ class TradingSystem:
             self._exit_queue.put((code, reason))
 
     def run_cycle(self):
-        if not self.broker.ensure_connected():
-            self.logger.warning("連線異常，本週期略過")
-            return
-        now = datetime.now()
-        self.logger.info(f"===== 執行交易週期 {now.strftime('%H:%M:%S')} =====")
-        self.feed.clear_cache()
+        try:
+            if not self.broker.ensure_connected():
+                self.logger.warning("連線異常，本週期略過")
+                return
+            now = datetime.now()
+            self.logger.info(f"===== 執行交易週期 {now.strftime('%H:%M:%S')} =====")
+            self.feed.clear_cache()
 
-        bal = self.broker.get_account_balance()
-        if bal:
-            self.portfolio.update_capital(bal.get("balance", 0))
+            bal = self.broker.get_account_balance()
+            if bal:
+                self.portfolio.update_capital(bal.get("balance", 0))
 
-        self._drain_exit_queue()
-        self._check_pending_sells()
-        self._check_pending_orders()
-        self._check_exit_conditions_via_snapshot()
-        self._sync_tick_subscriptions()
+            self._drain_exit_queue()
+            self._check_pending_sells()
+            self._check_pending_orders()
+            self._check_exit_conditions_via_snapshot()
+            self._sync_tick_subscriptions()
 
-        candidates = self.scanner.screen()
-        if not candidates:
-            self.logger.info("沒有符合條件的標的")
+            candidates = self.scanner.screen()
+            if not candidates:
+                self.logger.info("沒有符合條件的標的")
+                self._print_summary()
+                return
+
+            signals = self._evaluate_candidates(candidates)
+            if signals and not self.market_filter.allow_long():
+                self.logger.info("大盤趨勢偏空，本週期不開新倉")
+                signals = []
+
+            if signals:
+                self._execute_buy_signals(signals)
+
             self._print_summary()
-            return
-
-        signals = self._evaluate_candidates(candidates)
-        if signals and not self.market_filter.allow_long():
-            self.logger.info("大盤趨勢偏空，本週期不開新倉")
-            signals = []
-
-        if signals:
-            self._execute_buy_signals(signals)
-
-        self._print_summary()
+        except Exception as e:
+            self.logger.exception(f"交易週期例外，下週期繼續: {e}")
+            self.notifier.notify(f"🚨 交易週期例外: {e}")
 
     def _drain_exit_queue(self):
         while not self._exit_queue.empty():
@@ -492,13 +496,32 @@ class TradingSystem:
 
     def _fast_exit_check(self):
         """快速出場監控（每 2 分鐘）：補強 Tick 延遲或中斷時的出場空窗"""
-        if not self.portfolio.positions and not self.portfolio.pending_sells:
+        try:
+            if not self.portfolio.positions and not self.portfolio.pending_sells:
+                return
+            if not self.broker.ensure_connected():
+                return
+            self._drain_exit_queue()
+            self._check_pending_sells()
+            self._check_exit_conditions_via_snapshot()
+        except Exception as e:
+            self.logger.exception(f"快速出場檢查例外: {e}")
+
+    def _open_market_check(self):
+        """開盤後立即執行快照出場檢查，防護隔夜跳空跌破停損"""
+        if not self.portfolio.positions:
             return
-        if not self.broker.ensure_connected():
-            return
-        self._drain_exit_queue()
-        self._check_pending_sells()
-        self._check_exit_conditions_via_snapshot()
+        try:
+            if not self.broker.ensure_connected():
+                return
+            self.logger.info("開盤跳空保護：執行快照出場檢查")
+            bal = self.broker.get_account_balance()
+            if bal:
+                self.portfolio.update_capital(bal.get("balance", 0))
+            self._check_exit_conditions_via_snapshot()
+            self._drain_exit_queue()
+        except Exception as e:
+            self.logger.exception(f"開盤出場檢查例外: {e}")
 
     def _write_heartbeat(self):
         """寫入心跳檔案並發送通知，讓外部監控確認程序存活"""
@@ -646,6 +669,11 @@ def main():
         lambda: system._fast_exit_check() if is_trading_hours(config) else None
     )
 
+    open_check_time = (
+        datetime.strptime(config["schedule"]["market_open"], "%H:%M") + timedelta(minutes=1)
+    ).strftime("%H:%M")
+    schedule.every().day.at(open_check_time).do(system._open_market_check)
+
     console.print(f"[bold green]排程啟動，每 {interval} 分鐘掃描[/bold green]")
     if is_trading_hours(config):
         system.run_cycle()
@@ -661,7 +689,10 @@ def main():
                 system._sync_tick_subscriptions()
                 system.notifier.notify("🔄 交易系統已重連，Tick 訂閱已恢復")
             system._drain_exit_queue()
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            system.logger.exception(f"排程執行例外，繼續運行: {e}")
         time.sleep(5)
 
     system.teardown()
