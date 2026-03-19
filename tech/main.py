@@ -75,6 +75,7 @@ def signal_handler(sig, frame):
 
 def _run_standalone_scan(config: dict):
     """免券商掃描：證交所 OpenAPI + 技術策略評估"""
+    logger = logging.getLogger("main")
     console.print("[bold cyan]免券商模式：使用證交所 OpenAPI[/bold cyan]")
     scanner = StandaloneStockScanner(config)
     engine = StrategyEngine(config)
@@ -90,6 +91,15 @@ def _run_standalone_scan(config: dict):
     if not candidates:
         console.print("[yellow]無符合篩選條件的標的[/yellow]")
         return
+
+    console.print(f"\n[bold green]共篩選出 {len(candidates)} 檔[/bold green]")
+    console.print("[dim]⚠ 資料來源：TWSE STOCK_DAY_ALL（收盤後約 14:00 更新；盤中執行看到的是前一交易日資料）[/dim]\n")
+    logger.info(f"初步篩選通過 {len(candidates)} 檔")
+    for c in candidates:
+        logger.info(
+            f"[通過篩選] {c['code']} {c.get('name', '')[:8]} "
+            f"收={c['close']:.2f} 量={c['volume']:,} 漲跌={c['change_pct']:+.2%}"
+        )
 
     table = Table(title="篩選結果（上市）", show_header=True)
     table.add_column("代碼", style="cyan")
@@ -110,13 +120,23 @@ def _run_standalone_scan(config: dict):
 
     console.print("\n[bold]策略評估中...[/bold]")
     signals = []
+    stock_rejects: list[tuple[str, str, list[str]]] = []  # (code, name, reasons)
     for c in candidates[:30]:  # 最多評估前 30 檔
         df = fetch_kbars(c["code"], lookback_days=lookback)
         if df is None or len(df) < 20:
+            stock_rejects.append((c["code"], c.get("name", "")[:8], ["K棒不足"]))
             continue
         sig = engine.evaluate(c["code"], df)
         if sig and sig.action == "Buy":
             signals.append(sig)
+        else:
+            reasons = []
+            for s in engine.strategies:
+                if hasattr(s, "diagnose"):
+                    r = s.diagnose(c["code"], df)
+                    reasons.append(f"{s.name}: {r}")
+            if reasons:
+                stock_rejects.append((c["code"], c.get("name", "")[:8], reasons))
 
     signals.sort(key=lambda s: s.confidence, reverse=True)
     if signals:
@@ -126,9 +146,18 @@ def _run_standalone_scan(config: dict):
         stbl.add_column("理由", style="dim")
         for s in signals:
             stbl.add_row(s.code, f"{s.confidence:.2f}", (s.reason or "")[:40])
+            logger.info(f"[買入訊號] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
         console.print(stbl)
     else:
         console.print("[dim]無買入訊號[/dim]")
+        logger.info("無買入訊號")
+
+    if stock_rejects:
+        console.print("\n[bold]各檔被篩掉原因[/bold]")
+        for code, name, reasons in stock_rejects:
+            line = f"{code} {name}: {' | '.join(reasons)}"
+            console.print(f"  [dim]{line}[/dim]")
+            logger.info(f"篩掉 {line}")
 
 
 class TradingSystem:
@@ -621,7 +650,7 @@ def main():
     parser = argparse.ArgumentParser(description="技術策略自動交易")
     parser.add_argument("--dry-run", action="store_true", help="不實際下單")
     parser.add_argument("--scan-only", action="store_true", help="只篩選標的")
-    parser.add_argument("--standalone", action="store_true", help="免券商模式（僅 --scan-only）")
+    parser.add_argument("--standalone", action="store_true", help="免券商模式：掃描上市股並評估策略，不連永豐")
     parser.add_argument("--config", default=None, help="設定檔路徑")
     args = parser.parse_args()
 
@@ -629,9 +658,9 @@ def main():
     config = load_config(config_path)
     setup_logger("root", config, log_file=str(PROJECT_ROOT / "logs" / "trading.log"))
 
-    # 多實例防護：--scan-only 不需要鎖
+    # 多實例防護：--scan-only、--standalone 不需要鎖
     _lock_fd = None
-    if not args.scan_only:
+    if not args.scan_only and not args.standalone:
         _lock_fd = _acquire_instance_lock(PROJECT_ROOT / "data" / ".trading.lock")
         if _lock_fd is None:
             console.print("[bold red]錯誤：已有另一個 tech 實例在執行中，請確認後再啟動[/bold red]")
@@ -641,8 +670,8 @@ def main():
     dry = " [DRY-RUN]" if args.dry_run else ""
     console.rule(f"[bold]技術策略交易 | {mode}模式{dry}[/bold]")
 
-    # 免券商模式：單用技術分析，不連永豐
-    if args.scan_only and args.standalone:
+    # 免券商模式：單用技術分析，不連永豐（--standalone 即掃描並結束）
+    if args.standalone:
         _run_standalone_scan(config)
         return
 
