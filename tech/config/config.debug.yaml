@@ -1,0 +1,94 @@
+# 技術策略專案 Debug 設定
+# 用法:
+#   python tech/main.py --config tech/config/config.debug.yaml --dry-run
+#
+# 說明:
+# - 這份檔案預設不放金鑰；可用環境變數或自行填入。
+# - 會輸出較詳細 DEBUG 日誌到獨立檔案，避免污染正式 log。
+
+broker:
+  api_key: ""
+  secret_key: ""
+  ca_path: ""
+  ca_passwd: ""
+  person_id: ""
+  simulation: true
+  dry_run: true
+
+market_filter:
+  enabled: true
+  proxy_code: "0050"
+  ma_period: 20
+
+risk:
+  max_positions: 3
+  max_position_pct: 0.10
+  stop_loss_pct: 0.05
+  take_profit_pct: 0.10
+  max_daily_loss_pct: 0.03
+  min_order_value: 10000
+  max_order_value: 300000
+  consecutive_loss_pause:
+    count: 2
+    pause_minutes: 30
+  trailing_stop:
+    activation_pct: 0.05
+    trail_pct: 0.03
+  max_sell_retries: 3
+
+screener:
+  exchanges: ["TSE", "OTC"]
+  min_price: 10.0
+  max_price: 1000.0
+  min_volume: 1000
+  min_avg_volume_5d: 0   # debug/simulation 常用：先不擋均量
+  max_stocks: 20          # debug 先縮小樣本，加快觀察
+
+strategies:
+  active: ["momentum", "breakout"]
+
+  momentum:
+    rsi_period: 14
+    rsi_oversold: 35
+    rsi_overbought: 65
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    lookback_days: 30
+
+  mean_reversion:
+    bb_period: 20
+    bb_std: 2.0
+    rsi_period: 14
+    rsi_low: 30
+    rsi_high: 70
+    lookback_days: 30
+
+  breakout:
+    volume_multiplier: 2.0
+    price_breakout_pct: 0.02
+    lookback_days: 20
+    confirm_days: 3
+
+schedule:
+  market_open: "09:00"
+  market_close: "13:30"
+  ignore_trading_hours: true
+  scan_interval_minutes: 5
+  rebalance_time: "09:15"
+  heartbeat_interval_minutes: 5
+  fast_exit_interval_minutes: 1
+  force_close_minutes_before_close: 0
+
+logging:
+  level: "DEBUG"
+  file: "tech/logs/trading.debug.log"
+  max_bytes: 10485760
+  backup_count: 3
+
+notifications:
+  enabled: false
+  line_token: ""
+  telegram:
+    bot_token: ""
+    chat_id: ""

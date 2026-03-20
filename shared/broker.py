@@ -22,6 +22,36 @@ class Broker:
         self._connected = False
         self._subscribed_codes: set[str] = set()
         self.just_reconnected: bool = False  # 供外部在重連後重新訂閱 Tick
+        self._account_access_ok: bool = True
+
+    def _configure_default_stock_account(self, accounts) -> None:
+        """登入後挑選可用股票帳戶，避免預設帳戶導致 406。"""
+        if not accounts:
+            return
+        preferred_id = self.cfg.get("stock_account_id") or os.environ.get("SHIOAJI_STOCK_ACCOUNT_ID", "")
+        stock_accounts = []
+        for acc in accounts:
+            acct_type = getattr(getattr(acc, "account_type", None), "value", getattr(acc, "account_type", None))
+            if acct_type == "S":
+                stock_accounts.append(acc)
+        if not stock_accounts:
+            return
+        chosen = None
+        if preferred_id:
+            chosen = next((a for a in stock_accounts if str(getattr(a, "account_id", "")) == str(preferred_id)), None)
+            if chosen is None:
+                logger.warning(f"找不到指定 stock_account_id={preferred_id}，改用自動挑選")
+        if chosen is None:
+            chosen = next((a for a in stock_accounts if getattr(a, "signed", False)), stock_accounts[0])
+        try:
+            self.api.set_default_account(chosen)
+            logger.info(
+                "預設股票帳戶已設定: "
+                f"{getattr(chosen, 'broker_id', '')}-{getattr(chosen, 'account_id', '')} "
+                f"(signed={getattr(chosen, 'signed', False)})"
+            )
+        except Exception as e:
+            logger.warning(f"設定預設股票帳戶失敗，沿用 SDK 預設: {e}")
 
     def connect(self) -> bool:
         try:
@@ -39,6 +69,7 @@ class Broker:
                 fetch_contract=True,
             )
             logger.info(f"登入成功，帳號數: {len(accounts)}")
+            self._configure_default_stock_account(accounts)
             if not self.simulation and self.cfg.get("ca_path"):
                 self.api.activate_ca(
                     ca_path=self.cfg["ca_path"],
@@ -47,10 +78,20 @@ class Broker:
                 )
                 logger.info("憑證啟用成功")
             self._connected = True
+            self._account_access_ok = True
             return True
         except Exception as e:
             logger.error(f"連線失敗: {e}")
             return False
+
+    def _is_account_not_acceptable(self, err: Exception) -> bool:
+        msg = str(err)
+        return ("Account Not Acceptable" in msg) or ("status_code': 406" in msg) or ('"status_code": 406' in msg)
+
+    def _disable_account_queries(self, err: Exception):
+        if self._account_access_ok:
+            logger.warning(f"帳戶查詢權限不可用，已停用餘額/持倉查詢：{err}")
+        self._account_access_ok = False
 
     def disconnect(self):
         if self.api and self._connected:
@@ -70,9 +111,17 @@ class Broker:
                 self.just_reconnected = True
             return result
         try:
-            self.api.account_balance(account=self.api.stock_account)
+            # 以 update_status 做健康檢查，避免 simulation 下 account_balance 噪音警告。
+            if self.api.stock_account is not None and self._account_access_ok:
+                self.api.update_status(self.api.stock_account)
+            else:
+                # fallback：至少確認 API 物件仍可取用合約容器
+                _ = self.api.Contracts.Stocks
             return True
         except Exception as e:
+            if self._is_account_not_acceptable(e):
+                self._disable_account_queries(e)
+                return True
             logger.warning(f"連線異常，嘗試重連: {e}")
             self._connected = False
             self._subscribed_codes.clear()
@@ -93,12 +142,13 @@ class Broker:
             exch_obj = getattr(self.api.Contracts.Stocks, exch, None)
             if exch_obj is None:
                 continue
-            for symbol in dir(exch_obj):
-                if symbol.startswith("_"):
+            # Shioaji 合約容器可直接迭代，避免把 dict/keys 等方法誤當合約。
+            for contract in exch_obj:
+                if contract is None:
                     continue
-                c = getattr(exch_obj, symbol, None)
-                if c is not None:
-                    contracts.append(c)
+                if not hasattr(contract, "code"):
+                    continue
+                contracts.append(contract)
         return contracts
 
     def setup_tick_callback(self, callback: Callable):
@@ -186,11 +236,15 @@ class Broker:
         if contract is None:
             return None
         act = constant.Action.Buy if action == "Buy" else constant.Action.Sell
+        if hasattr(constant.StockPriceType, "MKT"):
+            market_price_type = constant.StockPriceType.MKT
+        else:
+            market_price_type = constant.StockPriceType.MKP
         order = self.api.Order(
             price=0,
             quantity=quantity,
             action=act,
-            price_type=constant.StockPriceType.MKP,
+            price_type=market_price_type,
             order_type=constant.OrderType.IOC,
             order_lot=constant.StockOrderLot.Common,
             account=self.api.stock_account,
@@ -213,16 +267,22 @@ class Broker:
             return False
 
     def update_all_order_status(self):
+        if not self._account_access_ok:
+            return
         try:
             self.api.update_status(self.api.stock_account)
         except Exception as e:
+            if self._is_account_not_acceptable(e):
+                self._disable_account_queries(e)
+                return
             logger.error(f"更新委託狀態失敗: {e}")
 
     def get_trade_fill(self, trade) -> tuple[str, float, int]:
         try:
             self.api.update_status(trade)
             status = trade.status.status
-            fill_price = trade.status.deal_price or trade.order.price
+            deals = getattr(trade.status, "deals", None) or []
+            fill_price = (deals[-1].price if deals else 0) or trade.order.price
             fill_qty = trade.status.deal_quantity or 0
             if status in FILLED_STATUSES:
                 return "Filled", fill_price, fill_qty
@@ -237,14 +297,21 @@ class Broker:
             return "Active", 0.0, 0
 
     def get_account_balance(self) -> dict:
+        if self.simulation or not self._account_access_ok:
+            return {}
         try:
             bal = self.api.account_balance(account=self.api.stock_account)
             return {"balance": bal.acc_balance, "date": bal.date, "status": bal.status}
         except Exception as e:
+            if self._is_account_not_acceptable(e):
+                self._disable_account_queries(e)
+                return {}
             logger.error(f"取得餘額失敗: {e}")
             return {}
 
     def get_positions(self) -> list:
+        if not self._account_access_ok:
+            return []
         try:
             positions = self.api.list_positions(self.api.stock_account)
             return [
@@ -259,5 +326,43 @@ class Broker:
                 for p in positions
             ]
         except Exception as e:
+            if self._is_account_not_acceptable(e):
+                self._disable_account_queries(e)
+                return []
             logger.error(f"取得持倉失敗: {e}")
+            return []
+
+    def get_active_trades(self) -> list[dict]:
+        """
+        取得券商端仍在委託中的單（Pending/Submitted/PartFilled）。
+        用於重啟後檢查是否有本地未追蹤委託。
+        """
+        if not self._account_access_ok:
+            return []
+        try:
+            if self.api.stock_account is not None:
+                self.api.update_status(self.api.stock_account)
+            trades = self.api.list_trades() or []
+            results = []
+            for t in trades:
+                st_raw = getattr(getattr(t, "status", None), "status", "")
+                status = getattr(st_raw, "value", str(st_raw))
+                if status not in ACTIVE_STATUSES:
+                    continue
+                action_raw = getattr(getattr(t, "order", None), "action", "")
+                action = getattr(action_raw, "value", str(action_raw))
+                results.append({
+                    "code": str(getattr(getattr(t, "contract", None), "code", "")),
+                    "action": action,
+                    "status": status,
+                    "quantity": int(getattr(getattr(t, "order", None), "quantity", 0) or 0),
+                    "price": float(getattr(getattr(t, "order", None), "price", 0) or 0),
+                    "deal_quantity": int(getattr(getattr(t, "status", None), "deal_quantity", 0) or 0),
+                })
+            return results
+        except Exception as e:
+            if self._is_account_not_acceptable(e):
+                self._disable_account_queries(e)
+                return []
+            logger.error(f"取得委託中清單失敗: {e}")
             return []

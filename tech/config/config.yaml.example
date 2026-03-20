@@ -66,6 +66,7 @@ strategies:
 schedule:
   market_open: "09:00"
   market_close: "13:30"
+  ignore_trading_hours: false  # true=忽略 09:00~13:30 限制，任何時間都可跑
   scan_interval_minutes: 30
   rebalance_time: "09:15"
   heartbeat_interval_minutes: 30  # 心跳通知間隔（分鐘）

@@ -246,6 +246,7 @@ class TradingSystem:
                 self.logger.info(f"持倉記錄 {code} 已不在券商端，略過")
 
         self._restore_pending_orders(saved_pending, set(broker_map.keys()))
+        self._warn_untracked_broker_trades(saved_pending)
         self.portfolio._recalc_available()
         self.portfolio.save_to_file()
 
@@ -271,6 +272,31 @@ class TradingSystem:
                 f"⚠️ 系統重啟後發現 {len(lost)} 筆遺留掛單（{codes_str}），"
                 "請至永豐金 App 手動確認委託狀態"
             )
+
+    def _warn_untracked_broker_trades(self, saved_pending: dict):
+        """
+        啟動時比對券商端「委託中」與本地追蹤狀態，避免漏單無感。
+        目前先提示人工確認，不直接自動接管，避免誤判成交/重複下單。
+        """
+        broker_trades = self.broker.get_active_trades()
+        if not broker_trades:
+            return
+        tracked_codes = set(saved_pending.keys()) | set(self.portfolio.pending_sells.keys())
+        untracked = [t for t in broker_trades if t.get("code") not in tracked_codes]
+        if not untracked:
+            return
+        self.logger.warning(f"券商端有 {len(untracked)} 筆委託中單未被本地追蹤")
+        console.print(f"[yellow]警告：券商端有 {len(untracked)} 筆委託中單未被本地追蹤[/yellow]")
+        for t in untracked[:10]:
+            line = (
+                f"{t.get('code')} {t.get('action')} "
+                f"{t.get('quantity')}張 @ {t.get('price')} "
+                f"status={t.get('status')} 成交={t.get('deal_quantity')}"
+            )
+            self.logger.warning(f"[未追蹤委託] {line}")
+            console.print(f"[dim]- {line}[/dim]")
+        if len(untracked) > 10:
+            console.print(f"[dim]... 另有 {len(untracked) - 10} 筆，請至券商端確認[/dim]")
 
     def _on_tick(self, code: str, price: float):
         self.portfolio.update_price(code, price)
@@ -712,12 +738,15 @@ def main():
         system.teardown()
         return
 
+    ignore_trading_hours = config["schedule"].get("ignore_trading_hours", False)
     interval = config["schedule"].get("scan_interval_minutes", 30)
     schedule.every(interval).minutes.do(
-        lambda: system.run_cycle() if is_trading_hours(config) else None
+        lambda: system.run_cycle() if (ignore_trading_hours or is_trading_hours(config)) else None
     )
-    if not is_trading_day(config):
+    if not ignore_trading_hours and not is_trading_day(config):
         console.print("[yellow]今日為休市日，排程待命中[/yellow]")
+    if ignore_trading_hours:
+        console.print("[yellow]已關閉交易時段限制：非盤中也會執行掃描[/yellow]")
     schedule.every().day.at(config["schedule"]["market_open"]).do(system.portfolio.reset_daily)
 
     hb_interval = config["schedule"].get("heartbeat_interval_minutes", 30)
@@ -725,7 +754,7 @@ def main():
 
     exit_interval = config["schedule"].get("fast_exit_interval_minutes", 2)
     schedule.every(exit_interval).minutes.do(
-        lambda: system._fast_exit_check() if is_trading_hours(config) else None
+        lambda: system._fast_exit_check() if (ignore_trading_hours or is_trading_hours(config)) else None
     )
 
     open_check_time = (
@@ -743,7 +772,7 @@ def main():
         console.print(f"[dim]收盤前 {force_close_min} 分鐘強制平倉排程：{fc_time}[/dim]")
 
     console.print(f"[bold green]排程啟動，每 {interval} 分鐘掃描[/bold green]")
-    if is_trading_hours(config):
+    if ignore_trading_hours or is_trading_hours(config):
         system.run_cycle()
 
     while _running:
