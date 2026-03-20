@@ -462,8 +462,22 @@ class TradingSystem:
         return signals
 
     def _execute_buy_signals(self, signals: list):
+        simulation = self.config["broker"].get("simulation", False)
         for signal in signals:
             code, price = signal.code, signal.price
+            if price <= 0:
+                if simulation:
+                    # 模擬模式：盤後快照為 0 時，用 K 棒最後一根收盤價補足
+                    df = self.feed.get_kbars(code, lookback_days=5)
+                    if df is not None and len(df) > 0:
+                        price = float(df["Close"].iloc[-1])
+                        self.logger.info(f"{code} 快照價格為 0，模擬模式使用 K 棒收盤價 {price}")
+                    else:
+                        self.logger.warning(f"跳過 {code}：快照與 K 棒均無有效價格")
+                        continue
+                else:
+                    self.logger.warning(f"跳過 {code}：快照價格為 0（停牌、盤前或資料異常）")
+                    continue
             if price <= 0:
                 self.logger.warning(f"跳過 {code}：快照價格為 0（停牌、盤前或資料異常）")
                 continue
