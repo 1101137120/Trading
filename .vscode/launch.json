@@ -1,0 +1,70 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Tech: Dry Run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tech/main.py",
+            "args": ["--dry-run"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Tech: Scan Only (連券商)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tech/main.py",
+            "args": ["--scan-only"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Tech: Standalone Scan (免券商)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/tech/main.py",
+            "args": ["--standalone"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Value: Dry Run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/value/main.py",
+            "args": ["--dry-run"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        },
+        {
+            "name": "Value: Scan Only",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/value/main.py",
+            "args": ["--scan-only"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}"
+            }
+        }
+    ]
+}
