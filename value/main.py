@@ -374,7 +374,7 @@ class ValueTradingSystem:
         for signal in signals:
             code, price = signal.code, signal.price
             if price <= 0:
-                self.logger.warning(f"跳過 {code}：價格為 0（模擬/盤前資料尚未更新）")
+                self.logger.warning(f"跳過 {code}：快照價格為 0（停牌、盤前或資料異常）")
                 continue
             qty = self.portfolio.calculate_quantity(price)
             if qty <= 0:
