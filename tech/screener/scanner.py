@@ -11,6 +11,7 @@ logger = logging.getLogger("screener")
 class StockScanner:
     def __init__(self, config: dict, broker, data_feed):
         self.cfg = config["screener"]
+        self.simulation = config.get("broker", {}).get("simulation", False)
         self.broker = broker
         self.feed = data_feed
 
@@ -39,10 +40,14 @@ class StockScanner:
             volume = snap.get("volume", 0)
             change_pct = snap.get("change_pct", 0)
 
-            if not (min_price <= close <= max_price):
-                continue
-            if volume < min_volume:
-                continue
+            # 模擬模式盤後快照為 0：跳過價格/量篩選，讓後段 K 棒評估取真實收盤價
+            if close <= 0 and self.simulation:
+                pass
+            else:
+                if not (min_price <= close <= max_price):
+                    continue
+                if volume < min_volume:
+                    continue
 
             candidates.append({
                 "code": code,
