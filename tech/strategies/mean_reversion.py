@@ -2,23 +2,13 @@
 均值回歸策略：布林通道 + RSI
 """
 import pandas as pd
-import numpy as np
 from typing import Optional
 import logging
 
 from .base import BaseStrategy, Signal
+from .indicators import rsi as _rsi
 
 logger = logging.getLogger("strategy.mean_reversion")
-
-
-def _rsi(close: pd.Series, period: int) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
 
 
 class MeanReversionStrategy(BaseStrategy):

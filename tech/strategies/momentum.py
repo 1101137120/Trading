@@ -2,36 +2,13 @@
 動量策略：RSI + MACD 雙重確認
 """
 import pandas as pd
-import numpy as np
 from typing import Optional
 import logging
 
 from .base import BaseStrategy, Signal
+from .indicators import rsi as _rsi, macd as _macd
 
 logger = logging.getLogger("strategy.momentum")
-
-
-def _ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def _rsi(close: pd.Series, period: int) -> pd.Series:
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-
-def _macd(close: pd.Series, fast: int, slow: int, signal: int):
-    ema_fast = _ema(close, fast)
-    ema_slow = _ema(close, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = _ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
 
 
 class MomentumStrategy(BaseStrategy):
@@ -53,13 +30,13 @@ class MomentumStrategy(BaseStrategy):
             return None
 
         close = df["Close"].astype(float)
-        rsi = _rsi(close, self.rsi_period)
+        rsi_vals = _rsi(close, self.rsi_period)
         macd_line, signal_line, histogram = _macd(
             close, self.macd_fast, self.macd_slow, self.macd_signal
         )
 
-        rsi_now = rsi.iloc[-1]
-        rsi_prev = rsi.iloc[-2]
+        rsi_now = rsi_vals.iloc[-1]
+        rsi_prev = rsi_vals.iloc[-2]
         hist_now = histogram.iloc[-1]
         hist_prev = histogram.iloc[-2]
         price = close.iloc[-1]

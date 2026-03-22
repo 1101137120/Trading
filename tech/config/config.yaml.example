@@ -36,9 +36,11 @@ screener:
   min_volume: 1000
   min_avg_volume_5d: 2000
   max_stocks: 50
+  max_evaluate: 30   # 策略評估最多跑幾檔（依成交量排序）
 
 strategies:
-  active: ["momentum", "breakout"]
+  # 可任意組合，多策略同時觸發時信心值加成
+  active: ["momentum", "breakout", "mean_reversion", "ema_trend", "kd_cross"]
 
   momentum:
     rsi_period: 14
@@ -62,6 +64,19 @@ strategies:
     price_breakout_pct: 0.02
     lookback_days: 20
     confirm_days: 3
+
+  ema_trend:
+    ema_fast: 5
+    ema_mid: 20
+    ema_slow: 60
+    vol_confirm: true
+    lookback_days: 70
+
+  kd_cross:
+    kd_period: 9
+    k_oversold: 25
+    rsi_period: 14
+    lookback_days: 30
 
 schedule:
   market_open: "09:00"

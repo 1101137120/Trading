@@ -468,8 +468,11 @@ class TradingSystem:
             self.config["strategies"].get("momentum", {}).get("lookback_days", 30),
             self.config["strategies"].get("breakout", {}).get("lookback_days", 20),
             self.config["strategies"].get("mean_reversion", {}).get("lookback_days", 30),
+            self.config["strategies"].get("ema_trend", {}).get("lookback_days", 70),
+            self.config["strategies"].get("kd_cross", {}).get("lookback_days", 30),
         )
-        for c in candidates:
+        max_evaluate = self.config["screener"].get("max_evaluate", 30)
+        for c in candidates[:max_evaluate]:
             code = c["code"]
             if self.portfolio.has_position_or_pending(code):
                 continue
@@ -581,7 +584,14 @@ class TradingSystem:
             self.logger.exception(f"快速出場檢查例外: {e}")
 
     def _force_close_all(self):
-        """收盤前強制平倉所有持倉（由 force_close_minutes_before_close 設定觸發）"""
+        """收盤前強制平倉所有持倉，並取消所有未成交買單"""
+        # 先取消所有掛買單，避免收盤後意外成交
+        for code in list(self.portfolio.pending_orders.keys()):
+            po = self.portfolio.pending_orders.get(code)
+            if po and po.trade_ref:
+                self.broker.cancel_order(po.trade_ref)
+            self.portfolio.cancel_pending(code)
+
         if not self.portfolio.positions:
             return
         count = len(self.portfolio.positions)

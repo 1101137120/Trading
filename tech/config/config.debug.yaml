@@ -45,7 +45,7 @@ screener:
   max_stocks: 20          # debug 先縮小樣本，加快觀察
 
 strategies:
-  active: ["momentum", "breakout"]
+  active: ["momentum", "breakout", "mean_reversion", "ema_trend", "kd_cross"]
 
   momentum:
     rsi_period: 14
@@ -69,6 +69,19 @@ strategies:
     price_breakout_pct: 0.02
     lookback_days: 20
     confirm_days: 3
+
+  ema_trend:
+    ema_fast: 5
+    ema_mid: 20
+    ema_slow: 60
+    vol_confirm: true
+    lookback_days: 70
+
+  kd_cross:
+    kd_period: 9
+    k_oversold: 25
+    rsi_period: 14
+    lookback_days: 30
 
 schedule:
   market_open: "09:00"

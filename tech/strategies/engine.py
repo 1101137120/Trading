@@ -9,6 +9,8 @@ from .base import Signal
 from .momentum import MomentumStrategy
 from .mean_reversion import MeanReversionStrategy
 from .breakout import BreakoutStrategy
+from .ema_trend import EmaTrendStrategy
+from .kd_cross import KdCrossStrategy
 
 logger = logging.getLogger("strategy.engine")
 
@@ -16,6 +18,8 @@ STRATEGY_MAP = {
     "momentum": MomentumStrategy,
     "mean_reversion": MeanReversionStrategy,
     "breakout": BreakoutStrategy,
+    "ema_trend": EmaTrendStrategy,
+    "kd_cross": KdCrossStrategy,
 }
 
 MIN_CONFIDENCE = 0.25
