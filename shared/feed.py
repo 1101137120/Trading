@@ -48,7 +48,9 @@ class MarketDataFeed:
             df = df.resample("D").agg({
                 "Open": "first", "High": "max", "Low": "min",
                 "Close": "last", "Volume": "sum",
-            }).dropna(how="all")
+            })
+            # 只保留有收盤價的交易日（過濾週末、假日、停牌日）
+            df = df[df["Close"].notna() & (df["Close"] > 0)]
             df = df.reset_index()
             df = df.tail(lookback_days).reset_index(drop=True)
 
