@@ -17,6 +17,8 @@ logger = logging.getLogger("standalone_feed")
 
 TSE_DAY_ALL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TSE_STOCK_DAY = "https://www.twse.com.tw/exchangeReport/STOCK_DAY?response=json&date={date}&stockNo={code}"
+_ssl_warned_day_all = False
+_ssl_warned_stock_day = False
 
 
 def fetch_tse_daily_all() -> dict[str, dict]:
@@ -32,7 +34,10 @@ def fetch_tse_daily_all() -> dict[str, dict]:
                 with urlopen(req, timeout=30, context=_ssl_context(verify=verify)) as resp:
                     data = json.loads(resp.read().decode())
                 if not verify:
-                    logger.warning("STOCK_DAY_ALL：SSL 憑證驗證已停用（TWSE 憑證問題），請確認網路環境安全")
+                    global _ssl_warned_day_all
+                    if not _ssl_warned_day_all:
+                        _ssl_warned_day_all = True
+                        logger.warning("STOCK_DAY_ALL：SSL 憑證驗證已停用（TWSE 憑證問題），請確認網路環境安全")
                 break
             except Exception as e:
                 if verify and "certificate" in str(e).lower():
@@ -107,7 +112,10 @@ def fetch_kbars(code: str, lookback_days: int = 60) -> Optional[pd.DataFrame]:
                     with urlopen(req, timeout=15, context=_ssl_context(verify=verify)) as resp:
                         data = json.loads(resp.read().decode())
                     if not verify:
-                        logger.warning(f"STOCK_DAY {code}：SSL 憑證驗證已停用（TWSE 憑證問題）")
+                        global _ssl_warned_stock_day
+                        if not _ssl_warned_stock_day:
+                            _ssl_warned_stock_day = True
+                            logger.warning("STOCK_DAY：SSL 憑證驗證已停用（TWSE 憑證問題），後續同類訊息略過")
                     break
                 except Exception as e:
                     if verify and "certificate" in str(e).lower():

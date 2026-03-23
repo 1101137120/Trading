@@ -97,10 +97,11 @@ class MarketDataFeed:
             if not snaps:
                 return None
             s = snaps[0]
+            prev = getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None)
             return {
                 "code": code, "open": s.open, "high": s.high, "low": s.low,
                 "close": s.close, "volume": s.total_volume,
-                "change_pct": s.change_price / s.yesterday_close if s.yesterday_close else 0,
+                "change_pct": s.change_price / prev if prev else 0,
             }
         except Exception as e:
             logger.error(f"快照失敗 {code}: {e}")
@@ -115,10 +116,11 @@ class MarketDataFeed:
                 snaps = self.api.snapshots(batch)
                 for s in snaps:
                     code = str(s.code)
+                    prev = getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None)
                     result[code] = {
                         "code": code, "open": s.open, "high": s.high, "low": s.low,
                         "close": s.close, "volume": s.total_volume,
-                        "change_pct": s.change_price / s.yesterday_close if s.yesterday_close else 0.0,
+                        "change_pct": s.change_price / prev if prev else 0.0,
                     }
             except Exception as e:
                 logger.warning(f"批次快照失敗 (batch {i}): {e}")

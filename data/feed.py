@@ -97,7 +97,7 @@ class MarketDataFeed:
                 "low": s.low,
                 "close": s.close,
                 "volume": s.total_volume,
-                "change_pct": s.change_price / s.yesterday_close if s.yesterday_close else 0,
+                "change_pct": s.change_price / (getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None) or 1) if s.close else 0,
             }
         except Exception as e:
             logger.error(f"快照失敗 {code}: {e}")
@@ -121,10 +121,10 @@ class MarketDataFeed:
                         "close": s.close,
                         "volume": s.total_volume,
                         "avg_price": s.avg_price,
-                        "yesterday_close": s.yesterday_close,
+                        "yesterday_close": getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None),
                         "change_pct": (
-                            s.change_price / s.yesterday_close
-                            if s.yesterday_close
+                            s.change_price / (getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None))
+                            if (getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None))
                             else 0.0
                         ),
                         "buy_price": s.buy_price,
