@@ -75,6 +75,9 @@ class ValueScanner:
                     continue
                 if pe is not None and pe > 0 and pe > tech_cfg.get("max_pe", 35):
                     continue
+                min_pe = tech_cfg.get("min_pe", 0)
+                if min_pe > 0 and (pe is None or pe <= 0 or pe < min_pe):
+                    continue  # 排除虧損或 PE 過低（資料異常）的股票
                 min_y = (tech_cfg.get("min_dividend_yield") or 0) * 100
                 if min_y > 0 and (yield_pct is None or yield_pct < min_y):
                     continue
