@@ -588,11 +588,66 @@ def main():
             sys.exit(1)
 
     if args.scan_only:
-        # scan-only 不需連券商，僅用證交所/櫃買資料
+        from shared.standalone_feed import fetch_kbars
+        import numpy as np
+
         console.print("[dim]價值篩選使用證交所+櫃買資料（上櫃收盤價由殖利率反推）[/dim]")
         value_scanner = ValueScanner(config, None)
         value_candidates = value_scanner.screen()
-        table = Table(title="價值篩選結果（價值股+科技股）", show_header=True)
+
+        if not value_candidates:
+            console.print("[yellow]無符合條件的標的[/yellow]")
+            return
+
+        # ── 大盤狀態（0050）──
+        rs_cfg = config.get("relative_strength", {})
+        rs_lookback = rs_cfg.get("lookback_days", 20)
+        ma_period = config.get("market_filter", {}).get("ma_period", 20)
+
+        market_status = "未知"
+        market_return = None
+        try:
+            m_df = fetch_kbars("0050", lookback_days=max(rs_lookback, ma_period) + 10)
+            if m_df is not None and len(m_df) >= ma_period:
+                ma = m_df["Close"].tail(ma_period).mean()
+                ma60 = m_df["Close"].tail(60).mean() if len(m_df) >= 60 else None
+                last = m_df["Close"].iloc[-1]
+                market_return = (last / m_df["Close"].iloc[-min(rs_lookback, len(m_df))] - 1) * 100
+                if last > ma and (ma60 is None or last > ma60):
+                    market_status = f"[green]偏多[/green]（0050={last:.1f} > MA{ma_period}={ma:.1f}）"
+                elif last < (ma60 or ma):
+                    market_status = f"[red]偏空[/red]（0050={last:.1f} < MA{ma_period}={ma:.1f}）"
+                else:
+                    market_status = f"[yellow]中性[/yellow]（0050={last:.1f} 介於 MA{ma_period}/{60}之間）"
+        except Exception:
+            pass
+
+        console.print(f"\n大盤狀態：{market_status}")
+        if market_return is not None:
+            clr = "green" if market_return >= 0 else "red"
+            console.print(f"0050 近 {rs_lookback} 日報酬：[{clr}]{market_return:+.2f}%[/{clr}]\n")
+
+        # ── 加計相對強度 ──
+        console.print(f"[dim]計算相對強度（近 {rs_lookback} 日 vs 0050），請稍候...[/dim]")
+        value_candidates = value_scanner.enrich_with_relative_strength(
+            value_candidates,
+            lookback=rs_lookback,
+            market_code="0050",
+        )
+
+        # 加財報評分
+        for c in value_candidates:
+            c["fs"] = value_scanner.calc_fundamental_score(c)
+
+        # 依「財報評分 + 相對強度」排序（各佔一半）
+        def sort_key(c):
+            fs = c.get("fs") or 0
+            rs = c.get("rs_pct") or -999
+            return fs * 0.5 + (rs if rs != -999 else -50) * 0.5
+        value_candidates.sort(key=sort_key, reverse=True)
+
+        # ── 輸出主表 ──
+        table = Table(title="價值篩選結果（財報 + 相對強度）", show_header=True)
         table.add_column("類型", style="dim")
         table.add_column("代碼", style="cyan")
         table.add_column("名稱")
@@ -600,18 +655,52 @@ def main():
         table.add_column("PE", justify="right")
         table.add_column("殖利率%", justify="right")
         table.add_column("PB", justify="right")
+        table.add_column("財報分", justify="right")
+        table.add_column(f"近{rs_lookback}日%", justify="right")
+        table.add_column("vs大盤", justify="right")
+
         for c in value_candidates:
+            typ = "科技" if c.get("type") == "tech" else "價值"
+            rs = c.get("rs_pct")
+            sr = c.get("stock_return")
+            if rs is None:
+                rs_str = "-"
+                sr_str = "-"
+            else:
+                rs_clr = "green" if rs >= 0 else "red"
+                rs_str = f"[{rs_clr}]{rs:+.1f}%[/{rs_clr}]"
+                sr_clr = "green" if (sr or 0) >= 0 else "red"
+                sr_str = f"[{sr_clr}]{sr:+.1f}%[/{sr_clr}]"
+
+            fs = c.get("fs", 0)
+            fs_clr = "green" if fs >= 60 else ("yellow" if fs >= 40 else "red")
+
             table.add_row(
-                c.get("type", "value") == "tech" and "科技" or "價值",
+                typ,
                 c["code"],
-                c.get("name", "")[:8],
+                (c.get("name") or "")[:8],
                 f"{c.get('close', 0):.2f}",
                 str(c.get("pe") or "-"),
                 f"{c.get('yield_pct', 0):.2f}",
                 str(c.get("pb") or "-"),
+                f"[{fs_clr}]{fs}[/{fs_clr}]",
+                sr_str,
+                rs_str,
             )
         console.print(table)
-        console.print(f"[dim]共 {len(value_candidates)} 檔通過價值篩選，需技術確認才下單[/dim]")
+
+        # ── 使用建議 ──
+        top_rs = [c for c in value_candidates if (c.get("rs_pct") or -999) > 0]
+        console.print(
+            f"\n共 [bold]{len(value_candidates)}[/bold] 檔通過價值篩選，"
+            f"其中 [green]{len(top_rs)}[/green] 檔跑贏大盤（相對強度 > 0）"
+        )
+        if "偏空" in market_status:
+            console.print(
+                "[yellow]⚠ 大盤偏空：建議優先關注相對強度 > 0 的標的，"
+                "財報分 ≥ 60 且 vs大盤 > +3% 為較強支撐[/yellow]"
+            )
+        console.print("[dim]最終買賣由您自行判斷，此為篩選參考清單[/dim]")
         return
 
     system = ValueTradingSystem(config, dry_run=args.dry_run)

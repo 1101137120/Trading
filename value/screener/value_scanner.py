@@ -1,11 +1,13 @@
 """
 價值篩選器：以證交所/櫃買基本面篩選
-支援價值股 + 科技股雙軌篩選
+支援價值股 + 科技股雙軌篩選，並可加計相對強度
 """
 import logging
+import time
 from typing import Optional
 
 from shared.twse_feed import fetch_all_fundamentals
+from shared.standalone_feed import fetch_kbars
 
 logger = logging.getLogger("value_scanner")
 
@@ -89,3 +91,66 @@ class ValueScanner:
 
         logger.info(f"價值篩選完成，取得 {len(result)} 檔（價值 {len([r for r in result if r.get('type')=='value'])} + 科技 {len([r for r in result if r.get('type')=='tech'])}）")
         return result
+
+    def calc_fundamental_score(self, c: dict) -> float:
+        """
+        財報評分 0~100（越高越好）
+        由 PE、殖利率、PB 三項加權合成，供人工判斷用
+        """
+        score = 0.0
+        pe = c.get("pe")
+        yield_pct = c.get("yield_pct") or 0
+        pb = c.get("pb")
+
+        # PE：< 10 滿分，10~20 線性，> 20 得 0
+        if pe and pe > 0:
+            score += max(0, min(40, (20 - pe) / 20 * 40))
+
+        # 殖利率：> 5% 滿分，0~5% 線性
+        score += min(40, yield_pct / 5 * 40)
+
+        # PB：< 1 滿分，1~4 線性，> 4 得 0
+        if pb and pb > 0:
+            score += max(0, min(20, (4 - pb) / 4 * 20))
+
+        return round(score, 1)
+
+    def enrich_with_relative_strength(
+        self, candidates: list[dict], lookback: int = 20, market_code: str = "0050"
+    ) -> list[dict]:
+        """
+        計算每支候選股票相對大盤（0050）的近 N 日相對強度。
+        rs_pct > 0 = 跑贏大盤，越高越好。
+        """
+        # 取 0050 K棒作為基準
+        market_df = fetch_kbars(market_code, lookback_days=lookback + 10)
+        if market_df is None or len(market_df) < lookback:
+            logger.warning(f"無法取得 {market_code} K棒，跳過相對強度計算")
+            for c in candidates:
+                c["rs_pct"] = None
+                c["stock_return"] = None
+            return candidates
+
+        market_return = (
+            market_df["Close"].iloc[-1] / market_df["Close"].iloc[-min(lookback, len(market_df))] - 1
+        ) * 100
+
+        for c in candidates:
+            try:
+                df = fetch_kbars(c["code"], lookback_days=lookback + 10)
+                time.sleep(0.1)   # 避免打爆 TWSE API
+                if df is None or len(df) < lookback:
+                    c["rs_pct"] = None
+                    c["stock_return"] = None
+                    continue
+                stock_return = (
+                    df["Close"].iloc[-1] / df["Close"].iloc[-min(lookback, len(df))] - 1
+                ) * 100
+                c["stock_return"] = round(stock_return, 2)
+                c["rs_pct"] = round(stock_return - market_return, 2)
+            except Exception as e:
+                logger.debug(f"相對強度計算失敗 {c.get('code')}: {e}")
+                c["rs_pct"] = None
+                c["stock_return"] = None
+
+        return candidates
