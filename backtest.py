@@ -91,6 +91,38 @@ def make_backtest_config(base: dict, strategies) -> dict:
 # 回測核心
 # ──────────────────────────────────────────────
 
+def build_dynamic_pool(
+    all_kbars: dict[str, pd.DataFrame],
+    max_stocks: int,
+    vol_window: int = 5,
+) -> dict:
+    """
+    逐日計算各股過去 vol_window 日均量，取前 max_stocks 檔作為當日可進場標的。
+
+    解決存活者偏差：避免用「今天」成交量前 N 去回測歷史，
+    而是每個交易日只允許「當天」排名前 N 的股票產生訊號，
+    模擬當時真實可操作的股票池。
+    """
+    # 收集所有出現過的交易日
+    all_dates = sorted({
+        row.date()
+        for df in all_kbars.values()
+        for row in df["ts"]
+    })
+
+    pool_by_date: dict[date, set] = {}
+    for d in all_dates:
+        vol_scores = {}
+        for code, df in all_kbars.items():
+            recent = df[df["ts"].dt.date <= d].tail(vol_window)
+            if not recent.empty:
+                vol_scores[code] = recent["Volume"].mean()
+        top = sorted(vol_scores, key=vol_scores.get, reverse=True)[:max_stocks]
+        pool_by_date[d] = set(top)
+
+    return pool_by_date
+
+
 def simulate_trades(
     df: pd.DataFrame,
     engine: StrategyEngine,
@@ -102,6 +134,7 @@ def simulate_trades(
     market_df: pd.DataFrame = None,
     market_ma_period: int = 20,
     loss_cooldown_days: int = 0,
+    dynamic_pool: dict = None,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -109,6 +142,7 @@ def simulate_trades(
     - 出場：次日起每日收盤檢查停損 / 停利；回測結束強制平倉
     - market_df：0050 日 K，有傳時只在大盤 > MA20 時開倉
     - loss_cooldown_days：停損後冷卻天數內不再進場
+    - dynamic_pool：{date: set(code)}，有傳時只在該股票當日在池內才進場
     回傳每筆交易的明細。
     """
     trades = []
@@ -168,6 +202,10 @@ def simulate_trades(
 
         # ── 空倉：大盤過濾 ──
         if market_allow and not market_allow.get(row_date, True):
+            continue
+
+        # ── 空倉：動態股票池（消除存活者偏差）──
+        if dynamic_pool and code not in dynamic_pool.get(row_date, set()):
             continue
 
         # ── 空倉：個股冷卻 ──
@@ -376,6 +414,12 @@ def main():
                         help="個股停損後冷卻天數（預設 0=停用），建議 3~7")
     parser.add_argument("--max-avg-range", type=float, default=0.0,
                         help="排除日均振幅 > 此值%%的高波動股（預設 0=停用），建議 6~8")
+    parser.add_argument("--dynamic-pool", action="store_true", default=True,
+                        help="啟用動態股票池（消除存活者偏差），預設開啟")
+    parser.add_argument("--no-dynamic-pool", action="store_true",
+                        help="停用動態股票池（用今日快照固定選股）")
+    parser.add_argument("--universe-mult", type=int, default=3,
+                        help="動態池 universe 倍數：實際下載 stocks×N 檔再每日排名，預設 3")
     parser.add_argument("--fee-rate", type=float, default=0.001425,
                         help="手續費率（單邊），預設 0.001425")
     parser.add_argument("--min-fee", type=float, default=20.0,
@@ -417,16 +461,24 @@ def main():
         sys.exit(1)
 
     exclude_etf = args.exclude_etf and not args.include_etf
-    pool = [
+    use_dynamic_pool = args.dynamic_pool and not args.no_dynamic_pool
+
+    candidates = [
         s for s in snapshots.values()
         if args.min_price <= s["close"] <= args.max_price
         and s["volume"] >= args.min_volume
         and (not exclude_etf or not is_etf_code(s["code"]))
     ]
-    pool.sort(key=lambda x: x["volume"], reverse=True)
-    pool = pool[:args.stocks]
+    candidates.sort(key=lambda x: x["volume"], reverse=True)
+
+    # 動態池模式：多下載 universe_mult 倍股票，每日排名取前 stocks 檔
+    universe_size = args.stocks * args.universe_mult if use_dynamic_pool else args.stocks
+    pool = candidates[:universe_size]
     etf_note = "（已排除 ETF）" if exclude_etf else "（含 ETF）"
-    console.print(f"股票池: [bold]{len(pool)}[/bold] 檔 [dim]{etf_note}[/dim]")
+    if use_dynamic_pool:
+        console.print(f"Universe: [bold]{len(pool)}[/bold] 檔下載 → 每日動態取前 [bold]{args.stocks}[/bold] 檔 [dim]{etf_note}[/dim]")
+    else:
+        console.print(f"股票池: [bold]{len(pool)}[/bold] 檔 [dim]（固定，存在存活者偏差）{etf_note}[/dim]")
 
     # ── 載入大盤 K 棒（0050）──
     use_market_filter = args.market_filter and not args.no_market_filter
@@ -444,24 +496,23 @@ def main():
 
     loss_cooldown = args.loss_cooldown
 
-    # ── 逐檔拉 K 棒並回測 ──
-    all_trades: list[dict] = []
+    # ── 第一輪：下載所有 K 棒 ──
+    all_kbars: dict[str, pd.DataFrame] = {}
+    stock_meta: dict[str, str] = {}  # code → name
     failed = 0
     failed_items: list[tuple[str, str]] = []
+    lookback_needed = (end - start).days + 90  # 多拉 90 天供 EMA60 warmup
 
-    with console.status("[dim]下載 K 棒並模擬交易...[/dim]") as status:
+    with console.status("[dim]下載 K 棒...[/dim]") as status:
         for i, stock in enumerate(pool):
             code = stock["code"]
             status.update(f"[dim]({i+1}/{len(pool)}) {code} {stock.get('name','')}[/dim]")
 
-            # 多拉 90 天供 EMA60 warmup
-            lookback_needed = (end - start).days + 90
             df = None
             for attempt in range(1, max(1, args.kbars_retries) + 1):
                 df = fetch_kbars(code, lookback_days=lookback_needed)
                 if df is not None and len(df) >= 60:
                     break
-                # 指數退避 + 抖動，降低 API 波動期間的整批失敗率
                 if attempt < args.kbars_retries:
                     sleep_s = args.retry_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.15)
                     time.sleep(sleep_s)
@@ -470,11 +521,27 @@ def main():
                 failed_items.append((code, str(stock.get("name", "")).strip()))
                 continue
 
-            # 除權/分割回填調整：yfinance 已自動調整，TWSE fallback 才需要
-            # （adjust_splits 偵測 >25% 單日跳空並回填，處理 TWSE 未還原資料）
             df = adjust_splits(df)
+            all_kbars[code] = df
+            stock_meta[code] = str(stock.get("name", "")).strip()
+            time.sleep(0.15)
 
-            # 波動過濾：排除日均振幅過大的股票
+    # ── 建立動態股票池（消除存活者偏差）──
+    dynamic_pool = None
+    if use_dynamic_pool and all_kbars:
+        with console.status("[dim]建立動態股票池（逐日排名）...[/dim]"):
+            dynamic_pool = build_dynamic_pool(all_kbars, args.stocks)
+        console.print(f"[dim]動態池建立完成（{len(dynamic_pool)} 個交易日）[/dim]")
+
+    # ── 第二輪：逐檔回測 ──
+    all_trades: list[dict] = []
+
+    with console.status("[dim]模擬交易...[/dim]") as status:
+        items = list(all_kbars.items())
+        for i, (code, df) in enumerate(items):
+            status.update(f"[dim]({i+1}/{len(items)}) {code} {stock_meta.get(code,'')}[/dim]")
+
+            # 波動過濾
             if args.max_avg_range > 0:
                 recent = df.tail(10)
                 valid = recent[recent["Close"] > 0]
@@ -488,12 +555,11 @@ def main():
                 market_df=market_df,
                 market_ma_period=args.market_ma,
                 loss_cooldown_days=loss_cooldown,
+                dynamic_pool=dynamic_pool,
             )
-            stock_name = str(stock.get("name", "")).strip()
             for t in trades:
-                t["name"] = stock_name
+                t["name"] = stock_meta.get(code, "")
             all_trades.extend(trades)
-            time.sleep(0.15)  # 避免打爆 TWSE API
 
     console.print(f"[dim]下載失敗或資料不足: {failed} 檔[/dim]\n")
     if failed_items:
