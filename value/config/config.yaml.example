@@ -41,6 +41,52 @@ tech_screener:
   max_price: 1000.0
   max_stocks: 15
 
+relative_strength:
+  lookbacks: [20, 60, 120]     # 多週期報酬率
+  weights: [0.5, 0.3, 0.2]     # 對應週期權重（會自動正規化）
+  volatility_penalty: 0.20     # 近20日波動懲罰係數（0=不懲罰）
+  market_code: "0050"          # 大盤代理
+  fs_weight: 0.4               # 基本面分在綜合排序的權重
+  rs_weight: 0.6               # RS分在綜合排序的權重（偏品質+動能）
+
+quality_factors:
+  enabled: true
+  source: "yfinance"
+  real_quality_weight: 0.7
+  max_calls_per_run: 40
+  sleep_seconds: 0.05
+  weights:
+    roe: 14
+    eps_growth: 10
+    revenue_growth: 10
+    debt_to_equity: 6
+
+v2_gate:
+  enabled: true
+  hard_filters:
+    min_fs_total: 55.0
+    require_pe_positive: true
+    pe_min: 6.0
+    pe_max: 120.0
+    pb_max: 5.0
+    yield_min_pct: 0.0
+    yield_max_pct: 12.0
+    min_price: 10.0
+    max_price: 2000.0
+    min_roe_pct: null
+    min_eps_growth_pct: null
+    min_revenue_growth_pct: null
+    max_debt_to_equity: null
+    require_real_quality_metrics: false
+  rs:
+    require_positive: true
+    min_rs_score: 0.0
+  diversification:
+    max_per_type:
+      value: 10
+      tech: 15
+    max_same_prefix2: 4
+
 market_filter:
   enabled: true
   proxy_code: "0050"

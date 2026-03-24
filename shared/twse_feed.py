@@ -11,6 +11,7 @@ from typing import Optional
 from urllib.request import urlopen, Request
 
 logger = logging.getLogger("twse_feed")
+_ssl_warned_tpex = False
 
 
 def _ssl_context(verify: bool = True):
@@ -90,6 +91,7 @@ def fetch_twse_fundamentals(date: str = None) -> dict[str, dict]:
                     "name": name,
                     "close": close,
                     "yield_pct": yield_pct,
+                    "dividend_per_share": None,  # TWSE BWIBBU_d 未直接提供每股股利
                     "pe": pe,
                     "pb": pb,
                     "exchange": "TSE",
@@ -112,8 +114,25 @@ def fetch_tpex_fundamentals() -> dict[str, dict]:
 
     try:
         req = Request(TPEX_PERATIO, headers={"User-Agent": "Mozilla/5.0"})
-        with urlopen(req, timeout=15, context=_ssl_context()) as resp:
-            data = json.loads(resp.read().decode())
+        data = None
+        for verify in (True, False):
+            try:
+                with urlopen(req, timeout=15, context=_ssl_context(verify=verify)) as resp:
+                    data = json.loads(resp.read().decode())
+                if not verify:
+                    global _ssl_warned_tpex
+                    if not _ssl_warned_tpex:
+                        _ssl_warned_tpex = True
+                        logger.warning("TPEX：SSL 憑證驗證已停用（公開資料讀取），後續同類訊息略過")
+                break
+            except (ssl.SSLCertVerificationError, OSError) as e:
+                if verify and "certificate" in str(e).lower():
+                    logger.debug("TPEX SSL 驗證失敗，改用不驗證模式（公開資料）")
+                    continue
+                raise
+
+        if data is None:
+            return result
 
         if not isinstance(data, list):
             logger.warning("TPEX 回傳格式異常")
@@ -142,6 +161,7 @@ def fetch_tpex_fundamentals() -> dict[str, dict]:
                 "name": name,
                 "close": close,
                 "yield_pct": yield_pct or 0,
+                "dividend_per_share": div,
                 "pe": pe,
                 "pb": pb,
                 "exchange": "OTC",

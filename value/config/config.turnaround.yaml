@@ -1,0 +1,61 @@
+extends: "config.yaml"
+
+# 受委屈的種子（轉機股 Lite 可出名單版）：
+# 1) PB < 2.0 安全邊際（再放寬）
+# 2) 營收成長 > 10%
+# 3) 不再硬卡 EPS<0 或 高PE（改為後續觀察）
+# 4) 負債權益比 < 120
+selection_overrides:
+  # 轉機股希望涵蓋更多科技/景氣循環標的
+  manual_include_codes: []
+
+value_screener:
+  max_stocks: 30
+
+tech_screener:
+  enabled: true
+  max_stocks: 120
+  max_pe: 999
+  min_pe: 0
+  min_dividend_yield: 0
+  max_pb: 8.0
+
+relative_strength:
+  # 轉機初段先以基本面訊號優先，RS 只當參考
+  fs_weight: 0.75
+  rs_weight: 0.25
+  volatility_penalty: 0.10
+
+quality_factors:
+  real_quality_weight: 0.85
+  max_calls_per_run: 220
+  sleep_seconds: 0.03
+
+v2_gate:
+  hard_filters:
+    # 轉機模式用 PB/營收/負債 + turnaround_pe 作主篩，不硬卡 fs
+    min_fs_total: 0.0
+    min_fs_total_value: 0.0
+    min_fs_total_tech: 0.0
+    require_pe_positive: false
+    pe_min: 0.0
+    pe_max: 999.0
+    pb_max: 2.0
+    yield_min_pct: 0.0
+    yield_max_pct: 20.0
+    min_roe_pct: null
+    min_eps_growth_pct: null
+    min_revenue_growth_pct: 10.0
+    max_debt_to_equity: 120.0
+    require_real_quality_metrics: false
+  turnaround_filters:
+    require_eps_negative_or_high_pe: false
+    high_pe_threshold: 25.0
+  rs:
+    require_positive: false
+    min_rs_score: -999.0
+  diversification:
+    max_per_type:
+      value: 20
+      tech: 80
+    max_same_prefix2: 20

@@ -102,7 +102,8 @@ def fetch_kbars(code: str, lookback_days: int = 60) -> Optional[pd.DataFrame]:
     """取得個股日 K 棒（證交所 STOCK_DAY）"""
     dfs = []
     end = datetime.now()
-    for _ in range(3):  # 最多取 3 個月
+    months_needed = max(3, lookback_days // 20 + 2)  # 每月約 20 交易日
+    for _ in range(months_needed):  # 動態計算需要幾個月
         date_str = end.strftime("%Y%m%d")
         url = TSE_STOCK_DAY.format(date=date_str, code=code)
         try:

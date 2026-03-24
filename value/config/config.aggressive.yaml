@@ -1,0 +1,37 @@
+extends: "config.yaml"
+
+risk:
+  max_positions: 6
+  max_position_pct: 0.25
+  stop_loss_pct: 0.10
+  take_profit_pct: 0.30
+
+relative_strength:
+  fs_weight: 0.30
+  rs_weight: 0.70
+  volatility_penalty: 0.10
+
+quality_factors:
+  real_quality_weight: 0.55
+
+v2_gate:
+  hard_filters:
+    min_fs_total: 45.0
+    pe_min: 3.0
+    pe_max: 180.0
+    pb_max: 8.0
+    yield_min_pct: 0.0
+    yield_max_pct: 15.0
+    min_roe_pct: null
+    min_eps_growth_pct: null
+    min_revenue_growth_pct: null
+    max_debt_to_equity: null
+    require_real_quality_metrics: false
+  rs:
+    require_positive: false
+    min_rs_score: -3.0
+  diversification:
+    max_per_type:
+      value: 12
+      tech: 20
+    max_same_prefix2: 6

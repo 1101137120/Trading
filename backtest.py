@@ -13,6 +13,7 @@ import sys
 import time
 import argparse
 import logging
+import random
 from pathlib import Path
 from datetime import datetime, date
 
@@ -28,6 +29,10 @@ from tech.strategies.engine import StrategyEngine
 
 console = Console()
 logging.basicConfig(level=logging.WARNING)
+
+
+def is_etf_code(code: str) -> bool:
+    return str(code).startswith("00")
 
 
 # ──────────────────────────────────────────────
@@ -127,6 +132,123 @@ def simulate_trades(
 
 
 # ──────────────────────────────────────────────
+# 資金模擬（含張數、實際損益）
+# ──────────────────────────────────────────────
+
+def portfolio_simulation(
+    all_trades: list[dict],
+    initial_capital: float,
+    position_pct: float,
+    max_positions: int,
+    fee_rate: float = 0.001425,
+    min_fee: float = 20.0,
+    tax_stock_rate: float = 0.003,
+    tax_etf_rate: float = 0.001,
+) -> dict:
+    """
+    依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
+    規則：
+    - 每筆最多投入 position_pct × 當下可用資金
+    - 同時持倉不超過 max_positions
+    - 1 張 = 1000 股
+    """
+    trades_sorted = sorted(all_trades, key=lambda x: (x["entry_date"], x["code"]))
+
+    capital = initial_capital
+    peak_capital = initial_capital
+    max_drawdown = 0.0
+    active: list[dict] = []   # {exit_date, exit_cash}
+    taken: list[dict] = []
+    total_fees = 0.0
+    total_taxes = 0.0
+
+    for trade in trades_sorted:
+        entry_date = trade["entry_date"]
+
+        # 釋放已平倉的持倉
+        still_active = []
+        for pos in active:
+            if pos["exit_date"] <= entry_date:
+                capital += pos["exit_cash"]
+                peak_capital = max(peak_capital, capital)
+                dd = (peak_capital - capital) / peak_capital * 100
+                max_drawdown = max(max_drawdown, dd)
+            else:
+                still_active.append(pos)
+        active = still_active
+
+        if len(active) >= max_positions:
+            continue
+
+        alloc = capital * position_pct
+        one_lot_cost = trade["entry_price"] * 1000
+        one_lot_fee_buy = max(one_lot_cost * fee_rate, min_fee)
+        if alloc < one_lot_cost + one_lot_fee_buy:
+            continue  # 買不起 1 張
+
+        lots = int(alloc / (trade["entry_price"] * 1000 * (1 + fee_rate)))
+        if lots <= 0:
+            continue
+
+        cost = lots * trade["entry_price"] * 1000
+        fee_buy = max(cost * fee_rate, min_fee)
+        while lots > 0 and (cost + fee_buy) > alloc:
+            lots -= 1
+            cost = lots * trade["entry_price"] * 1000
+            fee_buy = max(cost * fee_rate, min_fee) if lots > 0 else 0
+        if lots <= 0:
+            continue
+
+        gross_pnl_dollars = lots * 1000 * (trade["exit_price"] - trade["entry_price"])
+        sell_amount = lots * trade["exit_price"] * 1000
+        fee_sell = max(sell_amount * fee_rate, min_fee)
+        tax_rate = tax_etf_rate if is_etf_code(trade["code"]) else tax_stock_rate
+        tax = sell_amount * tax_rate
+        net_pnl_dollars = gross_pnl_dollars - fee_buy - fee_sell - tax
+
+        capital -= (cost + fee_buy)
+        total_fees += fee_buy + fee_sell
+        total_taxes += tax
+
+        taken.append({
+            **trade,
+            "lots": lots,
+            "cost": round(cost, 0),
+            "fee_buy": round(fee_buy, 0),
+            "fee_sell": round(fee_sell, 0),
+            "tax": round(tax, 0),
+            "fee_tax_total": round(fee_buy + fee_sell + tax, 0),
+            "gross_pnl_dollars": round(gross_pnl_dollars, 0),
+            "pnl_dollars": round(net_pnl_dollars, 0),  # 相容舊欄位：改為淨損益
+            "net_pnl_dollars": round(net_pnl_dollars, 0),
+        })
+        active.append({
+            "exit_date": trade["exit_date"],
+            "exit_cash": cost + gross_pnl_dollars - fee_sell - tax,
+        })
+
+    # 回測結束，釋放剩餘持倉
+    for pos in active:
+        capital += pos["exit_cash"]
+    peak_capital = max(peak_capital, capital)
+    final_dd = (peak_capital - capital) / peak_capital * 100
+    max_drawdown = max(max_drawdown, final_dd)
+
+    total_return_pct = (capital - initial_capital) / initial_capital * 100
+    return {
+        "taken_trades": taken,
+        "initial_capital": initial_capital,
+        "final_capital": round(capital, 0),
+        "total_return_pct": round(total_return_pct, 2),
+        "max_drawdown_pct": round(max_drawdown, 2),
+        "skipped": len(all_trades) - len(taken),
+        "total_fees": round(total_fees, 0),
+        "total_taxes": round(total_taxes, 0),
+        "total_fee_tax": round(total_fees + total_taxes, 0),
+    }
+
+
+# ──────────────────────────────────────────────
 # 結果統計
 # ──────────────────────────────────────────────
 
@@ -159,7 +281,7 @@ def summarize(all_trades: list[dict]) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description="策略回測（TWSE 歷史 K 棒）")
-    parser.add_argument("--start",      default="2026-01-01", help="回測起始日 YYYY-MM-DD")
+    parser.add_argument("--start",      default="2025-03-01", help="回測起始日 YYYY-MM-DD")
     parser.add_argument("--end",        default=date.today().strftime("%Y-%m-%d"), help="回測結束日")
     parser.add_argument("--stocks",     type=int, default=50, help="最多回測幾檔（依成交量排序）")
     parser.add_argument("--min-price",  type=float, default=10.0)
@@ -170,6 +292,26 @@ def main():
     parser.add_argument("--strategies", nargs="+",  default=None,
                         help="指定策略，空白分隔，預設讀 config")
     parser.add_argument("--config",     default="tech/config/config.yaml")
+    parser.add_argument("--capital",    type=float, default=1_000_000,
+                        help="初始資金（元），預設 100 萬")
+    parser.add_argument("--position-pct", type=float, default=0.10,
+                        help="每筆投入比例（0~1），預設 0.10 = 10%%")
+    parser.add_argument("--max-positions", type=int, default=None,
+                        help="最大同時持倉數，預設讀 config risk.max_positions")
+    parser.add_argument("--kbars-retries", type=int, default=3,
+                        help="每檔 K 棒下載重試次數（預設 3）")
+    parser.add_argument("--retry-sleep", type=float, default=0.35,
+                        help="每次重試前等待秒數（預設 0.35）")
+    parser.add_argument("--exclude-etf", action="store_true",
+                        help="排除 ETF（代碼 00 開頭）")
+    parser.add_argument("--fee-rate", type=float, default=0.001425,
+                        help="手續費率（單邊），預設 0.001425")
+    parser.add_argument("--min-fee", type=float, default=20.0,
+                        help="單邊最低手續費，預設 20 元")
+    parser.add_argument("--tax-stock-rate", type=float, default=0.003,
+                        help="股票賣出證交稅率，預設 0.003")
+    parser.add_argument("--tax-etf-rate", type=float, default=0.001,
+                        help="ETF 賣出稅率，預設 0.001")
     args = parser.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -185,11 +327,13 @@ def main():
     cfg = make_backtest_config(base_cfg, args.strategies)
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
+    max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
     active = cfg["strategies"].get("active", [])
 
     console.rule(f"[bold]策略回測 {args.start} → {args.end}[/bold]")
     console.print(f"策略: [cyan]{', '.join(active)}[/cyan]  |  "
-                  f"停損: [red]{sl*100:.1f}%[/red]  停利: [green]{tp*100:.1f}%[/green]")
+                  f"停損: [red]{sl*100:.1f}%[/red]  停利: [green]{tp*100:.1f}%[/green]  |  "
+                  f"初始資金: [bold]{args.capital:,.0f}[/bold]  每筆: {args.position_pct*100:.0f}%  最多持倉: {max_pos}")
 
     engine = StrategyEngine(cfg)
 
@@ -204,30 +348,56 @@ def main():
         s for s in snapshots.values()
         if args.min_price <= s["close"] <= args.max_price
         and s["volume"] >= args.min_volume
+        and (not args.exclude_etf or not is_etf_code(s["code"]))
     ]
     pool.sort(key=lambda x: x["volume"], reverse=True)
     pool = pool[:args.stocks]
     console.print(f"股票池: [bold]{len(pool)}[/bold] 檔")
+    if args.exclude_etf:
+        console.print("[dim]已排除 ETF（00 開頭）[/dim]")
 
     # ── 逐檔拉 K 棒並回測 ──
     all_trades: list[dict] = []
     failed = 0
+    failed_items: list[tuple[str, str]] = []
 
     with console.status("[dim]下載 K 棒並模擬交易...[/dim]") as status:
         for i, stock in enumerate(pool):
             code = stock["code"]
             status.update(f"[dim]({i+1}/{len(pool)}) {code} {stock.get('name','')}[/dim]")
 
-            df = fetch_kbars(code, lookback_days=120)
-            if df is None or len(df) < 30:
+            # 多拉 90 天供 EMA60 warmup
+            lookback_needed = (end - start).days + 90
+            df = None
+            for attempt in range(1, max(1, args.kbars_retries) + 1):
+                df = fetch_kbars(code, lookback_days=lookback_needed)
+                if df is not None and len(df) >= 60:
+                    break
+                # 指數退避 + 抖動，降低 API 波動期間的整批失敗率
+                if attempt < args.kbars_retries:
+                    sleep_s = args.retry_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.15)
+                    time.sleep(sleep_s)
+            if df is None or len(df) < 60:
                 failed += 1
+                failed_items.append((code, str(stock.get("name", "")).strip()))
                 continue
 
             trades = simulate_trades(df, engine, code, start, end, sl, tp)
+            stock_name = str(stock.get("name", "")).strip()
+            for t in trades:
+                t["name"] = stock_name
             all_trades.extend(trades)
             time.sleep(0.15)  # 避免打爆 TWSE API
 
     console.print(f"[dim]下載失敗或資料不足: {failed} 檔[/dim]\n")
+    if failed_items:
+        preview_items = [
+            f"{code}({name})" if name else code
+            for code, name in failed_items[:20]
+        ]
+        preview = ", ".join(preview_items)
+        more = f" ... 另有 {len(failed_items) - 20} 檔" if len(failed_items) > 20 else ""
+        console.print(f"[dim]失敗清單: {preview}{more}[/dim]\n")
 
     # ── 顯示結果 ──
     if not all_trades:
@@ -274,6 +444,7 @@ def main():
     def _trade_table(title: str, rows: pd.DataFrame):
         t = Table(title=title, show_header=True)
         t.add_column("代碼", style="cyan")
+        t.add_column("名稱")
         t.add_column("進場", style="dim")
         t.add_column("出場", style="dim")
         t.add_column("進場價", justify="right")
@@ -286,6 +457,7 @@ def main():
             clr = "green" if r["pnl_pct"] > 0 else "red"
             t.add_row(
                 str(r["code"]),
+                str(r.get("name", "")),
                 str(r["entry_date"]),
                 str(r["exit_date"]),
                 f"{r['entry_price']:.2f}",
@@ -307,10 +479,83 @@ def main():
     console.print(f"\n出場原因: " +
         " | ".join(f"{k}: {v}筆" for k, v in reason_counts.items()))
 
-    # 存 CSV
+    # ── 資金模擬 ──
+    console.rule("\n[bold]資金模擬（含張數 / 實際損益）[/bold]")
+    psim = portfolio_simulation(
+        all_trades,
+        args.capital,
+        args.position_pct,
+        max_pos,
+        fee_rate=args.fee_rate,
+        min_fee=args.min_fee,
+        tax_stock_rate=args.tax_stock_rate,
+        tax_etf_rate=args.tax_etf_rate,
+    )
+
+    cap_clr = "green" if psim["total_return_pct"] >= 0 else "red"
+    cap_table = Table(show_header=False, box=None)
+    cap_table.add_column("項目", style="dim")
+    cap_table.add_column("數值", justify="right")
+    cap_table.add_row("初始資金",   f"{psim['initial_capital']:>12,.0f} 元")
+    cap_table.add_row("最終資金",   f"[{cap_clr}]{psim['final_capital']:>12,.0f} 元[/{cap_clr}]")
+    cap_table.add_row("實際報酬",   f"[{cap_clr}]{psim['total_return_pct']:+.2f}%[/{cap_clr}]")
+    cap_table.add_row("最大回撤",   f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]")
+    cap_table.add_row("總手續費",   f"{psim['total_fees']:>12,.0f} 元")
+    cap_table.add_row("總證交稅",   f"{psim['total_taxes']:>12,.0f} 元")
+    cap_table.add_row("費稅合計",   f"{psim['total_fee_tax']:>12,.0f} 元")
+    cap_table.add_row("實際執行筆數", str(len(psim["taken_trades"])))
+    cap_table.add_row("跳過（資金/倉位不足）", str(psim["skipped"]))
+    console.print(cap_table)
+
+    if psim["taken_trades"]:
+        taken_df = pd.DataFrame(psim["taken_trades"]).sort_values("net_pnl_dollars", ascending=False)
+
+        def _money_table(title: str, rows: pd.DataFrame):
+            t = Table(title=title, show_header=True)
+            t.add_column("代碼", style="cyan")
+            t.add_column("名稱")
+            t.add_column("進場", style="dim")
+            t.add_column("出場", style="dim")
+            t.add_column("進場價", justify="right")
+            t.add_column("出場價", justify="right")
+            t.add_column("張數", justify="right")
+            t.add_column("成本(元)", justify="right")
+            t.add_column("費稅(元)", justify="right")
+            t.add_column("毛損益(元)", justify="right")
+            t.add_column("淨損益(元)", justify="right")
+            t.add_column("損益%", justify="right")
+            t.add_column("策略", style="dim")
+            for _, r in rows.iterrows():
+                clr = "green" if r["net_pnl_dollars"] > 0 else "red"
+                t.add_row(
+                    str(r["code"]),
+                    str(r.get("name", "")),
+                    str(r["entry_date"]),
+                    str(r["exit_date"]),
+                    f"{r['entry_price']:.2f}",
+                    f"{r['exit_price']:.2f}",
+                    str(int(r["lots"])),
+                    f"{r['cost']:,.0f}",
+                    f"{r.get('fee_tax_total', 0):,.0f}",
+                    f"{r.get('gross_pnl_dollars', 0):+,.0f}",
+                    f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
+                    f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
+                    str(r["strategy"]),
+                )
+            return t
+
+        console.print()
+        console.print(_money_table("最佳 10 筆（損益金額）", taken_df.head(10)))
+        console.print()
+        console.print(_money_table("最差 10 筆（損益金額）", taken_df.tail(10).iloc[::-1]))
+
+    # 存 CSV（含張數與損益金額）
     out_path = Path("backtest_result.csv")
-    s["trades"].to_csv(out_path, index=False, encoding="utf-8-sig")
-    console.print(f"\n[dim]詳細明細已存至 {out_path}[/dim]")
+    if psim["taken_trades"]:
+        pd.DataFrame(psim["taken_trades"]).to_csv(out_path, index=False, encoding="utf-8-sig")
+    else:
+        s["trades"].to_csv(out_path, index=False, encoding="utf-8-sig")
+    console.print(f"\n[dim]詳細明細（含張數/損益元）已存至 {out_path}[/dim]")
 
 
 if __name__ == "__main__":

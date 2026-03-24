@@ -1,0 +1,37 @@
+extends: "config.yaml"
+
+# 平衡：沿用目前主設定（作為版本鎖定快照）
+relative_strength:
+  fs_weight: 0.55
+  rs_weight: 0.45
+  volatility_penalty: 0.20
+
+quality_factors:
+  real_quality_weight: 0.70
+
+tech_screener:
+  max_stocks: 40
+
+v2_gate:
+  hard_filters:
+    min_fs_total: 55.0
+    min_fs_total_value: 55.0
+    min_fs_total_tech: 35.0
+    pe_min: 6.0
+    pe_max: 120.0
+    pb_max: 5.0
+    yield_min_pct: 0.0
+    yield_max_pct: 12.0
+    min_roe_pct: null
+    min_eps_growth_pct: null
+    min_revenue_growth_pct: null
+    max_debt_to_equity: null
+    require_real_quality_metrics: false
+  rs:
+    require_positive: false
+    min_rs_score: -2.0
+  diversification:
+    max_per_type:
+      value: 10
+      tech: 30
+    max_same_prefix2: 12

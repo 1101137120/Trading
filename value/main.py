@@ -21,6 +21,7 @@ import signal
 import argparse
 import logging
 from datetime import datetime, timedelta
+from copy import deepcopy
 
 import yaml
 import schedule
@@ -48,8 +49,30 @@ PENDING_SELL_TIMEOUT_MINUTES = 5
 def load_config(path: Path = None) -> dict:
     path = path or PROJECT_ROOT / "config" / "config.yaml"
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
+        def _read_yaml(p: Path) -> dict:
+            with open(p, "r", encoding="utf-8") as f:
+                d = yaml.safe_load(f)
+            if d is None:
+                raise ValueError(f"設定檔為空: {p}")
+            return d
+
+        def _deep_merge(base: dict, override: dict) -> dict:
+            out = deepcopy(base)
+            for k, v in (override or {}).items():
+                if isinstance(v, dict) and isinstance(out.get(k), dict):
+                    out[k] = _deep_merge(out[k], v)
+                else:
+                    out[k] = v
+            return out
+
+        data = _read_yaml(path)
+        extends = data.get("extends")
+        if extends:
+            base_path = (path.parent / str(extends)).resolve()
+            if not base_path.exists():
+                raise FileNotFoundError(f"extends 指向的檔案不存在: {base_path}")
+            base_data = _read_yaml(base_path)
+            data = _deep_merge(base_data, {k: v for k, v in data.items() if k != "extends"})
         if data is None:
             raise ValueError("設定檔為空")
         return data
@@ -65,6 +88,44 @@ def signal_handler(sig, frame):
     global _running
     console.print("\n[yellow]收到中斷訊號，準備結束...[/yellow]")
     _running = False
+
+
+def resolve_rs_params(config: dict) -> dict:
+    rs_cfg = config.get("relative_strength", {})
+    market_code = rs_cfg.get("market_code", "0050")
+    lookbacks = rs_cfg.get("lookbacks")
+    if not lookbacks:
+        lookbacks = [rs_cfg.get("lookback_days", 20)]  # 相容舊設定
+    lookbacks = sorted({int(x) for x in lookbacks if int(x) > 0})
+    if not lookbacks:
+        lookbacks = [20]
+    display_lb = 20 if 20 in lookbacks else lookbacks[0]
+    return {
+        "market_code": market_code,
+        "lookbacks": lookbacks,
+        "display_lb": display_lb,
+        "weights": rs_cfg.get("weights", [0.5, 0.3, 0.2]),
+        "volatility_penalty": float(rs_cfg.get("volatility_penalty", 0.0)),
+        "fs_weight": float(rs_cfg.get("fs_weight", 0.5)),
+        "rs_weight": float(rs_cfg.get("rs_weight", 0.5)),
+    }
+
+
+def resolve_rs_enforcement(candidates: list[dict], logger_obj=None, console_obj=None) -> bool:
+    """
+    若本次所有候選都缺 rs_score（常見於 market_code K 棒暫時抓不到），
+    則降級為不強制 RS 門檻，避免整批被誤刷掉。
+    """
+    has_rs_data = any(c.get("rs_score") is not None for c in candidates)
+    if has_rs_data:
+        return True
+
+    msg = "本輪相對強度資料缺失（rs_score 全空），暫時停用 RS 硬門檻避免誤判"
+    if logger_obj is not None:
+        logger_obj.warning(msg)
+    if console_obj is not None:
+        console_obj.print(f"[yellow]{msg}[/yellow]")
+    return False
 
 
 class ValueTradingSystem:
@@ -210,6 +271,25 @@ class ValueTradingSystem:
             value_candidates = self.value_scanner.screen()
             if not value_candidates:
                 self.logger.info("沒有符合價值條件的標的")
+                self._print_summary()
+                return
+
+            # 1.1 補上基本面分與多週期 RS，再套用 v2 gate（硬門檻 + 黑名單 + 分散）
+            rs_params = resolve_rs_params(self.config)
+            value_candidates = self.value_scanner.enrich_with_quality_metrics(value_candidates)
+            for c in value_candidates:
+                c["fs"] = self.value_scanner.calc_fundamental_score(c)
+            value_candidates = self.value_scanner.enrich_with_relative_strength(
+                value_candidates,
+                lookbacks=rs_params["lookbacks"],
+                weights=rs_params["weights"],
+                market_code=rs_params["market_code"],
+                volatility_penalty=rs_params["volatility_penalty"],
+            )
+            enforce_rs = resolve_rs_enforcement(value_candidates, logger_obj=self.logger)
+            value_candidates = self.value_scanner.apply_v2_gates(value_candidates, enforce_rs=enforce_rs)
+            if not value_candidates:
+                self.logger.info("v2 gate 後無可交易標的")
                 self._print_summary()
                 return
 
@@ -600,67 +680,106 @@ def main():
             return
 
         # ── 大盤狀態（0050）──
-        rs_cfg = config.get("relative_strength", {})
-        rs_lookback = rs_cfg.get("lookback_days", 20)
+        rs_params = resolve_rs_params(config)
+        rs_market_code = rs_params["market_code"]
+        rs_lookbacks = rs_params["lookbacks"]
+        rs_display_lb = rs_params["display_lb"]
+        rs_weights = rs_params["weights"]
+        rs_vol_penalty = rs_params["volatility_penalty"]
+        fs_weight = rs_params["fs_weight"]
+        rs_weight = rs_params["rs_weight"]
         ma_period = config.get("market_filter", {}).get("ma_period", 20)
 
         market_status = "未知"
         market_return = None
         try:
-            m_df = fetch_kbars("0050", lookback_days=max(rs_lookback, ma_period) + 10)
+            m_df = fetch_kbars(rs_market_code, lookback_days=max(max(rs_lookbacks), ma_period) + 10)
             if m_df is not None and len(m_df) >= ma_period:
                 ma = m_df["Close"].tail(ma_period).mean()
                 ma60 = m_df["Close"].tail(60).mean() if len(m_df) >= 60 else None
                 last = m_df["Close"].iloc[-1]
-                market_return = (last / m_df["Close"].iloc[-min(rs_lookback, len(m_df))] - 1) * 100
+                market_return = (last / m_df["Close"].iloc[-min(rs_display_lb, len(m_df))] - 1) * 100
                 if last > ma and (ma60 is None or last > ma60):
-                    market_status = f"[green]偏多[/green]（0050={last:.1f} > MA{ma_period}={ma:.1f}）"
+                    market_status = f"[green]偏多[/green]（{rs_market_code}={last:.1f} > MA{ma_period}={ma:.1f}）"
                 elif last < (ma60 or ma):
-                    market_status = f"[red]偏空[/red]（0050={last:.1f} < MA{ma_period}={ma:.1f}）"
+                    market_status = f"[red]偏空[/red]（{rs_market_code}={last:.1f} < MA{ma_period}={ma:.1f}）"
                 else:
-                    market_status = f"[yellow]中性[/yellow]（0050={last:.1f} 介於 MA{ma_period}/{60}之間）"
+                    market_status = f"[yellow]中性[/yellow]（{rs_market_code}={last:.1f} 介於 MA{ma_period}/{60}之間）"
         except Exception:
             pass
 
         console.print(f"\n大盤狀態：{market_status}")
         if market_return is not None:
             clr = "green" if market_return >= 0 else "red"
-            console.print(f"0050 近 {rs_lookback} 日報酬：[{clr}]{market_return:+.2f}%[/{clr}]\n")
+            console.print(f"{rs_market_code} 近 {rs_display_lb} 日報酬：[{clr}]{market_return:+.2f}%[/{clr}]\n")
 
-        # ── 加計相對強度 ──
-        console.print(f"[dim]計算相對強度（近 {rs_lookback} 日 vs 0050），請稍候...[/dim]")
+        # ── 補品質資料 + 相對強度 ──
+        console.print("[dim]補品質因子（ROE / EPS成長 / 營收成長 / 負債權益比），請稍候...[/dim]")
+        value_candidates = value_scanner.enrich_with_quality_metrics(value_candidates)
+        console.print(
+            f"[dim]計算相對強度（{rs_lookbacks} 日，多週期 vs {rs_market_code}）"
+            f"；波動懲罰={rs_vol_penalty}，請稍候...[/dim]"
+        )
         value_candidates = value_scanner.enrich_with_relative_strength(
             value_candidates,
-            lookback=rs_lookback,
-            market_code="0050",
+            lookbacks=rs_lookbacks,
+            weights=rs_weights,
+            market_code=rs_market_code,
+            volatility_penalty=rs_vol_penalty,
         )
 
-        # 加財報評分
+        # 加基本面評分（估值 + 品質代理 - 風險扣分）
         for c in value_candidates:
             c["fs"] = value_scanner.calc_fundamental_score(c)
 
-        # 依「財報評分 + 相對強度」排序（各佔一半）
+        before_gate = len(value_candidates)
+        enforce_rs = resolve_rs_enforcement(value_candidates, console_obj=console)
+        value_candidates = value_scanner.apply_v2_gates(value_candidates, enforce_rs=enforce_rs)
+        if not value_candidates:
+            console.print("[yellow]v2 gate 後無符合條件的標的[/yellow]")
+            return
+        console.print(f"[dim]v2 gate: {before_gate} -> {len(value_candidates)} 檔[/dim]")
+
+        # 依「基本面分 + 相對強度」排序（預設各佔一半）
         def sort_key(c):
-            fs = c.get("fs") or 0
-            rs = c.get("rs_pct") or -999
-            return fs * 0.5 + (rs if rs != -999 else -50) * 0.5
+            fs = float(c.get("fs") or 0.0)
+            rs_score = c.get("rs_score")
+            if rs_score is None:
+                rs_term = -50.0
+            else:
+                rs_term = float(rs_score)
+            return fs * fs_weight + rs_term * rs_weight
         value_candidates.sort(key=sort_key, reverse=True)
 
         # ── 輸出主表 ──
-        table = Table(title="價值篩選結果（財報 + 相對強度）", show_header=True)
+        table = Table(title="價值篩選結果（基本面 + 相對強度）", show_header=True)
         table.add_column("類型", style="dim")
+        table.add_column("市場", style="dim")
         table.add_column("代碼", style="cyan")
         table.add_column("名稱")
+        table.add_column("產業", no_wrap=True)
         table.add_column("收盤", justify="right")
         table.add_column("PE", justify="right")
         table.add_column("殖利率%", justify="right")
         table.add_column("PB", justify="right")
-        table.add_column("財報分", justify="right")
-        table.add_column(f"近{rs_lookback}日%", justify="right")
+        table.add_column("基本面分", justify="right")
+        table.add_column("估值", justify="right")
+        table.add_column("品質", justify="right")
+        table.add_column("扣分", justify="right")
+        table.add_column("ROE%", justify="right")
+        table.add_column("EPS成長%", justify="right")
+        table.add_column("營收成長%", justify="right")
+        table.add_column("負債權益", justify="right")
+        table.add_column(f"近{rs_display_lb}日%", justify="right")
         table.add_column("vs大盤", justify="right")
+        table.add_column("RS分", justify="right")
 
         for c in value_candidates:
             typ = "科技" if c.get("type") == "tech" else "價值"
+            ex = str(c.get("exchange") or "").upper()
+            market = "上市" if ex == "TSE" else ("上櫃" if ex == "OTC" else "-")
+            industry = c.get("industry") or c.get("sector") or "-"
+            industry = str(industry)[:18]
             rs = c.get("rs_pct")
             sr = c.get("stock_return")
             if rs is None:
@@ -677,28 +796,38 @@ def main():
 
             table.add_row(
                 typ,
+                market,
                 c["code"],
                 (c.get("name") or "")[:8],
+                industry,
                 f"{c.get('close', 0):.2f}",
                 str(c.get("pe") or "-"),
                 f"{c.get('yield_pct', 0):.2f}",
                 str(c.get("pb") or "-"),
                 f"[{fs_clr}]{fs}[/{fs_clr}]",
+                f"{c.get('fs_value', 0):.1f}",
+                f"{c.get('fs_quality', 0):.1f}",
+                f"-{c.get('fs_penalty', 0):.1f}",
+                f"{c.get('roe_pct'):.1f}" if c.get("roe_pct") is not None else "-",
+                f"{c.get('eps_growth_pct'):.1f}" if c.get("eps_growth_pct") is not None else "-",
+                f"{c.get('revenue_growth_pct'):.1f}" if c.get("revenue_growth_pct") is not None else "-",
+                f"{c.get('debt_to_equity'):.1f}" if c.get("debt_to_equity") is not None else "-",
                 sr_str,
                 rs_str,
+                f"{(c.get('rs_score')):+.1f}" if c.get("rs_score") is not None else "-",
             )
         console.print(table)
 
         # ── 使用建議 ──
-        top_rs = [c for c in value_candidates if (c.get("rs_pct") or -999) > 0]
+        top_rs = [c for c in value_candidates if (c.get("rs_score") is not None and c.get("rs_score") > 0)]
         console.print(
             f"\n共 [bold]{len(value_candidates)}[/bold] 檔通過價值篩選，"
-            f"其中 [green]{len(top_rs)}[/green] 檔跑贏大盤（相對強度 > 0）"
+            f"其中 [green]{len(top_rs)}[/green] 檔綜合 RS分 > 0（多週期跑贏大盤）"
         )
         if "偏空" in market_status:
             console.print(
                 "[yellow]⚠ 大盤偏空：建議優先關注相對強度 > 0 的標的，"
-                "財報分 ≥ 60 且 vs大盤 > +3% 為較強支撐[/yellow]"
+                "基本面分 ≥ 60 且 RS分 > +3 為較強支撐[/yellow]"
             )
         console.print("[dim]最終買賣由您自行判斷，此為篩選參考清單[/dim]")
         return
