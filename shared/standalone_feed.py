@@ -131,7 +131,7 @@ def _fetch_kbars_yf(code: str, lookback_days: int) -> Optional[pd.DataFrame]:
                 ticker,
                 start=start_dt.strftime("%Y-%m-%d"),
                 end=(end_dt + td(days=1)).strftime("%Y-%m-%d"),
-                auto_adjust=True,   # 已還原除權，不需另行 adjust_splits
+                auto_adjust=False,  # 保留實際成交價，分割由 adjust_splits 處理
                 progress=False,
                 threads=False,
             )
@@ -142,6 +142,7 @@ def _fetch_kbars_yf(code: str, lookback_days: int) -> Optional[pd.DataFrame]:
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = [c[0] for c in raw.columns]
 
+            # auto_adjust=False 時含 Adj Close，只取 OHLCV（實際成交價）
             raw = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
             raw.index = pd.to_datetime(raw.index)
             raw = raw[raw["Close"] > 0].reset_index()
@@ -152,6 +153,8 @@ def _fetch_kbars_yf(code: str, lookback_days: int) -> Optional[pd.DataFrame]:
             raw["ts"] = pd.to_datetime(raw["ts"])
             raw = raw[["ts", "Open", "High", "Low", "Close", "Volume"]].sort_values("ts")
             raw["Volume"] = (raw["Volume"] // 1000).astype(int)  # 股 → 張
+            for col in ["Open", "High", "Low", "Close"]:
+                raw[col] = raw[col].round(2)
             result = raw.tail(lookback_days).reset_index(drop=True)
             if len(result) >= 20:
                 return result
