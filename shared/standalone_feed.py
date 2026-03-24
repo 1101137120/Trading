@@ -1,7 +1,7 @@
 """
 免券商資料來源：使用證交所 OpenAPI
 - 上市：STOCK_DAY_ALL（全市場日成交）
-- K 棒：STOCK_DAY（個股日 K）
+- K 棒：STOCK_DAY（個股日 K），或 yfinance（更穩定，含除權調整）
 """
 import json
 import logging
@@ -99,11 +99,74 @@ def _parse_change(change_val, close: float) -> float:
 
 
 def fetch_kbars(code: str, lookback_days: int = 60) -> Optional[pd.DataFrame]:
-    """取得個股日 K 棒（證交所 STOCK_DAY）"""
+    """
+    取得個股日 K 棒。
+    優先使用 yfinance（自動除權調整、更穩定），失敗才降級至 TWSE STOCK_DAY。
+    回傳欄位：ts, Open, High, Low, Close, Volume
+    """
+    df = _fetch_kbars_yf(code, lookback_days)
+    if df is not None and len(df) >= 20:
+        return df
+    logger.debug(f"yfinance 取得 {code} 失敗，降級至 TWSE STOCK_DAY")
+    return _fetch_kbars_twse(code, lookback_days)
+
+
+def _fetch_kbars_yf(code: str, lookback_days: int) -> Optional[pd.DataFrame]:
+    """透過 yfinance 取得台股日 K（自動除權除息調整）"""
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+
+    from datetime import date, timedelta as td
+    end_dt = datetime.now()
+    # 多取 20% 緩衝以確保交易日數足夠
+    start_dt = end_dt - td(days=int(lookback_days * 1.4) + 10)
+
+    # TSE 用 .TW，OTC 用 .TWO；先試 .TW，失敗再試 .TWO
+    for suffix in (".TW", ".TWO"):
+        ticker = f"{code}{suffix}"
+        try:
+            raw = yf.download(
+                ticker,
+                start=start_dt.strftime("%Y-%m-%d"),
+                end=(end_dt + td(days=1)).strftime("%Y-%m-%d"),
+                auto_adjust=True,   # 已還原除權，不需另行 adjust_splits
+                progress=False,
+                threads=False,
+            )
+            if raw is None or raw.empty:
+                continue
+
+            # yfinance 有時回傳 MultiIndex columns，需要壓平
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [c[0] for c in raw.columns]
+
+            raw = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+            raw.index = pd.to_datetime(raw.index)
+            raw = raw[raw["Close"] > 0].reset_index()
+            raw.rename(columns={"Date": "ts", "index": "ts"}, inplace=True)
+            # 確保 ts 欄為 datetime
+            if "ts" not in raw.columns:
+                raw.insert(0, "ts", raw.index)
+            raw["ts"] = pd.to_datetime(raw["ts"])
+            raw = raw[["ts", "Open", "High", "Low", "Close", "Volume"]].sort_values("ts")
+            raw["Volume"] = (raw["Volume"] // 1000).astype(int)  # 股 → 張
+            result = raw.tail(lookback_days).reset_index(drop=True)
+            if len(result) >= 20:
+                return result
+        except Exception as e:
+            logger.debug(f"yfinance {ticker}: {e}")
+            continue
+    return None
+
+
+def _fetch_kbars_twse(code: str, lookback_days: int) -> Optional[pd.DataFrame]:
+    """原 TWSE STOCK_DAY 實作（作為 fallback）"""
     dfs = []
     end = datetime.now()
-    months_needed = max(3, lookback_days // 20 + 2)  # 每月約 20 交易日
-    for _ in range(months_needed):  # 動態計算需要幾個月
+    months_needed = max(3, lookback_days // 20 + 2)
+    for _ in range(months_needed):
         date_str = end.strftime("%Y%m%d")
         url = TSE_STOCK_DAY.format(date=date_str, code=code)
         try:
@@ -124,15 +187,15 @@ def fetch_kbars(code: str, lookback_days: int = 60) -> Optional[pd.DataFrame]:
                     raise
 
             if data.get("stat") != "OK" or not data.get("data"):
-                break
+                end = end - timedelta(days=30)
+                continue  # 本月無資料，繼續往前取
 
             rows = []
             for r in data["data"]:
                 if len(r) < 9:
                     continue
-                # 日期, 成交股數, 成交金額, 開, 高, 低, 收, 漲跌, 成交筆數
                 date_part = r[0].replace("/", "")
-                year = int(date_part[:3]) + 1911  # 民國
+                year = int(date_part[:3]) + 1911
                 month = int(date_part[3:5])
                 day = int(date_part[5:7])
                 vol = int(str(r[1]).replace(",", "")) // 1000

@@ -35,6 +35,41 @@ def is_etf_code(code: str) -> bool:
     return str(code).startswith("00")
 
 
+def adjust_splits(df: pd.DataFrame, threshold: float = 0.25) -> pd.DataFrame:
+    """
+    偵測 K 棒中因除權/股票分割造成的單日大幅跳空（>threshold），
+    對跳空前所有價格欄位做比例回填調整（backward adjustment），
+    讓整條序列在相同計價基礎上，EMA / 訊號計算才有意義。
+
+    原理：
+      - 若第 i 日收盤相對前一日跌幅 > 25%，視為向下除權/分割
+        adjustment_ratio = close[i] / close[i-1]  （< 1）
+        把 i 之前所有 OHLC 乘上此 ratio，使序列連續
+      - 若第 i 日收盤相對前一日漲幅 > 25%，視為向上除權/合股
+        同理調整
+    """
+    df = df.copy()
+    price_cols = [c for c in ["Open", "High", "Low", "Close"] if c in df.columns]
+    closes = df["Close"].values
+
+    # 從後往前掃，這樣多次分割可以依序修正
+    for i in range(len(closes) - 1, 0, -1):
+        prev = closes[i - 1]
+        curr = closes[i]
+        if prev <= 0 or curr <= 0:
+            continue
+        change = (curr - prev) / prev
+        if abs(change) > threshold:
+            ratio = curr / prev
+            # 調整 i 之前（含 i-1）所有 K 棒的價格
+            for col in price_cols:
+                df[col].iloc[:i] = df[col].iloc[:i] * ratio
+            # 同步更新 closes 以供後續迭代使用
+            closes = df["Close"].values
+
+    return df
+
+
 # ──────────────────────────────────────────────
 # 設定載入
 # ──────────────────────────────────────────────
@@ -339,6 +374,8 @@ def main():
                         help="大盤過濾 MA 週期（預設 20）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
                         help="個股停損後冷卻天數（預設 0=停用），建議 3~7")
+    parser.add_argument("--max-avg-range", type=float, default=0.0,
+                        help="排除日均振幅 > 此值%%的高波動股（預設 0=停用），建議 6~8")
     parser.add_argument("--fee-rate", type=float, default=0.001425,
                         help="手續費率（單邊），預設 0.001425")
     parser.add_argument("--min-fee", type=float, default=20.0,
@@ -432,6 +469,19 @@ def main():
                 failed += 1
                 failed_items.append((code, str(stock.get("name", "")).strip()))
                 continue
+
+            # 除權/分割回填調整：yfinance 已自動調整，TWSE fallback 才需要
+            # （adjust_splits 偵測 >25% 單日跳空並回填，處理 TWSE 未還原資料）
+            df = adjust_splits(df)
+
+            # 波動過濾：排除日均振幅過大的股票
+            if args.max_avg_range > 0:
+                recent = df.tail(10)
+                valid = recent[recent["Close"] > 0]
+                if not valid.empty:
+                    avg_range_pct = ((valid["High"] - valid["Low"]) / valid["Close"]).mean() * 100
+                    if avg_range_pct > args.max_avg_range:
+                        continue
 
             trades = simulate_trades(
                 df, engine, code, start, end, sl, tp,
