@@ -8,25 +8,36 @@ broker:
   person_id: ""
   simulation: true
 
+# ── 大盤過濾 ──────────────────────────────────────────────────────────────
+# 只在大盤（0050）站上 MA 時才開倉，避免在空頭市場逆勢買進。
+# 回測比較結果（2025-04-01 起，30 檔，停利 25%）：
+#   MA20 → 實際報酬 +0.19%   MA10 → 實際報酬 +10.08%
+# MA10 反應更快，V 型反彈時可更早進場；缺點是空頭初期可能多幾筆假訊號。
 market_filter:
   enabled: true
   proxy_code: "0050"
-  ma_period: 20
+  ma_period: 10   # 建議 10（快）或 20（穩）；牛市/V型反彈偏好 10
 
+# ── 風控 ──────────────────────────────────────────────────────────────────
 risk:
-  max_positions: 5
-  max_position_pct: 0.20
-  stop_loss_pct: 0.05
-  take_profit_pct: 0.15
-  max_daily_loss_pct: 0.03
-  min_order_value: 10000
-  max_order_value: 500000
+  max_positions: 5          # 同時最多持幾檔，超過則等待既有部位出場再進新倉
+  max_position_pct: 0.20    # 單檔最多佔總資金比例（避免重押一檔）
+  stop_loss_pct: 0.05       # 停損：買入後跌 5% 出場（注意：隔日跳空可能超過此值）
+  # 停利設定說明：
+  #   停利 15%：交易次數多、勝率略高，但牛市容易太早出場。
+  #   停利 25%：讓趨勢跑更久，每筆期望值從 +4.82% 提升至 +8.76%（回測數據）。
+  take_profit_pct: 0.25
+  max_daily_loss_pct: 0.03  # 當日總虧損達 3% 時停止開新倉（日內熔斷）
+  min_order_value: 10000    # 單筆最低委託金額（元）
+  max_order_value: 500000   # 單筆最高委託金額（元），防止異常大單
   consecutive_loss_pause:
     count: 3           # 連續虧損幾次後暫停開倉
     pause_minutes: 60  # 暫停時間（分鐘）
+  # 移動停利：獲利達 activation_pct 後啟動，之後從最高點回落 trail_pct 才出場。
+  # 適合趨勢行情，讓獲利單繼續跑；若行情急漲急跌則可能過早出場。
   trailing_stop:
-    activation_pct: 0.07   # 獲利達 7% 後啟動移動停損
-    trail_pct: 0.04         # 從最高點回落 4% 出場
+    activation_pct: 0.10   # 獲利達 10% 後啟動移動停損（配合停利 25% 調高）
+    trail_pct: 0.05         # 從最高點回落 5% 出場
   max_sell_retries: 5      # 賣出失敗達此次數後停止自動重試，需人工確認
   loss_cooldown_days: 5    # 個股停損出場後冷卻天數，期間不再進場；0 = 停用
   order_chase:
@@ -35,6 +46,7 @@ risk:
     max_pct: 0.015         # 最高追至原始下單價 + 1.5%，超過則放棄
     max_retries: 1         # 最多追幾次
 
+# ── 選股過濾 ──────────────────────────────────────────────────────────────
 screener:
   exchanges: ["TSE", "OTC"]
   min_price: 10.0
@@ -42,15 +54,18 @@ screener:
   min_volume: 1000
   min_avg_volume_5d: 2000
   max_stocks: 50
-  max_evaluate: 30   # 策略評估最多跑幾檔（依成交量排序）
-  exclude_etf: true       # 排除 ETF（代碼 00 開頭），避免除息/分割干擾技術訊號
-  exclude_disposed: true  # 排除處置股（day_trade=No），撮合受限掛單難成交
-  max_avg_daily_range_pct: 6.0  # 排除日均振幅 > 此值(%)的高波動股；0 = 停用
+  max_evaluate: 30         # 策略評估最多跑幾檔（依成交量排序）
+  exclude_etf: true        # 排除 ETF（代碼 00 開頭），避免除息/分割干擾技術訊號
+  exclude_disposed: true   # 排除處置股（day_trade=No），撮合受限掛單難成交
+  max_avg_daily_range_pct: 0  # 排除日均振幅 > 此值(%)的高波動股；0 = 停用
 
+# ── 策略 ──────────────────────────────────────────────────────────────────
+# 多策略同時觸發同一檔股票時，信心值會疊加（consensus boosting）。
+# 建議至少保留 ema_trend + kd_cross，這兩組在回測中訊號最多、表現最穩。
 strategies:
-  # 可任意組合，多策略同時觸發時信心值加成
   active: ["momentum", "breakout", "mean_reversion", "ema_trend", "kd_cross"]
 
+  # 動能策略：RSI 脫離超賣 + MACD 柱狀翻正
   momentum:
     rsi_period: 14
     rsi_oversold: 35
@@ -60,6 +75,7 @@ strategies:
     macd_signal: 9
     lookback_days: 30
 
+  # 均值回歸：價格碰布林下軌 + RSI < 30（超跌反彈）
   mean_reversion:
     bb_period: 20
     bb_std: 2.0
@@ -68,12 +84,14 @@ strategies:
     rsi_high: 70
     lookback_days: 30
 
+  # 突破策略：收盤突破 20 日高點 + 爆量（量確認方向）
   breakout:
     volume_multiplier: 2.0
     price_breakout_pct: 0.02
     lookback_days: 20
     confirm_days: 3
 
+  # EMA 多頭排列：EMA5 > EMA20 > EMA60 且量能配合（趨勢跟隨）
   ema_trend:
     ema_fast: 5
     ema_mid: 20
@@ -81,12 +99,14 @@ strategies:
     vol_confirm: true
     lookback_days: 70
 
+  # KD 黃金交叉：K 從超賣區上穿 D + RSI 回升（短線反彈）
   kd_cross:
     kd_period: 9
     k_oversold: 25
     rsi_period: 14
     lookback_days: 30
 
+# ── 排程 ──────────────────────────────────────────────────────────────────
 schedule:
   market_open: "09:00"
   market_close: "13:30"
@@ -98,12 +118,14 @@ schedule:
   force_close_minutes_before_close: 0  # 0=停用；設為 10 表示 13:20 強制平倉所有持倉（防隔夜風險）
   # holidays: ["2025-09-01"]  # 可追加颱風假等，格式 YYYY-MM-DD
 
+# ── 日誌 ──────────────────────────────────────────────────────────────────
 logging:
   level: "INFO"
   file: "tech/logs/trading.log"
-  max_bytes: 10485760
+  max_bytes: 10485760  # 10 MB
   backup_count: 5
 
+# ── 通知 ──────────────────────────────────────────────────────────────────
 notifications:
   enabled: false
   line_token: ""      # LINE Notify Token，或設環境變數 LINE_NOTIFY_TOKEN
