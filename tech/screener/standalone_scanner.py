@@ -23,12 +23,17 @@ class StandaloneStockScanner:
         max_stocks = self.cfg.get("max_stocks", 50)
         min_avg_vol = self.cfg.get("min_avg_volume_5d", 0)
 
+        exclude_etf = self.cfg.get("exclude_etf", True)
+
         snapshots = fetch_tse_daily_all()
         if not snapshots:
             return []
 
         candidates = []
         for code, snap in snapshots.items():
+            if exclude_etf and str(code).startswith("00"):
+                continue
+
             close = snap.get("close", 0)
             volume = snap.get("volume", 0)
             change_pct = snap.get("change_pct", 0)

@@ -64,15 +64,30 @@ def simulate_trades(
     end: date,
     stop_loss_pct: float,
     take_profit_pct: float,
+    market_df: pd.DataFrame = None,
+    market_ma_period: int = 20,
+    loss_cooldown_days: int = 0,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
     - 買入：訊號日收盤價
     - 出場：次日起每日收盤檢查停損 / 停利；回測結束強制平倉
+    - market_df：0050 日 K，有傳時只在大盤 > MA20 時開倉
+    - loss_cooldown_days：停損後冷卻天數內不再進場
     回傳每筆交易的明細。
     """
     trades = []
-    position = None   # {entry_date, entry_price, stop, target}
+    position = None
+    cooldown_until: date = None  # 個股冷卻到期日
+
+    # 預先建立 0050 日期 -> 是否可做多 的 lookup
+    market_allow: dict[date, bool] = {}
+    if market_df is not None and len(market_df) >= market_ma_period:
+        market_df = market_df.copy()
+        market_df["ma"] = market_df["Close"].rolling(market_ma_period).mean()
+        for _, row in market_df.iterrows():
+            d = row["ts"].date() if hasattr(row["ts"], "date") else row["ts"]
+            market_allow[d] = (row["Close"] > row["ma"]) if pd.notna(row["ma"]) else True
 
     for i in range(len(df)):
         row_date = df["ts"].iloc[i].date()
@@ -110,11 +125,21 @@ def simulate_trades(
                     "result": exit_reason,
                     "strategy": position["strategy"],
                 })
+                if exit_reason == "停損" and loss_cooldown_days > 0:
+                    from datetime import timedelta
+                    cooldown_until = row_date + timedelta(days=loss_cooldown_days)
                 position = None
             continue  # 持倉中不找新訊號
 
+        # ── 空倉：大盤過濾 ──
+        if market_allow and not market_allow.get(row_date, True):
+            continue
+
+        # ── 空倉：個股冷卻 ──
+        if cooldown_until and row_date <= cooldown_until:
+            continue
+
         # ── 空倉：評估策略訊號 ──
-        # 傳入截至今日的全部 K 棒（i+1 根）
         df_slice = df.iloc[: i + 1].copy()
         sig = engine.evaluate(code, df_slice)
         if sig and sig.action == "Buy":
@@ -302,8 +327,18 @@ def main():
                         help="每檔 K 棒下載重試次數（預設 3）")
     parser.add_argument("--retry-sleep", type=float, default=0.35,
                         help="每次重試前等待秒數（預設 0.35）")
-    parser.add_argument("--exclude-etf", action="store_true",
-                        help="排除 ETF（代碼 00 開頭）")
+    parser.add_argument("--exclude-etf", action="store_true", default=True,
+                        help="排除 ETF（代碼 00 開頭），預設開啟")
+    parser.add_argument("--include-etf", action="store_true",
+                        help="強制納入 ETF（覆蓋 --exclude-etf 預設）")
+    parser.add_argument("--market-filter", action="store_true", default=True,
+                        help="啟用大盤過濾（0050 > MA20 才開倉），預設開啟")
+    parser.add_argument("--no-market-filter", action="store_true",
+                        help="停用大盤過濾")
+    parser.add_argument("--market-ma", type=int, default=20,
+                        help="大盤過濾 MA 週期（預設 20）")
+    parser.add_argument("--loss-cooldown", type=int, default=0,
+                        help="個股停損後冷卻天數（預設 0=停用），建議 3~7")
     parser.add_argument("--fee-rate", type=float, default=0.001425,
                         help="手續費率（單邊），預設 0.001425")
     parser.add_argument("--min-fee", type=float, default=20.0,
@@ -344,17 +379,33 @@ def main():
         console.print("[red]無法取得快照資料[/red]")
         sys.exit(1)
 
+    exclude_etf = args.exclude_etf and not args.include_etf
     pool = [
         s for s in snapshots.values()
         if args.min_price <= s["close"] <= args.max_price
         and s["volume"] >= args.min_volume
-        and (not args.exclude_etf or not is_etf_code(s["code"]))
+        and (not exclude_etf or not is_etf_code(s["code"]))
     ]
     pool.sort(key=lambda x: x["volume"], reverse=True)
     pool = pool[:args.stocks]
-    console.print(f"股票池: [bold]{len(pool)}[/bold] 檔")
-    if args.exclude_etf:
-        console.print("[dim]已排除 ETF（00 開頭）[/dim]")
+    etf_note = "（已排除 ETF）" if exclude_etf else "（含 ETF）"
+    console.print(f"股票池: [bold]{len(pool)}[/bold] 檔 [dim]{etf_note}[/dim]")
+
+    # ── 載入大盤 K 棒（0050）──
+    use_market_filter = args.market_filter and not args.no_market_filter
+    market_df = None
+    if use_market_filter:
+        lookback_market = (end - start).days + args.market_ma + 30
+        market_df = fetch_kbars("0050", lookback_days=lookback_market)
+        if market_df is not None and len(market_df) >= args.market_ma:
+            console.print(f"[dim]大盤過濾：0050 > MA{args.market_ma}（{len(market_df)} 根 K 棒）[/dim]")
+        else:
+            console.print("[yellow]警告：0050 K 棒不足，大盤過濾停用[/yellow]")
+            market_df = None
+    else:
+        console.print("[dim]大盤過濾：停用[/dim]")
+
+    loss_cooldown = args.loss_cooldown
 
     # ── 逐檔拉 K 棒並回測 ──
     all_trades: list[dict] = []
@@ -382,7 +433,12 @@ def main():
                 failed_items.append((code, str(stock.get("name", "")).strip()))
                 continue
 
-            trades = simulate_trades(df, engine, code, start, end, sl, tp)
+            trades = simulate_trades(
+                df, engine, code, start, end, sl, tp,
+                market_df=market_df,
+                market_ma_period=args.market_ma,
+                loss_cooldown_days=loss_cooldown,
+            )
             stock_name = str(stock.get("name", "")).strip()
             for t in trades:
                 t["name"] = stock_name
@@ -413,8 +469,10 @@ def main():
     summary_table.add_row("回測區間",     f"{args.start} → {args.end}")
     summary_table.add_row("總交易筆數",   str(s["total_trades"]))
     summary_table.add_row("勝率",         f"[{'green' if s['win_rate']>=50 else 'red'}]{s['win_rate']}%[/]")
-    summary_table.add_row("總累積報酬",
-        f"[{'green' if s['total_return_pct']>=0 else 'red'}]{s['total_return_pct']:+.2f}%[/] (等權加總)")
+    ev = s["total_return_pct"] / s["total_trades"] if s["total_trades"] else 0
+    ev_clr = "green" if ev >= 0 else "red"
+    summary_table.add_row("每筆期望值",
+        f"[{ev_clr}]{ev:+.2f}%[/{ev_clr}] [dim](各筆 pnl_pct 平均，不等於資金報酬)[/dim]")
     summary_table.add_row("平均獲利",     f"[green]+{s['avg_win_pct']:.2f}%[/green]")
     summary_table.add_row("平均虧損",     f"[red]{s['avg_loss_pct']:.2f}%[/red]")
     summary_table.add_row("平均持有天數", f"{s['avg_hold_days']} 天")
@@ -479,8 +537,7 @@ def main():
     console.print(f"\n出場原因: " +
         " | ".join(f"{k}: {v}筆" for k, v in reason_counts.items()))
 
-    # ── 資金模擬 ──
-    console.rule("\n[bold]資金模擬（含張數 / 實際損益）[/bold]")
+    # ── 資金模擬（先跑，把真實報酬提前顯示）──
     psim = portfolio_simulation(
         all_trades,
         args.capital,
@@ -493,18 +550,16 @@ def main():
     )
 
     cap_clr = "green" if psim["total_return_pct"] >= 0 else "red"
+    console.rule(f"\n[bold]資金模擬結果（初始 {args.capital:,.0f} 元）[/bold]")
     cap_table = Table(show_header=False, box=None)
     cap_table.add_column("項目", style="dim")
     cap_table.add_column("數值", justify="right")
     cap_table.add_row("初始資金",   f"{psim['initial_capital']:>12,.0f} 元")
     cap_table.add_row("最終資金",   f"[{cap_clr}]{psim['final_capital']:>12,.0f} 元[/{cap_clr}]")
-    cap_table.add_row("實際報酬",   f"[{cap_clr}]{psim['total_return_pct']:+.2f}%[/{cap_clr}]")
+    cap_table.add_row("[bold]實際報酬[/bold]", f"[bold {cap_clr}]{psim['total_return_pct']:+.2f}%[/bold {cap_clr}]  ← 這才是真實資金報酬")
     cap_table.add_row("最大回撤",   f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]")
-    cap_table.add_row("總手續費",   f"{psim['total_fees']:>12,.0f} 元")
-    cap_table.add_row("總證交稅",   f"{psim['total_taxes']:>12,.0f} 元")
-    cap_table.add_row("費稅合計",   f"{psim['total_fee_tax']:>12,.0f} 元")
-    cap_table.add_row("實際執行筆數", str(len(psim["taken_trades"])))
-    cap_table.add_row("跳過（資金/倉位不足）", str(psim["skipped"]))
+    cap_table.add_row("總手續費+稅", f"{psim['total_fee_tax']:>12,.0f} 元")
+    cap_table.add_row("實際執行筆數", f"{len(psim['taken_trades'])} 筆（跳過 {psim['skipped']} 筆）")
     console.print(cap_table)
 
     if psim["taken_trades"]:

@@ -26,6 +26,7 @@ class PendingOrder:
     take_profit: float
     placed_time: datetime
     trade_ref: object = None
+    chase_count: int = 0       # 已追單次數
 
     @property
     def order_value(self) -> float:
@@ -90,6 +91,8 @@ class Portfolio:
         self.notifier: Optional["Notifier"] = None
         # 賣出重試計數（停牌 / 連續跌停保護）
         self.sell_retries: dict[str, int] = {}
+        # 個股虧損冷卻：停損出場後 N 天內不再進場
+        self.loss_cooldowns: dict[str, datetime] = {}
 
     def update_capital(self, balance: float):
         with self._lock:
@@ -123,6 +126,13 @@ class Portfolio:
             })
             logger.info(f"平倉 {code} @ {exit_price} | PnL={pnl:+,.0f}元")
             self._check_risk_after_close(pnl)
+            # 虧損冷卻：停損後設定個股冷卻期
+            if pnl < 0:
+                cooldown_days = self.risk_cfg.get("loss_cooldown_days", 0)
+                if cooldown_days > 0:
+                    until = datetime.now() + timedelta(days=cooldown_days)
+                    self.loss_cooldowns[code] = until
+                    logger.info(f"個股冷卻 {code}：{cooldown_days} 天內不再進場（至 {until.strftime('%m/%d')}）")
         self.save_to_file()
 
     def _check_risk_after_close(self, pnl: float):
@@ -188,6 +198,15 @@ class Portfolio:
 
     def has_position_or_pending(self, code: str) -> bool:
         return code in self.positions or code in self.pending_orders
+
+    def is_in_loss_cooldown(self, code: str) -> bool:
+        until = self.loss_cooldowns.get(code)
+        if until is None:
+            return False
+        if datetime.now() >= until:
+            del self.loss_cooldowns[code]
+            return False
+        return True
 
     def add_pending(self, po: PendingOrder):
         with self._lock:
@@ -313,6 +332,11 @@ class Portfolio:
                  "placed_time": po.placed_time.isoformat()}
                 for po in self.pending_orders.values()
             ],
+            "loss_cooldowns": {
+                code: until.isoformat()
+                for code, until in self.loss_cooldowns.items()
+                if until > datetime.now()
+            },
         }
         tmp = path.with_suffix(".tmp")
         try:
@@ -349,6 +373,14 @@ class Portfolio:
                     trade_ref=None,
                 )
                 pending[d["code"]] = po
+            cooldowns = {}
+            for code, until_str in data.get("loss_cooldowns", {}).items():
+                until = datetime.fromisoformat(until_str)
+                if until > datetime.now():
+                    cooldowns[code] = until
+            self.loss_cooldowns = cooldowns
+            if cooldowns:
+                logger.info(f"載入 {len(cooldowns)} 筆個股冷卻記錄")
             logger.info(f"從檔案載入 {len(positions)} 筆持倉、{len(pending)} 筆遺留掛單")
             return positions, pending
         except Exception as e:

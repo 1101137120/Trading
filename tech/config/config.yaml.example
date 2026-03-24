@@ -28,6 +28,12 @@ risk:
     activation_pct: 0.07   # 獲利達 7% 後啟動移動停損
     trail_pct: 0.04         # 從最高點回落 4% 出場
   max_sell_retries: 5      # 賣出失敗達此次數後停止自動重試，需人工確認
+  loss_cooldown_days: 5    # 個股停損出場後冷卻天數，期間不再進場；0 = 停用
+  order_chase:
+    enabled: true          # 掛單未成交時自動追單
+    after_minutes: 5       # 掛出幾分鐘後仍 Active 才追
+    max_pct: 0.015         # 最高追至原始下單價 + 1.5%，超過則放棄
+    max_retries: 1         # 最多追幾次
 
 screener:
   exchanges: ["TSE", "OTC"]
@@ -37,6 +43,9 @@ screener:
   min_avg_volume_5d: 2000
   max_stocks: 50
   max_evaluate: 30   # 策略評估最多跑幾檔（依成交量排序）
+  exclude_etf: true       # 排除 ETF（代碼 00 開頭），避免除息/分割干擾技術訊號
+  exclude_disposed: true  # 排除處置股（day_trade=No），撮合受限掛單難成交
+  max_avg_daily_range_pct: 6.0  # 排除日均振幅 > 此值(%)的高波動股；0 = 停用
 
 strategies:
   # 可任意組合，多策略同時觸發時信心值加成

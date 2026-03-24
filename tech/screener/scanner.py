@@ -26,12 +26,31 @@ class StockScanner:
         max_price = self.cfg.get("max_price", 1000.0)
         min_volume = self.cfg.get("min_volume", 1000)
         max_stocks = self.cfg.get("max_stocks", 50)
+        exclude_etf = self.cfg.get("exclude_etf", True)
 
         contracts = self.get_candidate_contracts()
         if not contracts:
             return []
 
+        if exclude_etf:
+            before = len(contracts)
+            contracts = [c for c in contracts if not str(c.code).startswith("00")]
+            logger.info(f"排除 ETF 後剩 {len(contracts)} 個合約（移除 {before - len(contracts)} 檔）")
+
+        # 排除處置股：day_trade == No 表示受限制，撮合每 5 分鐘一次，掛單難成交
+        exclude_disposed = self.cfg.get("exclude_disposed", True)
+        if exclude_disposed:
+            before = len(contracts)
+            contracts = [
+                c for c in contracts
+                if str(getattr(getattr(c, "day_trade", None), "value", getattr(c, "day_trade", "Yes"))) != "No"
+            ]
+            removed = before - len(contracts)
+            if removed:
+                logger.info(f"排除處置股/限制股 {removed} 檔（day_trade=No）")
+
         logger.info(f"開始批次快照篩選，共 {len(contracts)} 檔...")
+        code_to_name = {c.code: getattr(c, "name", "") for c in contracts if hasattr(c, "code")}
         snapshots = self.feed.get_batch_snapshots(contracts)
 
         candidates = []
@@ -51,6 +70,7 @@ class StockScanner:
 
             candidates.append({
                 "code": code,
+                "name": code_to_name.get(code, ""),
                 "close": close,
                 "volume": volume,
                 "change_pct": change_pct,
@@ -65,6 +85,10 @@ class StockScanner:
         min_avg_vol = self.cfg.get("min_avg_volume_5d", 0)
         if min_avg_vol > 0:
             candidates = self.filter_by_avg_volume(candidates, min_avg_vol)
+
+        max_avg_daily_range_pct = self.cfg.get("max_avg_daily_range_pct", 0)
+        if max_avg_daily_range_pct > 0:
+            candidates = self.filter_by_volatility(candidates, max_avg_daily_range_pct)
 
         logger.info(f"篩選完成，取得 {len(candidates)} 檔候選標的")
         return candidates
@@ -82,4 +106,37 @@ class StockScanner:
                 c["avg_volume_5d"] = round(avg_vol, 0)
                 result.append(c)
         logger.info(f"均量過濾後剩 {len(result)} 檔")
+        return result
+
+    def filter_by_volatility(
+        self, candidates: list[dict], max_avg_daily_range_pct: float
+    ) -> list[dict]:
+        """
+        排除日均振幅（(High-Low)/Close）超過門檻的高波動股。
+        高波動股在跳空時停損容易大幅穿越，跳空滑價風險高。
+        """
+        result = []
+        removed = 0
+        for c in candidates:
+            df = self.feed.get_kbars(c["code"], lookback_days=20)
+            if df is None or len(df) < 10:
+                result.append(c)  # 資料不足時放行，不誤殺
+                continue
+            recent = df.tail(10)
+            valid = recent[recent["Close"] > 0]
+            if valid.empty:
+                result.append(c)
+                continue
+            avg_range_pct = ((valid["High"] - valid["Low"]) / valid["Close"]).mean() * 100
+            if avg_range_pct <= max_avg_daily_range_pct:
+                c["avg_daily_range_pct"] = round(avg_range_pct, 2)
+                result.append(c)
+            else:
+                removed += 1
+                logger.info(
+                    f"排除高波動 {c['code']} {c.get('name', '')}: "
+                    f"日均振幅 {avg_range_pct:.1f}% > {max_avg_daily_range_pct}%"
+                )
+        if removed:
+            logger.info(f"波動過濾移除 {removed} 檔，剩 {len(result)} 檔")
         return result

@@ -335,9 +335,19 @@ class TradingSystem:
                 self._print_summary()
                 return
 
+            code_to_name = {c["code"]: c.get("name", "") for c in candidates}
             signals = self._evaluate_candidates(candidates)
             if signals and not self.market_filter.allow_long():
                 self.logger.info("大盤趨勢偏空，本週期不開新倉")
+                stbl = Table(title="買入訊號（大盤偏空，僅供參考）", show_header=True)
+                stbl.add_column("代碼", style="cyan")
+                stbl.add_column("名稱", style="dim")
+                stbl.add_column("信心", justify="right")
+                stbl.add_column("理由", style="dim")
+                for s in signals:
+                    stbl.add_row(s.code, code_to_name.get(s.code, ""), f"{s.confidence:.2f}", (s.reason or "")[:40])
+                    self.logger.info(f"[訊號-未執行] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
+                console.print(stbl)
                 signals = []
 
             if signals:
@@ -430,7 +440,38 @@ class TradingSystem:
                 self.portfolio.cancel_pending(code)
             elif status == "Active":
                 elapsed = now - po.placed_time
-                if elapsed > timeout:
+                chase_cfg = self.config.get("risk", {}).get("order_chase", {})
+                chase_enabled = chase_cfg.get("enabled", False)
+                chase_after = timedelta(minutes=chase_cfg.get("after_minutes", 5))
+                chase_max_pct = chase_cfg.get("max_pct", 0.015)
+                chase_max_retries = chase_cfg.get("max_retries", 1)
+
+                if chase_enabled and elapsed > chase_after and po.chase_count < chase_max_retries:
+                    snap = self.feed.get_snapshot(code)
+                    new_price = snap["close"] if snap and snap.get("close", 0) > 0 else 0
+                    if 0 < new_price <= po.price * (1 + chase_max_pct):
+                        new_price = self.risk.round_to_tick(new_price)
+                        self.logger.info(
+                            f"追單 {code}：原價 {po.price} → {new_price} "
+                            f"（第 {po.chase_count + 1} 次）"
+                        )
+                        self.broker.cancel_order(po.trade_ref)
+                        new_trade = self.broker.place_limit_order(code, "Buy", new_price, po.quantity)
+                        if new_trade:
+                            po.trade_ref = new_trade
+                            po.price = new_price
+                            po.placed_time = now
+                            po.chase_count += 1
+                        else:
+                            self.portfolio.cancel_pending(code)
+                    elif new_price > po.price * (1 + chase_max_pct):
+                        self.logger.info(
+                            f"放棄追單 {code}：現價 {new_price} 已超出追單上限 "
+                            f"{po.price * (1 + chase_max_pct):.2f}"
+                        )
+                        self.broker.cancel_order(po.trade_ref)
+                        self.portfolio.cancel_pending(code)
+                elif elapsed > timeout:
                     self.broker.cancel_order(po.trade_ref)
                     self.portfolio.cancel_pending(code)
 
@@ -475,6 +516,10 @@ class TradingSystem:
         for c in candidates[:max_evaluate]:
             code = c["code"]
             if self.portfolio.has_position_or_pending(code):
+                continue
+            if self.portfolio.is_in_loss_cooldown(code):
+                until = self.portfolio.loss_cooldowns.get(code)
+                self.logger.info(f"跳過 {code}：停損冷卻中（至 {until.strftime('%m/%d') if until else '?'}）")
                 continue
             # 漲停保護：接近漲停的標的不追高
             if self.risk.is_limit_up(c.get("change_pct", 0)):
@@ -737,14 +782,71 @@ def main():
         candidates = system.scanner.screen()
         table = Table(title="篩選結果", show_header=True)
         table.add_column("代碼", style="cyan")
+        table.add_column("名稱", style="dim")
         table.add_column("現價", justify="right")
         table.add_column("成交量", justify="right")
         table.add_column("漲跌%", justify="right")
         for c in candidates:
             clr = "green" if c["change_pct"] >= 0 else "red"
-            table.add_row(c["code"], str(c["close"]), f"{c['volume']:,.0f}",
-                         f"[{clr}]{c['change_pct']:+.2%}[/{clr}]")
+            table.add_row(c["code"], (c.get("name", "") or "")[:8], str(c["close"]),
+                         f"{c['volume']:,.0f}", f"[{clr}]{c['change_pct']:+.2%}[/{clr}]")
         console.print(table)
+
+        if candidates:
+            console.print("\n[bold]策略評估中...[/bold]")
+            logger = logging.getLogger("main")
+            lookback = max(
+                config["strategies"].get("momentum", {}).get("lookback_days", 30),
+                config["strategies"].get("breakout", {}).get("lookback_days", 20),
+                config["strategies"].get("mean_reversion", {}).get("lookback_days", 30),
+                config["strategies"].get("ema_trend", {}).get("lookback_days", 70),
+                config["strategies"].get("kd_cross", {}).get("lookback_days", 30),
+            )
+            max_evaluate = config["screener"].get("max_evaluate", 30)
+            signals = []
+            stock_rejects: list[tuple[str, str, list[str]]] = []
+            for c in candidates[:max_evaluate]:
+                code = c["code"]
+                if system.risk.is_limit_up(c.get("change_pct", 0)):
+                    stock_rejects.append((code, c.get("name", "")[:8], ["接近漲停"]))
+                    continue
+                df = system.feed.get_kbars(code, lookback_days=lookback + 30)
+                if df is None or len(df) < 20:
+                    stock_rejects.append((code, c.get("name", "")[:8], ["K棒不足"]))
+                    continue
+                sig = system.engine.evaluate(code, df)
+                if sig and sig.action == "Buy":
+                    signals.append(sig)
+                else:
+                    reasons = []
+                    for s in system.engine.strategies:
+                        if hasattr(s, "diagnose"):
+                            r = s.diagnose(code, df)
+                            reasons.append(f"{s.name}: {r}")
+                    if reasons:
+                        stock_rejects.append((code, c.get("name", "")[:8], reasons))
+
+            code_to_name = {c["code"]: c.get("name", "") for c in candidates}
+            signals.sort(key=lambda s: s.confidence, reverse=True)
+            if signals:
+                stbl = Table(title="買入訊號（技術策略）", show_header=True)
+                stbl.add_column("代碼", style="cyan")
+                stbl.add_column("名稱", style="dim")
+                stbl.add_column("信心", justify="right")
+                stbl.add_column("理由", style="dim")
+                for s in signals:
+                    stbl.add_row(s.code, code_to_name.get(s.code, ""), f"{s.confidence:.2f}", (s.reason or "")[:40])
+                    logger.info(f"[買入訊號] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
+                console.print(stbl)
+            else:
+                console.print("[dim]無買入訊號[/dim]")
+
+            if stock_rejects:
+                console.print("\n[bold]各檔被篩掉原因[/bold]")
+                for code, name, reasons in stock_rejects:
+                    line = f"{code} {name}: {' | '.join(reasons)}"
+                    console.print(f"  [dim]{line}[/dim]")
+
         system.teardown()
         return
 
