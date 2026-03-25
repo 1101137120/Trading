@@ -1,5 +1,12 @@
 extends: "config.yaml"
 
+# 催化劑分析：轉機股更依賴事件驅動，權重拉高
+catalyst:
+  enabled: true
+  days: 60
+  use_ai: false           # 改 true + 設 ANTHROPIC_API_KEY 可開 AI 分析
+  score_weight: 0.4       # 轉機模式下催化劑佔 40%，比預設的 30% 更重
+
 # 受委屈的種子（轉機股 Lite 可出名單版）：
 # 1) PB < 2.0 安全邊際（再放寬）
 # 2) 營收成長 > 10%

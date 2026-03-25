@@ -6,9 +6,28 @@
 
 ```
 Trading/
-├── shared/           # 共用模組（broker、portfolio、risk、feed、logger、notifier）
-├── tech/             # 技術策略專案（Momentum / Breakout / Mean Reversion）
-├── value/            # 價值投資專案（證交所基本面 + 技術確認雙重篩選）
+├── shared/
+│   ├── broker.py           # Shioaji API 包裝
+│   ├── portfolio.py        # 持倉追蹤（thread-safe）
+│   ├── risk.py             # 停損/停利/熔斷
+│   ├── feed.py             # K 棒 + Snapshot（via Shioaji）
+│   ├── standalone_feed.py  # K 棒（免券商，via TWSE OpenAPI）
+│   ├── twse_feed.py        # 基本面：PE/PB/殖利率
+│   ├── revenue_feed.py     # 月營收（TWSE bulk + FinMind per-stock，含日快取）
+│   ├── news_feed.py        # 新聞資料
+│   ├── ai_analyst.py       # Claude AI 新聞分析
+│   ├── notifier.py         # LINE / Telegram 通知
+│   ├── market_schedule.py  # 台股交易時間 + 假日
+│   └── exdiv_checker.py    # 除權息日期
+├── tech/                   # 技術策略（Momentum / Breakout / EMA / KD / Mean Reversion）
+├── value/
+│   ├── screener/
+│   │   └── value_scanner.py  # 基本面篩選 + 月收豐富化 + 品質因子
+│   ├── catalyst/
+│   │   ├── mops_scraper.py   # MOPS 重大訊息抓取
+│   │   └── analyzer.py       # 催化劑評分（關鍵詞 + Claude AI）
+│   └── main.py
+├── backtest.py
 ├── requirements.txt
 └── README.md
 ```
@@ -82,10 +101,15 @@ python value/main.py --scan-only
 ```
 
 **價值+技術雙重篩選流程**：
-1. 價值篩選：證交所 TWSE + 櫃買 TPEX 取得本益比、殖利率、股價淨值比
-2. 技術確認：通過價值篩選的標的，需技術策略（momentum / breakout）也發出買訊
-3. 大盤過濾：0050 收盤 ≤ MA20 時不開新倉
-4. 下單執行
+1. 價值篩選：TWSE / TPEX 取得 PE、殖利率、PB，雙軌（價值股 / 科技股）初篩
+2. 品質因子補充（選用）：yfinance 補 ROE、EPS 成長、負債比
+3. 月營收豐富化：抓近 3 個月月營收，計算 YoY / MoM / 趨勢，納入評分
+4. 基本面評分：估值 + 品質 + 月收 − 風險扣分 → `fs_total`
+5. 催化劑分析（選用）：MOPS 重大訊息 + Claude AI 評分
+6. v2 Gate：硬門檻過濾（PE 範圍、PB、殖利率、月收趨勢等）+ 分散限制
+7. 技術確認：通過篩選的標的需技術策略同時發出買訊
+8. 大盤過濾：0050 收盤 ≤ MA20 時不開新倉
+9. 下單執行
 
 設定檔：`value/config/config.yaml`
 持倉檔：`value/data/positions.json`
@@ -301,8 +325,74 @@ tech/data/heartbeat.json
 
 ### 資料來源
 
-- **上市**：證交所 TWSE `BWIBBU_d` API（本益比、殖利率、股價淨值比）
-- **上櫃**：櫃買中心 TPEX OpenAPI（本益比、殖利率、股價淨值比）
+| 資料 | 來源 | 說明 |
+|------|------|------|
+| PE / PB / 殖利率（上市） | TWSE `BWIBBU_d` API | 每日收盤後更新 |
+| PE / PB / 殖利率（上櫃） | TPEX OpenAPI | 即時 |
+| 月營收（上市）| TWSE OpenAPI `t187ap05_L` | 一次取全部，含當月+上月+YoY% |
+| 月營收（上櫃）| FinMind v3 per-stock | 僅針對通過初篩的候選股 |
+| 重大訊息 / 催化劑 | MOPS（公開資訊觀測站）| per-stock，60 天公告 |
+| ROE / EPS 成長 / 負債比 | yfinance（選用）| per-stock，有快取 |
+
+### 月營收評分邏輯
+
+月營收在 PE/PB 初篩後才拉取，**最多 1 + N 次 HTTP 請求**（N = 上櫃候選股數），同一天內讀快取不重打。
+
+| YoY（年增率）| 加分 |
+|-------------|------|
+| ≥ 30% | +15 |
+| ≥ 15% | +12 |
+| ≥ 5%  | +8  |
+| ≥ 0%  | +5  |
+| < 0%  | +0  |
+
+| 趨勢 | 效果 |
+|------|------|
+| 加速成長（連兩月 MoM > 5%）| 額外 +3，計入 `fs_revenue` |
+| 成長 | +1 |
+| 持平 | 0 |
+| 衰退 | `fs_penalty` +4 |
+| 加速衰退 | `fs_penalty` +8 |
+
+config 開關：
+```yaml
+revenue:
+  enabled: true
+  n_months: 3
+  exclude_trends: ["加速衰退"]   # 直接排除此趨勢
+  min_yoy_pct: null              # YoY 硬門檻（null=不過濾）
+```
+
+`v2_gate.hard_filters` 也可設：
+```yaml
+  min_revenue_yoy_pct: null
+  exclude_revenue_trends: ["加速衰退", "衰退"]
+```
+
+### 催化劑分析
+
+```yaml
+catalyst:
+  enabled: true
+  days: 60          # 抓幾天的 MOPS 公告
+  use_ai: true      # 呼叫 Claude API 深度分析（需設 ANTHROPIC_API_KEY）
+  min_score: 0
+  score_weight: 0.3
+```
+
+Phase 1（關鍵詞）：AI伺服器、HBM、擴產、大單、虧轉盈 等分類關鍵詞比對，評出 0~10 分。
+Phase 2（Claude AI）：有 `ANTHROPIC_API_KEY` 時自動升級為深度語意分析，給出評分 + 催化劑摘要 + 風險 + 時間預期。
+
+### 基本面評分結構（fs_total，0~100）
+
+| 分項 | 上限 | 說明 |
+|------|------|------|
+| `fs_value`（估值）| 60 | PE 便宜度 + PB + 殖利率 |
+| `fs_quality`（品質）| 40 | yfinance ROE/EPS/負債比；無資料時用代理分 |
+| `fs_revenue`（月收）| 15 | YoY % + 趨勢加成 |
+| `fs_penalty`（風險扣）| -30 | 虧損、高 PB、高殖利率陷阱、衰退月收 |
+
+> `fs_total = fs_value + fs_quality + fs_revenue − fs_penalty`，上限 100
 
 ### 價值篩選參數
 

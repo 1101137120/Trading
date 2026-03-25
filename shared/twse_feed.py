@@ -46,13 +46,20 @@ def fetch_twse_fundamentals(date: str = None) -> dict[str, dict]:
     """
     from datetime import timedelta
 
+    from datetime import timedelta
     result = {}
-    base_date = datetime.now()
+    if date:
+        try:
+            base_date = datetime.strptime(str(date).replace("-", ""), "%Y%m%d")
+        except ValueError:
+            base_date = datetime.now()
+    else:
+        base_date = datetime.now()
     # 若當日無資料（盤中或假日），往前試前幾個交易日
     for offset in range(5):
         dt = base_date - timedelta(days=offset)
-        date = dt.strftime("%Y%m%d")
-        url = TWSE_BWIBBU.format(date=date)
+        query_date = dt.strftime("%Y%m%d")
+        url = TWSE_BWIBBU.format(date=query_date)
 
         try:
             req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -70,7 +77,7 @@ def fetch_twse_fundamentals(date: str = None) -> dict[str, dict]:
                     raise
 
             if data.get("stat") != "OK" or not data.get("data"):
-                logger.debug(f"TWSE {date} 無資料: {data.get('stat')}，嘗試前一交易日")
+                logger.debug(f"TWSE {query_date} 無資料: {data.get('stat')}，嘗試前一交易日")
                 continue
 
             # fields: 證券代號, 證券名稱, 收盤價, 殖利率(%), 股利年度, 本益比, 股價淨值比, 財報年/季
@@ -80,11 +87,20 @@ def fetch_twse_fundamentals(date: str = None) -> dict[str, dict]:
                 code = str(row[0]).strip()
                 if code.endswith("*"):
                     code = code[:-1]
+                # 只接受 4 位數字的標準上市代碼
+                if not code or not code.isdigit() or len(code) != 4:
+                    continue
                 name = row[1]
                 close = _parse_float(row[2])
                 yield_pct = _parse_float(row[3])
                 pe = _parse_float(row[5])
                 pb = _parse_float(row[6])
+
+                # 收盤價 + PB 必須存在（PB 有值 = 真實上市股票；下市股通常 PB=null）
+                if close is None or close <= 0:
+                    continue
+                if pb is None or pb <= 0:
+                    continue
 
                 result[code] = {
                     "code": code,
@@ -99,7 +115,7 @@ def fetch_twse_fundamentals(date: str = None) -> dict[str, dict]:
             logger.info(f"TWSE 取得 {len(result)} 檔上市基本面")
             break
         except Exception as e:
-            logger.warning(f"TWSE {date} 取得失敗: {e}")
+            logger.warning(f"TWSE {query_date} 取得失敗: {e}")
             continue
 
     return result
@@ -142,7 +158,8 @@ def fetch_tpex_fundamentals() -> dict[str, dict]:
             code = str(item.get("SecuritiesCompanyCode", "")).strip()
             if code.endswith("*"):
                 code = code[:-1]
-            if not code or not code.isdigit():
+            # 只接受 4 位數字的標準上櫃代碼
+            if not code or not code.isdigit() or len(code) != 4:
                 continue
 
             pe = _parse_float(item.get("PriceEarningRatio"))
@@ -155,6 +172,10 @@ def fetch_tpex_fundamentals() -> dict[str, dict]:
             close = None
             if yield_pct and yield_pct > 0 and div and div > 0:
                 close = div / (yield_pct / 100)
+
+            # PB 必須存在（PB 有值 = 真實上櫃股票）
+            if pb is None or pb <= 0:
+                continue
 
             result[code] = {
                 "code": code,
@@ -173,9 +194,39 @@ def fetch_tpex_fundamentals() -> dict[str, dict]:
     return result
 
 
+TPEX_ESM_URL = "https://www.tpex.org.tw/openapi/v1/tpex_esm_listed_regular"
+
+
+def fetch_emerging_codes() -> set[str]:
+    """抓取興櫃（ESM）股票代碼集合，用來排除非正規市場股票"""
+    try:
+        req = Request(TPEX_ESM_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=10, context=_ssl_context(verify=False)) as resp:
+            data = json.loads(resp.read().decode())
+        codes = {
+            str(item.get("SecuritiesCompanyCode", "")).strip()
+            for item in data
+            if item.get("SecuritiesCompanyCode")
+        }
+        logger.debug(f"興櫃黑名單：{len(codes)} 檔")
+        return codes
+    except Exception as e:
+        logger.debug(f"興櫃名單取得失敗（略過）: {e}")
+        return set()
+
+
 def fetch_all_fundamentals(date: str = None) -> dict[str, dict]:
-    """合併上市+上櫃基本面（上櫃覆蓋同代碼若有）"""
+    """合併上市+上櫃基本面，排除興櫃股票"""
     tse = fetch_twse_fundamentals(date)
     otc = fetch_tpex_fundamentals()
     merged = {**tse, **otc}
+
+    emerging = fetch_emerging_codes()
+    if emerging:
+        before = len(merged)
+        merged = {k: v for k, v in merged.items() if k not in emerging}
+        removed = before - len(merged)
+        if removed:
+            logger.debug(f"排除興櫃 {removed} 檔")
+
     return merged
