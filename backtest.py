@@ -123,6 +123,60 @@ def build_dynamic_pool(
     return pool_by_date
 
 
+def calc_benchmark(
+    market_df: pd.DataFrame,
+    start: date,
+    end: date,
+    capital: float,
+    fee_rate: float = 0.001425,
+    min_fee: float = 20.0,
+) -> dict | None:
+    """計算 0050 買進持有報酬（同回測期間），扣手續費與 ETF 稅"""
+    if market_df is None or market_df.empty:
+        return None
+    df = market_df.copy()
+    df["_date"] = df["ts"].dt.date
+    df = df[(df["_date"] >= start) & (df["_date"] <= end)].sort_values("_date")
+    if len(df) < 2:
+        return None
+
+    buy_price  = df.iloc[0]["Close"]
+    sell_price = df.iloc[-1]["Close"]
+    buy_date   = df.iloc[0]["_date"]
+    sell_date  = df.iloc[-1]["_date"]
+
+    lots = int(capital / (buy_price * 1000))
+    if lots <= 0:
+        return None
+
+    cost       = lots * buy_price * 1000
+    fee_buy    = max(cost * fee_rate, min_fee)
+    sell_amt   = lots * sell_price * 1000
+    fee_sell   = max(sell_amt * fee_rate, min_fee)
+    tax        = sell_amt * 0.001  # ETF 稅率
+    net_pnl    = lots * 1000 * (sell_price - buy_price) - fee_buy - fee_sell - tax
+    ret_pct    = net_pnl / (cost + fee_buy) * 100
+
+    # 最大回撤
+    closes = df["Close"].values
+    peak = closes[0]
+    max_dd = 0.0
+    for c in closes:
+        peak = max(peak, c)
+        dd = (peak - c) / peak * 100
+        max_dd = max(max_dd, dd)
+
+    return {
+        "buy_date":         buy_date,
+        "sell_date":        sell_date,
+        "buy_price":        buy_price,
+        "sell_price":       sell_price,
+        "lots":             lots,
+        "total_return_pct": round(ret_pct, 2),
+        "max_drawdown_pct": round(max_dd, 2),
+    }
+
+
 def simulate_trades(
     df: pd.DataFrame,
     engine: StrategyEngine,
@@ -135,6 +189,7 @@ def simulate_trades(
     market_ma_period: int = 20,
     loss_cooldown_days: int = 0,
     dynamic_pool: dict = None,
+    max_hold_days: int = 0,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -175,10 +230,13 @@ def simulate_trades(
             pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
             exit_reason = None
 
+            hold = (row_date - position["entry_date"]).days
             if current_price <= position["stop"]:
                 exit_reason = "停損"
             elif current_price >= position["target"]:
                 exit_reason = "停利"
+            elif max_hold_days > 0 and hold >= max_hold_days:
+                exit_reason = "到期出場"
             elif row_date == end or i == len(df) - 1:
                 exit_reason = "回測結束"
 
@@ -412,6 +470,8 @@ def main():
                         help="大盤過濾 MA 週期（預設 20）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
                         help="個股停損後冷卻天數（預設 0=停用），建議 3~7")
+    parser.add_argument("--max-hold-days", type=int, default=0,
+                        help="最長持有天數，到期強制出場（預設 0=停用）")
     parser.add_argument("--max-avg-range", type=float, default=0.0,
                         help="排除日均振幅 > 此值%%的高波動股（預設 0=停用），建議 6~8")
     parser.add_argument("--dynamic-pool", action="store_true", default=True,
@@ -556,6 +616,7 @@ def main():
                 market_ma_period=args.market_ma,
                 loss_cooldown_days=loss_cooldown,
                 dynamic_pool=dynamic_pool,
+                max_hold_days=args.max_hold_days,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -727,6 +788,39 @@ def main():
     else:
         s["trades"].to_csv(out_path, index=False, encoding="utf-8-sig")
     console.print(f"\n[dim]詳細明細（含張數/損益元）已存至 {out_path}[/dim]")
+
+    # ── 0050 買進持有基準比較 ──
+    if market_df is not None:
+        bench = calc_benchmark(market_df, start, end, args.capital, args.fee_rate, args.min_fee)
+        if bench:
+            alpha     = psim["total_return_pct"] - bench["total_return_pct"]
+            alpha_clr = "green" if alpha >= 0 else "red"
+            strat_clr = "green" if psim["total_return_pct"] >= 0 else "red"
+            bench_clr = "green" if bench["total_return_pct"] >= 0 else "red"
+
+            console.rule("\n[bold]vs 0050 買進持有 基準比較[/bold]")
+            cmp = Table(show_header=True)
+            cmp.add_column("項目",                style="dim")
+            cmp.add_column("策略",                justify="right")
+            cmp.add_column("0050 買進持有",       justify="right")
+            cmp.add_column("Alpha（策略 − 0050）", justify="right")
+            cmp.add_row(
+                "報酬率",
+                f"[{strat_clr}]{psim['total_return_pct']:+.2f}%[/{strat_clr}]",
+                f"[{bench_clr}]{bench['total_return_pct']:+.2f}%[/{bench_clr}]",
+                f"[bold {alpha_clr}]{alpha:+.2f}%[/bold {alpha_clr}]",
+            )
+            cmp.add_row(
+                "最大回撤",
+                f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]",
+                f"[red]-{bench['max_drawdown_pct']:.2f}%[/red]",
+                "—",
+            )
+            console.print(cmp)
+            console.print(
+                f"[dim]0050：{bench['buy_date']} 買入 {bench['buy_price']:.2f} → "
+                f"{bench['sell_date']} {bench['sell_price']:.2f}，{bench['lots']} 張[/dim]"
+            )
 
 
 if __name__ == "__main__":
