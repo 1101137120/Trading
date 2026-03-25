@@ -5,6 +5,7 @@
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Optional
 
 from shared.twse_feed import fetch_all_fundamentals
@@ -113,12 +114,15 @@ class ValueScanner:
             boost += 2.0
         return round(min(25.0, boost), 2)
 
-    def screen(self, date: str = None) -> list[dict]:
+    def screen(self, date: str = None, tse_only: bool = False) -> list[dict]:
         """
         執行價值篩選，可選合併科技股
+        tse_only=True：只看上市（TSE），排除上櫃（收盤價回溯準確、流動性較佳）
         回傳: [{code, name, close, pe, yield_pct, pb, type, ...}, ...]
         """
         raw = fetch_all_fundamentals(date)
+        if tse_only:
+            raw = {k: v for k, v in raw.items() if v.get("exchange") == "TSE"}
         seen = set()
         result = []
 
@@ -133,6 +137,7 @@ class ValueScanner:
                 if snap:
                     close = snap.get("close")
             if close is None or close <= 0:
+                logger.debug(f"跳過 {code}（{row.get('name', '')}）：無有效收盤價（上櫃需 snapshot 補）")
                 continue
             yield_pct_eff = self._effective_yield_pct(row, close)
             if not (value_cfg.get("min_price", 10) <= close <= value_cfg.get("max_price", 1000)):
@@ -180,6 +185,7 @@ class ValueScanner:
                     if snap:
                         close = snap.get("close")
                 if close is None or close <= 0:
+                    logger.debug(f"跳過 {code}（{row.get('name', '')}）：無有效收盤價（上櫃需 snapshot 補）")
                     continue
                 yield_pct_eff = self._effective_yield_pct(row, close)
                 if not (tech_cfg.get("min_price", 20) <= close <= tech_cfg.get("max_price", 1000)):
@@ -315,6 +321,10 @@ class ValueScanner:
                         yf.set_tz_cache_location(cache_dir)
                 except Exception:
                     pass
+                # 壓掉 yfinance 下市/找不到股票的 ERROR 噪音（正常現象，不影響功能）
+                import logging as _logging
+                for _noisy in ("yfinance", "peewee", "urllib3.connectionpool"):
+                    _logging.getLogger(_noisy).setLevel(_logging.CRITICAL)
                 self._yf_cache_inited = True
         except Exception:
             if not self._yf_missing_logged:
@@ -348,6 +358,146 @@ class ValueScanner:
 
         self._yf_cache[key] = out
         return out
+
+    def enrich_with_revenue(self, candidates: list[dict]) -> list[dict]:
+        """
+        月營收豐富化：抓近 3 個月月營收，計算 YoY / MoM / 趨勢，可選排除衰退股。
+        請求數：1（TSE bulk）+ N（上櫃候選股數），同一天內讀快取。
+        config.yaml 範例：
+          revenue:
+            enabled: true
+            n_months: 3
+            exclude_trends: ["加速衰退"]   # 直接過濾這些趨勢
+            min_yoy_pct: null              # 硬門檻（null=不過濾）
+        """
+        rcfg = (self.config.get("revenue") or {})
+        if not rcfg.get("enabled", True):
+            for c in candidates:
+                c.setdefault("revenue_trend", "不足")
+            return candidates
+
+        from shared.revenue_feed import build_revenue_map
+
+        n_months = int(rcfg.get("n_months", 3))
+        cache_path = rcfg.get("cache_path")
+        if cache_path:
+            cache_path = Path(cache_path)
+
+        rev_candidates = [
+            {"code": c["code"], "exchange": c.get("exchange", "TSE")}
+            for c in candidates
+        ]
+        try:
+            rev_map = build_revenue_map(rev_candidates, cache_path=cache_path, n_months=n_months)
+        except Exception as e:
+            logger.warning(f"月營收抓取失敗: {e}")
+            for c in candidates:
+                c.setdefault("revenue_trend", "不足")
+            return candidates
+
+        enriched = 0
+        for c in candidates:
+            info = rev_map.get(c["code"])
+            if info:
+                c["revenue_months"] = info.months
+                c["revenue_values"] = info.revenues
+                c["revenue_yoy_pct"] = info.yoy_pct
+                c["revenue_mom_pct"] = info.mom_pct
+                c["revenue_trend"] = info.trend
+                enriched += 1
+            else:
+                c["revenue_months"] = []
+                c["revenue_values"] = []
+                c["revenue_yoy_pct"] = None
+                c["revenue_mom_pct"] = None
+                c["revenue_trend"] = "不足"
+
+        # 可選硬門檻過濾
+        exclude_trends = list(rcfg.get("exclude_trends") or [])
+        min_yoy = rcfg.get("min_yoy_pct")
+        before = len(candidates)
+        if exclude_trends:
+            candidates = [c for c in candidates if c.get("revenue_trend") not in exclude_trends]
+        if min_yoy is not None:
+            candidates = [
+                c for c in candidates
+                if c.get("revenue_yoy_pct") is None or float(c["revenue_yoy_pct"]) >= float(min_yoy)
+            ]
+        filtered = before - len(candidates)
+        logger.info(
+            f"月營收豐富化：{enriched}/{before} 檔有資料，過濾 {filtered} 檔"
+        )
+        return candidates
+
+    def enrich_with_catalyst(self, candidates: list[dict], as_of_date: str = None) -> list[dict]:
+        """
+        催化劑豐富化：抓 MOPS 重大訊息，用關鍵詞或 Claude AI 評分。
+        在每個 candidate 加上 catalyst_score (0~10) 與 catalyst_tags。
+        config.yaml 範例：
+          catalyst:
+            enabled: true
+            days: 60          # 抓幾天的公告
+            use_ai: true      # 是否呼叫 Claude API（需 ANTHROPIC_API_KEY）
+            min_score: 0      # 低於此分數的標的不排除，只降權（0=不過濾）
+            score_weight: 0.3 # 催化劑分在最終排序的加權比例
+        """
+        cfg = (self.config.get("catalyst") or {})
+        if not cfg.get("enabled", False):
+            for c in candidates:
+                c["catalyst_score"] = 0.0
+                c["catalyst_tags"] = []
+            return candidates
+
+        from value.catalyst.mops_scraper import fetch_announcements
+        from value.catalyst.analyzer import analyze
+
+        days = int(cfg.get("days", 60))
+        use_ai = bool(cfg.get("use_ai", False))
+        api_key = cfg.get("api_key") or os.getenv("ANTHROPIC_API_KEY", "")
+
+        fetch_news = use_ai  # 只在 AI 模式下抓鉅亨新聞（關鍵詞模式不需要）
+        if fetch_news:
+            try:
+                from shared.news_feed import get_stock_news as _get_news
+            except ImportError:
+                _get_news = None
+                fetch_news = False
+        else:
+            _get_news = None
+
+        for c in candidates:
+            code = c.get("code", "")
+            name = c.get("name", code)
+            try:
+                announcements = fetch_announcements(code, days=days, as_of=as_of_date)
+                stock_news = _get_news(code, name, hours=72) if _get_news else []
+                result = analyze(
+                    code=code,
+                    name=name,
+                    announcements=announcements,
+                    fundamentals=c,
+                    use_ai=use_ai,
+                    api_key=api_key or None,
+                    news=stock_news,
+                )
+                c["catalyst_score"] = result.get("score", 0.0)
+                c["catalyst_tags"] = result.get("tags", [])
+                c["catalyst_source"] = result.get("source", "keyword")
+                c["catalyst_summary"] = result.get("catalyst_summary", "")
+                c["catalyst_negative"] = result.get("negative", False)
+                if result.get("source") == "claude":
+                    c["catalyst_horizon"] = result.get("horizon", "")
+                    c["catalyst_risk"] = result.get("risk", "")
+            except Exception as e:
+                logger.warning(f"{code} catalyst 分析失敗: {e}")
+                c["catalyst_score"] = 0.0
+                c["catalyst_tags"] = []
+
+        logger.info(
+            f"catalyst 分析完成，有催化劑(>3分): "
+            f"{sum(1 for c in candidates if c.get('catalyst_score', 0) > 3)} / {len(candidates)}"
+        )
+        return candidates
 
     def enrich_with_quality_metrics(self, candidates: list[dict]) -> list[dict]:
         """
@@ -417,10 +567,17 @@ class ValueScanner:
         min_roe_pct = hard.get("min_roe_pct")
         min_eps_growth_pct = hard.get("min_eps_growth_pct")
         min_revenue_growth_pct = hard.get("min_revenue_growth_pct")
+        min_revenue_yoy_alt = hard.get("min_revenue_yoy_pct_alt")   # 月收 YoY 替代門檻
         max_debt_to_equity = hard.get("max_debt_to_equity")
         require_real_quality = bool(hard.get("require_real_quality_metrics", False))
         require_eps_negative_or_high_pe = bool(turnaround.get("require_eps_negative_or_high_pe", False))
         high_pe_threshold = float(turnaround.get("high_pe_threshold", 50.0))
+
+        min_revenue_yoy_gate = hard.get("min_revenue_yoy_pct")
+        exclude_revenue_trends = list(hard.get("exclude_revenue_trends") or [])
+        sector_blacklist = [s.lower() for s in (hard.get("sector_blacklist") or [])]
+        min_catalyst_score = float(hard.get("min_catalyst_score", 0.0))
+        exclude_negative_catalyst = bool(hard.get("exclude_negative_catalyst", False))
 
         rs_required = bool(rs_gate.get("require_positive", True)) and enforce_rs
         min_rs_score = float(rs_gate.get("min_rs_score", 0.0))
@@ -478,8 +635,16 @@ class ValueScanner:
                 reasons.append("roe")
             if min_eps_growth_pct is not None and eps_growth_pct is not None and float(eps_growth_pct) < float(min_eps_growth_pct):
                 reasons.append("eps_growth")
-            if min_revenue_growth_pct is not None and revenue_growth_pct is not None and float(revenue_growth_pct) < float(min_revenue_growth_pct):
-                reasons.append("rev_growth")
+            if min_revenue_growth_pct is not None and revenue_growth_pct is not None:
+                yf_ok = float(revenue_growth_pct) >= float(min_revenue_growth_pct)
+                rev_yoy_val = c.get("revenue_yoy_pct")
+                alt_ok = (
+                    min_revenue_yoy_alt is not None
+                    and rev_yoy_val is not None
+                    and float(rev_yoy_val) >= float(min_revenue_yoy_alt)
+                )
+                if not (yf_ok or alt_ok):
+                    reasons.append("rev_growth")
             if max_debt_to_equity is not None and debt_to_equity is not None and float(debt_to_equity) > float(max_debt_to_equity):
                 reasons.append("debt")
             if require_eps_negative_or_high_pe:
@@ -489,18 +654,43 @@ class ValueScanner:
                 if not (pe_missing_or_negative or pe_high):
                     reasons.append("turnaround_pe")
 
+            # 月營收 gate（資料不足時不過濾）
+            rev_yoy = c.get("revenue_yoy_pct")
+            rev_trend = c.get("revenue_trend") or "不足"
+            if min_revenue_yoy_gate is not None and rev_yoy is not None:
+                if float(rev_yoy) < float(min_revenue_yoy_gate):
+                    reasons.append("revenue_yoy")
+            if exclude_revenue_trends and rev_trend in exclude_revenue_trends:
+                reasons.append("revenue_trend")
+
+            # 產業黑名單（yfinance sector，無資料時跳過）
+            if sector_blacklist:
+                sector_val = str(c.get("sector") or "").lower()
+                if sector_val and any(bl in sector_val for bl in sector_blacklist):
+                    reasons.append("sector")
+
+            # 催化劑過濾（資料不足時不過濾，避免誤殺）
+            cat_score = float(c.get("catalyst_score") or 0.0)
+            cat_negative = bool(c.get("catalyst_negative", False))
+            if exclude_negative_catalyst and cat_negative:
+                reasons.append("catalyst_negative")
+            if min_catalyst_score > 0 and cat_score < min_catalyst_score:
+                reasons.append("catalyst_score")
+
             if reasons:
                 c["gate_reject_reason"] = ",".join(reasons)
                 reject_count += 1
                 continue
             passed.append(c)
 
-        # 先按「基本面 + RS」排序，再做分散限制
+        # 先按「基本面 + RS + 催化劑」排序，再做分散限制
         def _score_key(x: dict) -> float:
             fs = float(x.get("fs_total", x.get("fs", 0.0)) or 0.0)
             rs = x.get("rs_score")
             rs_term = float(rs) if rs is not None else -50.0
-            return fs * 0.6 + rs_term * 0.4
+            cat = float(x.get("catalyst_score") or 0.0)
+            # catalyst_score 0~10，換算成同量級後加權 0.15
+            return fs * 0.55 + rs_term * 0.35 + cat * 1.5 * 0.1
 
         passed.sort(key=_score_key, reverse=True)
 
@@ -652,8 +842,43 @@ class ValueScanner:
         else:
             quality_score = proxy_quality_score
 
+        # -------- 月營收分 (0~15) --------
+        revenue_yoy = c.get("revenue_yoy_pct")
+        revenue_trend = c.get("revenue_trend") or "不足"
+
+        rev_score = 0.0
+        if revenue_yoy is not None:
+            yoy = float(revenue_yoy)
+            if yoy >= 30:    rev_score = 15.0
+            elif yoy >= 15:  rev_score = 12.0
+            elif yoy >= 5:   rev_score = 8.0
+            elif yoy >= 0:   rev_score = 5.0
+            # 負成長：0 分，另在風險扣分處處理
+        if revenue_trend == "加速成長":
+            rev_score = min(15.0, rev_score + 3.0)
+        elif revenue_trend == "成長":
+            rev_score = min(15.0, rev_score + 1.0)
+
+        # -------- 催化劑加分 (0~15) --------
+        # catalyst_score 0~10；有負面訊號扣分
+        catalyst_score_val = float(c.get("catalyst_score") or 0.0)
+        cat_negative = bool(c.get("catalyst_negative", False))
+        if cat_negative:
+            cat_boost = 0.0
+        elif catalyst_score_val >= 7:
+            cat_boost = 15.0
+        elif catalyst_score_val >= 5:
+            cat_boost = 10.0
+        elif catalyst_score_val >= 3:
+            cat_boost = 5.0
+        else:
+            cat_boost = 0.0
+
         # -------- 風險扣分 (0~30) --------
         risk_penalty = 0.0
+        # 有負面催化劑（公告負面）額外扣分
+        if cat_negative:
+            risk_penalty += 10.0
         # 虧損或異常估值，直接重扣
         if pe is None or pe <= 0:
             risk_penalty += 20.0
@@ -674,10 +899,17 @@ class ValueScanner:
             risk_penalty += 4.0
         if debt_to_equity is not None and float(debt_to_equity) > 150:
             risk_penalty += 4.0
+        # 月營收衰退懲罰
+        if revenue_trend == "加速衰退":
+            risk_penalty += 8.0
+        elif revenue_trend == "衰退":
+            risk_penalty += 4.0
+        elif revenue_yoy is not None and float(revenue_yoy) < -20:
+            risk_penalty += 4.0
 
         risk_penalty = min(30.0, risk_penalty)
 
-        total = max(0.0, min(100.0, valuation_score + quality_score - risk_penalty))
+        total = max(0.0, min(100.0, valuation_score + quality_score + rev_score + cat_boost - risk_penalty))
 
         # 回填拆解欄位，讓主程式可直接顯示原因
         c["fs_value"] = round(valuation_score, 1)
@@ -685,6 +917,8 @@ class ValueScanner:
         c["fs_quality_real"] = round(real_quality_score, 1)
         c["fs_quality_coverage"] = round(real_quality_coverage, 2)
         c["fs_quality"] = round(quality_score, 1)
+        c["fs_revenue"] = round(rev_score, 1)
+        c["fs_catalyst"] = round(cat_boost, 1)
         c["fs_penalty"] = round(risk_penalty, 1)
         c["fs_total"] = round(total, 1)
 

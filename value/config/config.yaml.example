@@ -61,6 +61,18 @@ quality_factors:
     revenue_growth: 10
     debt_to_equity: 6
 
+revenue:
+  enabled: true
+  n_months: 3                        # 連續幾個月
+  exclude_trends: ["加速衰退", "衰退"]  # 直接排除衰退趨勢
+  min_yoy_pct: 10                    # 年增率 < 10% 的標的排除（null=不過濾）
+
+catalyst:
+  enabled: true
+  days: 60                           # 抓幾天的 MOPS 公告
+  use_ai: true                       # 呼叫 Claude API 深度分析（需 ANTHROPIC_API_KEY）
+  # api_key: ""                      # 或用環境變數 ANTHROPIC_API_KEY
+
 v2_gate:
   enabled: true
   hard_filters:
@@ -78,6 +90,10 @@ v2_gate:
     min_revenue_growth_pct: null
     max_debt_to_equity: null
     require_real_quality_metrics: false
+    min_revenue_yoy_pct: null          # 最低 YoY %（null=不過濾；已在 revenue 段過濾，這裡可保 null）
+    exclude_revenue_trends: []         # 排除趨勢（已在 revenue 段設定，這裡可留空）
+    min_catalyst_score: 3.0            # 催化劑分 < 3 的標的排除（0=不過濾）
+    exclude_negative_catalyst: true    # 有負面公告（掏空/砍單/重大損失）的標的直接剔除
   rs:
     require_positive: true
     min_rs_score: 0.0

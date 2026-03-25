@@ -13,6 +13,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
+# 自動載入專案根目錄的 .env（如存在），讓 ANTHROPIC_API_KEY 等環境變數生效
+try:
+    from dotenv import load_dotenv as _load_dotenv
+    _load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+except ImportError:
+    pass  # python-dotenv 未安裝時靜默跳過
+
 import fcntl
 import os
 import time
@@ -39,6 +46,8 @@ from shared.exdiv_checker import ExDividendChecker
 from tech.market_filter import MarketFilter
 from tech.strategies.engine import StrategyEngine
 from value.screener.value_scanner import ValueScanner
+from shared.news_feed import get_stock_news
+from shared.ai_analyst import analyze_news
 
 console = Console()
 _running = True
@@ -128,6 +137,44 @@ def resolve_rs_enforcement(candidates: list[dict], logger_obj=None, console_obj=
     return False
 
 
+def _detect_kbar_pattern(close, volume) -> str | None:
+    """
+    偵測進場型態：
+    - 盤整前：量縮 + 未創60日新高 + 近5日漲幅 < 10%
+    - 回檔盤整：20~60日曾漲 > 15%（有過爆發）+ 近5日漲幅 < 5% + 量縮 + 仍在高點85%以上
+    回傳 "盤整前" / "回檔盤整" / None（不符合任何型態則過濾掉）
+    """
+    import math
+    if len(close) < 20:
+        return None
+
+    price_now = float(close.iloc[-1])
+    if math.isnan(price_now) or price_now <= 0:
+        return None
+    vol_now = float(volume.iloc[-1])
+    vol_peak = float(volume.tail(20).max() if len(volume) >= 20 else volume.max())
+    if math.isnan(vol_peak) or vol_peak <= 0:
+        return None
+    vol_quiet = vol_now < vol_peak * 0.70
+
+    gain_5d = (price_now / float(close.iloc[-6]) - 1) if len(close) >= 6 else 0.0
+    high_60d = float(close.tail(60).max() if len(close) >= 60 else close.max())
+
+    # 型態一：盤整前埋伏
+    if vol_quiet and gain_5d < 0.10 and price_now < high_60d * 0.95:
+        return "盤整前"
+
+    # 型態二：回檔盤整（爆發後整理）
+    gain_20d = (price_now / float(close.iloc[-21]) - 1) if len(close) >= 21 else 0.0
+    gain_60d = (price_now / float(close.iloc[-61]) - 1) if len(close) >= 61 else 0.0
+    mid_gain = max(gain_20d, gain_60d)
+
+    if vol_quiet and gain_5d < 0.05 and mid_gain > 0.15 and price_now >= high_60d * 0.85:
+        return "回檔盤整"
+
+    return None
+
+
 class ValueTradingSystem:
     """價值 + 技術雙重篩選交易系統"""
 
@@ -147,6 +194,7 @@ class ValueTradingSystem:
         self.engine: StrategyEngine = None
         self.market_filter: MarketFilter = None
         self._exit_queue: queue.Queue = queue.Queue()
+        self._last_market_ok: bool = True  # 大盤趨勢查詢失敗時的 fallback
 
     def setup(self) -> bool:
         console.print("[bold cyan]正在連線永豐金...[/bold cyan]")
@@ -274,20 +322,13 @@ class ValueTradingSystem:
                 self._print_summary()
                 return
 
-            # 1.1 補上基本面分與多週期 RS，再套用 v2 gate（硬門檻 + 黑名單 + 分散）
-            rs_params = resolve_rs_params(self.config)
+            # 1.1 補上基本面分，再套用 v2 gate（硬門檻 + 黑名單 + 分散）
             value_candidates = self.value_scanner.enrich_with_quality_metrics(value_candidates)
+            value_candidates = self.value_scanner.enrich_with_revenue(value_candidates)
             for c in value_candidates:
                 c["fs"] = self.value_scanner.calc_fundamental_score(c)
-            value_candidates = self.value_scanner.enrich_with_relative_strength(
-                value_candidates,
-                lookbacks=rs_params["lookbacks"],
-                weights=rs_params["weights"],
-                market_code=rs_params["market_code"],
-                volatility_penalty=rs_params["volatility_penalty"],
-            )
-            enforce_rs = resolve_rs_enforcement(value_candidates, logger_obj=self.logger)
-            value_candidates = self.value_scanner.apply_v2_gates(value_candidates, enforce_rs=enforce_rs)
+            value_candidates = self.value_scanner.enrich_with_catalyst(value_candidates)
+            value_candidates = self.value_scanner.apply_v2_gates(value_candidates, enforce_rs=False)
             if not value_candidates:
                 self.logger.info("v2 gate 後無可交易標的")
                 self._print_summary()
@@ -303,7 +344,13 @@ class ValueTradingSystem:
                 return
 
             # 3. 大盤趨勢過濾
-            if not self.market_filter.allow_long():
+            try:
+                market_ok = self.market_filter.allow_long()
+                self._last_market_ok = market_ok
+            except Exception as e:
+                self.logger.warning(f"大盤趨勢查詢失敗，沿用上次結果: {e}")
+                market_ok = self._last_market_ok
+            if not market_ok:
                 self.logger.info("大盤趨勢偏空，本週期不開新倉")
                 self._print_summary()
                 return
@@ -396,6 +443,9 @@ class ValueTradingSystem:
                 if elapsed > timeout:
                     self.broker.cancel_order(po.trade_ref)
                     self.portfolio.cancel_pending(code)
+            else:
+                if status is not None:
+                    self.logger.warning(f"[訂單] {code} 回傳未知狀態 {status!r}，保持觀察")
 
     def _check_exit_conditions_via_snapshot(self):
         if not self.portfolio.positions:
@@ -443,11 +493,31 @@ class ValueTradingSystem:
             df = self.feed.get_kbars(code, lookback_days=lookback + 30)
             if df is None:
                 continue
+
+            close = df["Close"].astype(float)
+            volume = df["Volume"].astype(float)
+
+            pattern = _detect_kbar_pattern(close, volume)
+            if pattern is None:
+                self.logger.info(f"跳過 {code}：不符合盤整前或回檔盤整型態")
+                continue
+
             sig = self.engine.evaluate(code, df)
             if sig and sig.action == "Buy":
+                sig.reason = f"[{pattern}] {sig.reason}"
+                # 回檔盤整（爆發後整理再進場）歷史勝率較高，提升優先度
+                if pattern == "回檔盤整":
+                    sig.confidence = min(1.0, sig.confidence + 0.1)
                 signals.append(sig)
+        code_to_name = {c["code"]: c.get("name", "") for c in candidates}
         signals.sort(key=lambda s: s.confidence, reverse=True)
         self.logger.info(f"價值+技術雙重確認：{len(signals)} 個買入訊號")
+        for s in signals:
+            name = code_to_name.get(s.code, "")
+            news = get_stock_news(s.code, name)
+            analysis = analyze_news(s.code, name, news)
+            ai_note = f"[AI {analysis.sentiment} {analysis.score:+.1f}] {analysis.summary}" if analysis.has_news else "[無近期新聞]"
+            self.logger.info(f"[買入訊號] {s.code} {name} 價格={s.price} 信心={s.confidence:.2f} 理由={s.reason} | {ai_note}")
         return signals
 
     def _execute_buy_signals(self, signals: list):
@@ -650,6 +720,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="不實際下單")
     parser.add_argument("--scan-only", action="store_true", help="只篩選標的並印出")
     parser.add_argument("--config", default=None, help="設定檔路徑")
+    parser.add_argument(
+        "--tse-only", action="store_true",
+        help="只看上市（TSE），排除上櫃（OTC）－收盤價回溯準確、流動性較佳"
+    )
     args = parser.parse_args()
 
     config_path = Path(args.config) if args.config else PROJECT_ROOT / "config" / "config.yaml"
@@ -671,88 +745,91 @@ def main():
         from shared.standalone_feed import fetch_kbars
         import numpy as np
 
-        console.print("[dim]價值篩選使用證交所+櫃買資料（上櫃收盤價由殖利率反推）[/dim]")
+        src = "僅上市（TSE）" if args.tse_only else "上市+上櫃（TSE+OTC，上櫃收盤價由殖利率反推）"
+        console.print(f"[dim]價值篩選資料來源：{src}[/dim]")
         value_scanner = ValueScanner(config, None)
-        value_candidates = value_scanner.screen()
+        value_candidates = value_scanner.screen(tse_only=args.tse_only)
 
         if not value_candidates:
             console.print("[yellow]無符合條件的標的[/yellow]")
             return
 
-        # ── 大盤狀態（0050）──
-        rs_params = resolve_rs_params(config)
-        rs_market_code = rs_params["market_code"]
-        rs_lookbacks = rs_params["lookbacks"]
-        rs_display_lb = rs_params["display_lb"]
-        rs_weights = rs_params["weights"]
-        rs_vol_penalty = rs_params["volatility_penalty"]
-        fs_weight = rs_params["fs_weight"]
-        rs_weight = rs_params["rs_weight"]
-        ma_period = config.get("market_filter", {}).get("ma_period", 20)
-
-        market_status = "未知"
-        market_return = None
-        try:
-            m_df = fetch_kbars(rs_market_code, lookback_days=max(max(rs_lookbacks), ma_period) + 10)
-            if m_df is not None and len(m_df) >= ma_period:
-                ma = m_df["Close"].tail(ma_period).mean()
-                ma60 = m_df["Close"].tail(60).mean() if len(m_df) >= 60 else None
-                last = m_df["Close"].iloc[-1]
-                market_return = (last / m_df["Close"].iloc[-min(rs_display_lb, len(m_df))] - 1) * 100
-                if last > ma and (ma60 is None or last > ma60):
-                    market_status = f"[green]偏多[/green]（{rs_market_code}={last:.1f} > MA{ma_period}={ma:.1f}）"
-                elif last < (ma60 or ma):
-                    market_status = f"[red]偏空[/red]（{rs_market_code}={last:.1f} < MA{ma_period}={ma:.1f}）"
-                else:
-                    market_status = f"[yellow]中性[/yellow]（{rs_market_code}={last:.1f} 介於 MA{ma_period}/{60}之間）"
-        except Exception:
-            pass
-
-        console.print(f"\n大盤狀態：{market_status}")
-        if market_return is not None:
-            clr = "green" if market_return >= 0 else "red"
-            console.print(f"{rs_market_code} 近 {rs_display_lb} 日報酬：[{clr}]{market_return:+.2f}%[/{clr}]\n")
-
-        # ── 補品質資料 + 相對強度 ──
+        # ── 補品質資料 ──
         console.print("[dim]補品質因子（ROE / EPS成長 / 營收成長 / 負債權益比），請稍候...[/dim]")
         value_candidates = value_scanner.enrich_with_quality_metrics(value_candidates)
-        console.print(
-            f"[dim]計算相對強度（{rs_lookbacks} 日，多週期 vs {rs_market_code}）"
-            f"；波動懲罰={rs_vol_penalty}，請稍候...[/dim]"
-        )
-        value_candidates = value_scanner.enrich_with_relative_strength(
-            value_candidates,
-            lookbacks=rs_lookbacks,
-            weights=rs_weights,
-            market_code=rs_market_code,
-            volatility_penalty=rs_vol_penalty,
-        )
+        console.print("[dim]補月營收（近 3 個月），請稍候...[/dim]")
+        value_candidates = value_scanner.enrich_with_revenue(value_candidates)
 
-        # 加基本面評分（估值 + 品質代理 - 風險扣分）
+        # 加基本面評分（估值 + 品質代理 + 月收 - 風險扣分）
         for c in value_candidates:
             c["fs"] = value_scanner.calc_fundamental_score(c)
 
         before_gate = len(value_candidates)
-        enforce_rs = resolve_rs_enforcement(value_candidates, console_obj=console)
-        value_candidates = value_scanner.apply_v2_gates(value_candidates, enforce_rs=enforce_rs)
+        value_candidates = value_scanner.enrich_with_catalyst(value_candidates)
+        value_candidates = value_scanner.apply_v2_gates(value_candidates, enforce_rs=False)
         if not value_candidates:
             console.print("[yellow]v2 gate 後無符合條件的標的[/yellow]")
             return
         console.print(f"[dim]v2 gate: {before_gate} -> {len(value_candidates)} 檔[/dim]")
 
-        # 依「基本面分 + 相對強度」排序（預設各佔一半）
+        # ── K 棒型態偵測（盤整前 / 回檔盤整）──
+        console.print("[dim]偵測 K 棒型態，請稍候...[/dim]")
+        patterned = []
+        for c in value_candidates:
+            df = fetch_kbars(c["code"], lookback_days=80)
+            if df is None or len(df) < 20:
+                continue
+            pat = _detect_kbar_pattern(df["Close"].astype(float), df["Volume"].astype(float))
+            if pat is not None:
+                c["pattern"] = pat
+                patterned.append(c)
+        value_candidates = patterned
+        console.print(f"[dim]型態篩選後：{len(value_candidates)} 檔（盤整前 {sum(1 for c in value_candidates if c['pattern']=='盤整前')} / 回檔盤整 {sum(1 for c in value_candidates if c['pattern']=='回檔盤整')}）[/dim]")
+        if not value_candidates:
+            console.print("[yellow]無符合型態的標的[/yellow]")
+            return
+
+        # 依「基本面分 + 催化劑」排序
+        catalyst_cfg = config.get("catalyst") or {}
+        catalyst_weight = float(catalyst_cfg.get("score_weight", 0.3)) if catalyst_cfg.get("enabled") else 0.0
+
         def sort_key(c):
             fs = float(c.get("fs") or 0.0)
-            rs_score = c.get("rs_score")
-            if rs_score is None:
-                rs_term = -50.0
-            else:
-                rs_term = float(rs_score)
-            return fs * fs_weight + rs_term * rs_weight
+            catalyst_term = float(c.get("catalyst_score") or 0.0) * 10
+            return fs * (1 - catalyst_weight) + catalyst_term * catalyst_weight
         value_candidates.sort(key=sort_key, reverse=True)
 
         # ── 輸出主表 ──
-        table = Table(title="價值篩選結果（基本面 + 相對強度）", show_header=True)
+        _TREND_COLOR = {
+            "加速成長": "green", "成長": "green",
+            "持平": "dim", "不足": "dim",
+            "衰退": "yellow", "加速衰退": "red",
+        }
+
+        _TREND_SYMBOL = {
+            "加速成長": "↑↑", "成長": "↑",
+            "持平": "→", "不足": "-",
+            "衰退": "↓", "加速衰退": "↓↓",
+        }
+
+        def _fmt_revenue_row(c: dict) -> tuple:
+            """
+            趨勢符號用趨勢色，YoY% 用自己的漲跌色，兩者獨立顯示。
+            例：[red]↓↓[/red][green]+8%[/green]
+            """
+            yoy = c.get("revenue_yoy_pct")
+            trend = c.get("revenue_trend") or "不足"
+            t_color = _TREND_COLOR.get(trend, "dim")
+            sym = _TREND_SYMBOL.get(trend, "-")
+            if yoy is not None:
+                y_color = "green" if yoy >= 5 else ("yellow" if yoy >= 0 else "red")
+                yoy_str = f"[{y_color}]{yoy:+.0f}%[/{y_color}]"
+            else:
+                yoy_str = ""
+            return (f"[{t_color}]{sym}[/{t_color}]{yoy_str}",)
+
+        table = Table(title="價值篩選結果（基本面）", show_header=True)
+        table.add_column("型態", style="bold")
         table.add_column("類型", style="dim")
         table.add_column("市場", style="dim")
         table.add_column("代碼", style="cyan")
@@ -770,9 +847,14 @@ def main():
         table.add_column("EPS成長%", justify="right")
         table.add_column("營收成長%", justify="right")
         table.add_column("負債權益", justify="right")
-        table.add_column(f"近{rs_display_lb}日%", justify="right")
-        table.add_column("vs大盤", justify="right")
-        table.add_column("RS分", justify="right")
+        show_revenue = (value_scanner.config.get("revenue") or {}).get("enabled", True)
+        if show_revenue:
+            table.add_column("月收", justify="right")
+        else:
+            table.add_column("資料", justify="right")
+        if catalyst_cfg.get("enabled"):
+            table.add_column("催化劑", justify="right")
+            table.add_column("題材", style="dim")
 
         for c in value_candidates:
             typ = "科技" if c.get("type") == "tech" else "價值"
@@ -780,21 +862,13 @@ def main():
             market = "上市" if ex == "TSE" else ("上櫃" if ex == "OTC" else "-")
             industry = c.get("industry") or c.get("sector") or "-"
             industry = str(industry)[:18]
-            rs = c.get("rs_pct")
-            sr = c.get("stock_return")
-            if rs is None:
-                rs_str = "-"
-                sr_str = "-"
-            else:
-                rs_clr = "green" if rs >= 0 else "red"
-                rs_str = f"[{rs_clr}]{rs:+.1f}%[/{rs_clr}]"
-                sr_clr = "green" if (sr or 0) >= 0 else "red"
-                sr_str = f"[{sr_clr}]{sr:+.1f}%[/{sr_clr}]"
-
             fs = c.get("fs", 0)
             fs_clr = "green" if fs >= 60 else ("yellow" if fs >= 40 else "red")
 
+            pat = c.get("pattern", "-")
+            pat_str = f"[cyan]{pat}[/cyan]" if pat == "盤整前" else (f"[green]{pat}[/green]" if pat == "回檔盤整" else "-")
             table.add_row(
+                pat_str,
                 typ,
                 market,
                 c["code"],
@@ -812,23 +886,29 @@ def main():
                 f"{c.get('eps_growth_pct'):.1f}" if c.get("eps_growth_pct") is not None else "-",
                 f"{c.get('revenue_growth_pct'):.1f}" if c.get("revenue_growth_pct") is not None else "-",
                 f"{c.get('debt_to_equity'):.1f}" if c.get("debt_to_equity") is not None else "-",
-                sr_str,
-                rs_str,
-                f"{(c.get('rs_score')):+.1f}" if c.get("rs_score") is not None else "-",
+                *(list(_fmt_revenue_row(c)) if show_revenue else [
+                    "[yellow]⚠ 待確認[/yellow]" if c.get("revenue_growth_pct") is None else "[green]✓[/green]",
+                ]),
+                *([
+                    f"{c.get('catalyst_score', 0):.1f}",
+                    ",".join(c.get("catalyst_tags") or [])[:20] or "-",
+                ] if catalyst_cfg.get("enabled") else []),
             )
         console.print(table)
 
-        # ── 使用建議 ──
-        top_rs = [c for c in value_candidates if (c.get("rs_score") is not None and c.get("rs_score") > 0)]
-        console.print(
-            f"\n共 [bold]{len(value_candidates)}[/bold] 檔通過價值篩選，"
-            f"其中 [green]{len(top_rs)}[/green] 檔綜合 RS分 > 0（多週期跑贏大盤）"
-        )
-        if "偏空" in market_status:
+        if value_candidates:
             console.print(
-                "[yellow]⚠ 大盤偏空：建議優先關注相對強度 > 0 的標的，"
-                "基本面分 ≥ 60 且 RS分 > +3 為較強支撐[/yellow]"
+                "\n[bold yellow]⚠ 注意：本策略鎖定盤整啟動前標的（量縮、未創新高、近期未大漲），"
+                "訊號出現不代表立即進場時機——等量能明顯放大或突破整理區間再介入，"
+                "避免過早卡在盤整期間浪費資金效率。[/bold yellow]"
             )
+
+        console.print(f"\n共 [bold]{len(value_candidates)}[/bold] 檔通過篩選")
+        console.print(
+            "[bold yellow]⚠ 注意：本策略鎖定盤整啟動前標的（量縮、未創新高、近期未大漲），"
+            "訊號出現不代表立即進場時機——等量能明顯放大或突破整理區間再介入，"
+            "避免過早卡在盤整期間浪費資金效率。[/bold yellow]"
+        )
         console.print("[dim]最終買賣由您自行判斷，此為篩選參考清單[/dim]")
         return
 
