@@ -40,6 +40,8 @@ from tech.screener.scanner import StockScanner
 from tech.screener.standalone_scanner import StandaloneStockScanner
 from tech.strategies.engine import StrategyEngine
 from shared.standalone_feed import fetch_kbars
+from shared.news_feed import get_stock_news
+from shared.ai_analyst import analyze_news
 
 console = Console()
 _running = True
@@ -536,7 +538,10 @@ class TradingSystem:
         self.logger.info(f"共 {len(signals)} 個買入訊號")
         for s in signals:
             name = code_to_name.get(s.code, "")
-            self.logger.info(f"[買入訊號] {s.code} {name} 價格={s.price} 信心={s.confidence:.2f} 理由={s.reason}")
+            news = get_stock_news(s.code, name)
+            analysis = analyze_news(s.code, name, news)
+            ai_note = f"[AI {analysis.sentiment} {analysis.score:+.1f}] {analysis.summary}" if analysis.has_news else "[無近期新聞]"
+            self.logger.info(f"[買入訊號] {s.code} {name} 價格={s.price} 信心={s.confidence:.2f} 理由={s.reason} | {ai_note}")
         return signals
 
     def _execute_buy_signals(self, signals: list):
