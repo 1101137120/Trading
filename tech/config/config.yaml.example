@@ -98,6 +98,8 @@ strategies:
     ema_slow: 60
     vol_confirm: true
     lookback_days: 70
+    adx_period: 14         # ADX 計算週期
+    adx_min: 20            # ADX 低於此值視為橫盤，不進場（0 = 停用）
 
   # KD 黃金交叉：K 從超賣區上穿 D + RSI 回升（短線反彈）
   kd_cross:

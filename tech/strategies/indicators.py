@@ -28,6 +28,30 @@ def macd(close: pd.Series, fast: int, slow: int, signal: int):
     return macd_line, signal_line, histogram
 
 
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average Directional Index（Wilder 平滑法）"""
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    plus_dm  = (high - high.shift(1)).clip(lower=0)
+    minus_dm = (low.shift(1) - low).clip(lower=0)
+    # 若兩者相等或 +DM 較小，設為 0
+    mask = plus_dm >= minus_dm
+    plus_dm  = plus_dm.where(mask, 0)
+    minus_dm = minus_dm.where(~mask, 0)
+
+    atr      = tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    plus_di  = 100 * plus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, min_periods=period, adjust=False).mean() / atr
+
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
+    return dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
 def kd(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 9):
     """台股 KD 指標（RSV 法，1/3 平滑）"""
     low_n = low.rolling(period).min()

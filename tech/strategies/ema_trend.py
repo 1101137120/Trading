@@ -7,7 +7,7 @@ from typing import Optional
 import logging
 
 from .base import BaseStrategy, Signal
-from .indicators import ema
+from .indicators import ema, adx
 
 logger = logging.getLogger("strategy.ema_trend")
 
@@ -22,9 +22,11 @@ class EmaTrendStrategy(BaseStrategy):
         self.ema_slow = cfg.get("ema_slow", 60)
         self.vol_confirm = cfg.get("vol_confirm", True)
         self.lookback = cfg.get("lookback_days", 70)
+        self.adx_period = cfg.get("adx_period", 14)
+        self.adx_min    = cfg.get("adx_min", 20)    # < 20 視為橫盤，不進場
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
-        min_rows = self.ema_slow + 5
+        min_rows = self.ema_slow + self.adx_period + 5
         if not self._validate_df(df, min_rows):
             return None
 
@@ -44,6 +46,12 @@ class EmaTrendStrategy(BaseStrategy):
         bullish_prev = ef_prev > em_prev > es_prev
         if not (bullish_now and bullish_prev):
             return None
+
+        # ADX 過濾：橫盤市場不進場
+        if self.adx_min > 0 and "High" in df.columns and "Low" in df.columns:
+            adx_val = adx(df["High"].astype(float), df["Low"].astype(float), close, self.adx_period).iloc[-1]
+            if pd.isna(adx_val) or adx_val < self.adx_min:
+                return None
 
         # 量能不得嚴重萎縮
         if self.vol_confirm:
