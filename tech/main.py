@@ -531,8 +531,12 @@ class TradingSystem:
             sig = self.engine.evaluate(code, df)
             if sig and sig.action == "Buy":
                 signals.append(sig)
+        code_to_name = {c["code"]: c.get("name", "") for c in candidates}
         signals.sort(key=lambda s: s.confidence, reverse=True)
         self.logger.info(f"共 {len(signals)} 個買入訊號")
+        for s in signals:
+            name = code_to_name.get(s.code, "")
+            self.logger.info(f"[買入訊號] {s.code} {name} 價格={s.price} 信心={s.confidence:.2f} 理由={s.reason}")
         return signals
 
     def _execute_buy_signals(self, signals: list):
