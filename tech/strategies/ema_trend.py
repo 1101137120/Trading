@@ -39,12 +39,16 @@ class EmaTrendStrategy(BaseStrategy):
 
         price = close.iloc[-1]
         ef_now, em_now, es_now = ef.iloc[-1], em.iloc[-1], es.iloc[-1]
-        ef_prev, em_prev, es_prev = ef.iloc[-2], em.iloc[-2], es.iloc[-2]
-
-        # 多頭排列（今天 + 前一根都成立，確認趨勢穩定）
-        bullish_now = ef_now > em_now > es_now and price > em_now
-        bullish_prev = ef_prev > em_prev > es_prev
-        if not (bullish_now and bullish_prev):
+        # 多頭排列（連續 5 根都成立，過濾假突破）
+        confirm_bars = 5
+        if len(ef) < confirm_bars:
+            return None
+        for k in range(confirm_bars):
+            if not (ef.iloc[-(k+1)] > em.iloc[-(k+1)] > es.iloc[-(k+1)]):
+                return None
+        # 最新一根：價格需站上 EMA20
+        bullish_now = price > em_now
+        if not bullish_now:
             return None
 
         # ADX 計算（同時用於過濾與信心評分）
