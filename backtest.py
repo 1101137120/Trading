@@ -11,6 +11,7 @@
 """
 import sys
 import time
+import bisect
 import argparse
 import logging
 import random
@@ -190,6 +191,13 @@ def simulate_trades(
     loss_cooldown_days: int = 0,
     dynamic_pool: dict = None,
     max_hold_days: int = 0,
+    trail_stop_pct: float = 0.0,
+    trail_activation_pct: float = 0.08,
+    trail_stop_bull_pct: float = 0.0,
+    trail_stop_rs_bonus: float = 0.0,
+    min_rs_entry: float = 0.0,
+    time_stop_days: int = 0,
+    time_stop_min_pct: float = 0.05,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -198,6 +206,9 @@ def simulate_trades(
     - market_df：0050 日 K，有傳時只在大盤 > MA20 時開倉
     - loss_cooldown_days：停損後冷卻天數內不再進場
     - dynamic_pool：{date: set(code)}，有傳時只在該股票當日在池內才進場
+    - trail_stop_pct > 0：啟用追蹤停利，停利從最高點回落此比例出場；
+      固定停利停用，讓贏家持續跑；初始停損仍有效（保護剛進場的部位）
+    - trail_activation_pct：漲幅達此值後追蹤停利才啟動（避免剛進場就被微幅回落觸發）
     回傳每筆交易的明細。
     """
     trades = []
@@ -206,12 +217,21 @@ def simulate_trades(
 
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
+    market_bull: dict[date, bool] = {}   # True = 0050 MA20 > MA60（持續上行）
+    _mkt_dates: list = []   # 排序後的大盤日期（用於 RS 計算）
+    _mkt_closes: list = []  # 對應大盤收盤價
     if market_df is not None and len(market_df) >= market_ma_period:
         market_df = market_df.copy()
         market_df["ma"] = market_df["Close"].rolling(market_ma_period).mean()
-        for _, row in market_df.iterrows():
+        market_df["ma60"] = market_df["Close"].rolling(60).mean()
+        for _, row in market_df.sort_values("ts").iterrows():
             d = row["ts"].date() if hasattr(row["ts"], "date") else row["ts"]
             market_allow[d] = (row["Close"] > row["ma"]) if pd.notna(row["ma"]) else True
+            # MA20 > MA60 = 中期多頭確立，允許更寬的追蹤停利
+            ma20_ok = pd.notna(row["ma"]) and pd.notna(row["ma60"])
+            market_bull[d] = bool(row["ma"] > row["ma60"]) if ma20_ok else False
+            _mkt_dates.append(d)
+            _mkt_closes.append(float(row["Close"]))
 
     for i in range(len(df)):
         row_date = df["ts"].iloc[i].date()
@@ -225,20 +245,46 @@ def simulate_trades(
         if current_price <= 0:
             continue
 
-        # ── 持倉中：檢查停損 / 停利 ──
+        # ── 持倉中：更新最高價 → 檢查停損 / 追蹤停利 / 固定停利 ──
         if position:
+            # 更新最高價（追蹤停利用）
+            if current_price > position["peak_price"]:
+                position["peak_price"] = current_price
+
             pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
+            hold = (row_date - position["entry_date"]).days
             exit_reason = None
 
-            hold = (row_date - position["entry_date"]).days
             if current_price <= position["stop"]:
                 exit_reason = "停損"
+            elif trail_stop_pct > 0:
+                # 追蹤停利模式：漲幅達 trail_activation_pct 後才啟動
+                if pnl_pct >= trail_activation_pct:
+                    # 動態調寬：0050 MA20>MA60（持續上行）→ 用 bull trail
+                    is_bull = market_bull.get(row_date, False)
+                    eff_trail = (trail_stop_bull_pct
+                                 if (is_bull and trail_stop_bull_pct > 0)
+                                 else trail_stop_pct)
+                    # 強勢個股加成：RS > 0.1 再多給一點空間
+                    rs = position.get("rs_score", 0.0)
+                    if trail_stop_rs_bonus > 0 and rs > 0.1:
+                        eff_trail += trail_stop_rs_bonus
+                    trail_floor = position["peak_price"] * (1 - eff_trail)
+                    if current_price <= trail_floor:
+                        exit_reason = "追蹤停利"
             elif current_price >= position["target"]:
+                # 固定停利（僅在未使用追蹤停利時有效）
                 exit_reason = "停利"
-            elif max_hold_days > 0 and hold >= max_hold_days:
-                exit_reason = "到期出場"
-            elif row_date == end or i == len(df) - 1:
-                exit_reason = "回測結束"
+
+            if exit_reason is None:
+                if max_hold_days > 0 and hold >= max_hold_days:
+                    exit_reason = "到期出場"
+                elif (time_stop_days > 0 and hold >= time_stop_days
+                      and pnl_pct < time_stop_min_pct):
+                    # 持倉超過 N 天但漲幅未達門檻 → 佔位不賺，強制出場
+                    exit_reason = "時間停損"
+                elif row_date == end or i == len(df) - 1:
+                    exit_reason = "回測結束"
 
             if exit_reason:
                 trades.append({
@@ -251,6 +297,8 @@ def simulate_trades(
                     "hold_days": (row_date - position["entry_date"]).days,
                     "result": exit_reason,
                     "strategy": position["strategy"],
+                    "confidence": position.get("confidence", 0.30),
+                    "rs_score": position.get("rs_score", 0.0),
                 })
                 if exit_reason == "停損" and loss_cooldown_days > 0:
                     from datetime import timedelta
@@ -276,12 +324,38 @@ def simulate_trades(
         if sig and sig.action == "Buy":
             stop = current_price * (1 - stop_loss_pct)
             target = current_price * (1 + take_profit_pct)
+
+            # 計算相對強弱（RS）：個股近 20 交易日報酬 − 大盤近 20 交易日報酬
+            rs_score = 0.0
+            lookback = min(20, i)
+            if lookback >= 5 and df["Close"].iloc[i - lookback] > 0:
+                stock_ret = (current_price - df["Close"].iloc[i - lookback]) / df["Close"].iloc[i - lookback]
+                if _mkt_dates:
+                    pos = bisect.bisect_right(_mkt_dates, row_date) - 1
+                    past_pos = pos - lookback
+                    if pos >= 0 and past_pos >= 0:
+                        mc_now  = _mkt_closes[pos]
+                        mc_past = _mkt_closes[past_pos]
+                        mkt_ret = (mc_now - mc_past) / mc_past if mc_past > 0 else 0
+                        rs_score = stock_ret - mkt_ret
+                    else:
+                        rs_score = stock_ret
+                else:
+                    rs_score = stock_ret
+
+            # RS 過濾：個股近期跑輸大盤超過門檻則不進場
+            if min_rs_entry > 0 and rs_score < min_rs_entry:
+                continue
+
             position = {
                 "entry_date": row_date,
                 "entry_price": current_price,
+                "peak_price": current_price,
                 "stop": stop,
                 "target": target,
                 "strategy": sig.strategy,
+                "confidence": sig.confidence,
+                "rs_score": rs_score,
             }
 
     return trades
@@ -308,15 +382,17 @@ def portfolio_simulation(
     - 同時持倉不超過 max_positions
     - 1 張 = 1000 股
     """
-    trades_sorted = sorted(all_trades, key=lambda x: (x["entry_date"], x["code"]))
+    # 同日多筆訊號：RS 高（近期跑贏大盤）的優先進場
+    trades_sorted = sorted(all_trades, key=lambda x: (x["entry_date"], -x.get("rs_score", 0)))
 
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
-    active: list[dict] = []   # {exit_date, exit_cash}
+    active: list[dict] = []   # {exit_date, exit_cash, cost}
     taken: list[dict] = []
     total_fees = 0.0
     total_taxes = 0.0
+    total_open_cost = 0.0   # 所有持倉的買入成本合計
 
     for trade in trades_sorted:
         entry_date = trade["entry_date"]
@@ -326,12 +402,16 @@ def portfolio_simulation(
         for pos in active:
             if pos["exit_date"] <= entry_date:
                 capital += pos["exit_cash"]
-                peak_capital = max(peak_capital, capital)
-                dd = (peak_capital - capital) / peak_capital * 100
-                max_drawdown = max(max_drawdown, dd)
+                total_open_cost -= pos["cost"]
             else:
                 still_active.append(pos)
         active = still_active
+
+        # 組合總值 = 現金 + 持倉成本（開倉不改變總值，平倉損益才改變）
+        portfolio_value = capital + total_open_cost
+        peak_capital = max(peak_capital, portfolio_value)
+        dd = (peak_capital - portfolio_value) / peak_capital * 100 if peak_capital > 0 else 0
+        max_drawdown = max(max_drawdown, dd)
 
         if len(active) >= max_positions:
             continue
@@ -363,6 +443,7 @@ def portfolio_simulation(
         net_pnl_dollars = gross_pnl_dollars - fee_buy - fee_sell - tax
 
         capital -= (cost + fee_buy)
+        total_open_cost += cost          # 開倉：持倉成本增加
         total_fees += fee_buy + fee_sell
         total_taxes += tax
 
@@ -381,13 +462,16 @@ def portfolio_simulation(
         active.append({
             "exit_date": trade["exit_date"],
             "exit_cash": cost + gross_pnl_dollars - fee_sell - tax,
+            "cost": cost,
         })
 
     # 回測結束，釋放剩餘持倉
     for pos in active:
         capital += pos["exit_cash"]
-    peak_capital = max(peak_capital, capital)
-    final_dd = (peak_capital - capital) / peak_capital * 100
+        total_open_cost -= pos["cost"]
+    portfolio_value = capital + total_open_cost
+    peak_capital = max(peak_capital, portfolio_value)
+    final_dd = (peak_capital - portfolio_value) / peak_capital * 100 if peak_capital > 0 else 0
     max_drawdown = max(max_drawdown, final_dd)
 
     total_return_pct = (capital - initial_capital) / initial_capital * 100
@@ -480,6 +564,23 @@ def main():
                         help="停用動態股票池（用今日快照固定選股）")
     parser.add_argument("--universe-mult", type=int, default=3,
                         help="動態池 universe 倍數：實際下載 stocks×N 檔再每日排名，預設 3")
+    parser.add_argument("--trail-stop", type=float, default=0.0,
+                        help="追蹤停利：從最高點回落此比例出場（0=停用，建議 0.10~0.20）。"
+                             "啟用後固定停利停用，讓贏家持續跑。")
+    parser.add_argument("--trail-activation", type=float, default=0.08,
+                        help="追蹤停利啟動門檻：漲幅達此值後才開始追蹤（預設 0.08 = 8%%）")
+    parser.add_argument("--trail-stop-bull", type=float, default=0.0,
+                        help="牛市追蹤停利：0050 MA20>MA60 時改用此值（建議比 trail-stop 寬，如 0.20）"
+                             "；0 = 不區分市場狀態")
+    parser.add_argument("--trail-stop-rs-bonus", type=float, default=0.0,
+                        help="強勢個股追蹤加成：RS>0.1 的股票額外放寬此比例（建議 0.03~0.05）")
+    parser.add_argument("--min-rs", type=float, default=0.0,
+                        help="進場 RS 門檻：個股近 20 日跑贏大盤至少此值才進場（建議 0.03~0.08）"
+                             "；0=停用。用於過濾跑輸大盤的弱勢股。")
+    parser.add_argument("--time-stop-days", type=int, default=0,
+                        help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
+    parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
+                        help="時間停損最低漲幅門檻（預設 0.05 = 5%%），搭配 --time-stop-days 使用")
     parser.add_argument("--fee-rate", type=float, default=0.001425,
                         help="手續費率（單邊），預設 0.001425")
     parser.add_argument("--min-fee", type=float, default=20.0,
@@ -507,8 +608,21 @@ def main():
     active = cfg["strategies"].get("active", [])
 
     console.rule(f"[bold]策略回測 {args.start} → {args.end}[/bold]")
+    trail_stop = args.trail_stop
+    trail_activation = args.trail_activation
+    trail_stop_bull = args.trail_stop_bull
+    trail_stop_rs_bonus = args.trail_stop_rs_bonus
+    if trail_stop > 0:
+        bull_note = (f"  牛市: [green]{trail_stop_bull*100:.0f}%[/green]"
+                     if trail_stop_bull > 0 else "")
+        rs_note = (f"  強勢加成: +[green]{trail_stop_rs_bonus*100:.0f}%[/green]"
+                   if trail_stop_rs_bonus > 0 else "")
+        exit_mode = (f"追蹤停利: 啟動 [green]+{trail_activation*100:.0f}%[/green] "
+                     f"回落 [red]{trail_stop*100:.0f}%[/red]{bull_note}{rs_note}  固定停利: 停用")
+    else:
+        exit_mode = f"停利: [green]{tp*100:.1f}%[/green]"
     console.print(f"策略: [cyan]{', '.join(active)}[/cyan]  |  "
-                  f"停損: [red]{sl*100:.1f}%[/red]  停利: [green]{tp*100:.1f}%[/green]  |  "
+                  f"停損: [red]{sl*100:.1f}%[/red]  {exit_mode}  |  "
                   f"初始資金: [bold]{args.capital:,.0f}[/bold]  每筆: {args.position_pct*100:.0f}%  最多持倉: {max_pos}")
 
     engine = StrategyEngine(cfg)
@@ -617,6 +731,13 @@ def main():
                 loss_cooldown_days=loss_cooldown,
                 dynamic_pool=dynamic_pool,
                 max_hold_days=args.max_hold_days,
+                trail_stop_pct=trail_stop,
+                trail_activation_pct=trail_activation,
+                trail_stop_bull_pct=trail_stop_bull,
+                trail_stop_rs_bonus=trail_stop_rs_bonus,
+                min_rs_entry=args.min_rs,
+                time_stop_days=args.time_stop_days,
+                time_stop_min_pct=args.time_stop_min_pct,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -639,82 +760,7 @@ def main():
 
     s = summarize(all_trades)
 
-    # 整體摘要
-    summary_table = Table(title="回測整體摘要", show_header=False, box=None)
-    summary_table.add_column("項目", style="dim")
-    summary_table.add_column("數值", justify="right")
-    summary_table.add_row("回測區間",     f"{args.start} → {args.end}")
-    summary_table.add_row("總交易筆數",   str(s["total_trades"]))
-    summary_table.add_row("勝率",         f"[{'green' if s['win_rate']>=50 else 'red'}]{s['win_rate']}%[/]")
-    ev = s["total_return_pct"] / s["total_trades"] if s["total_trades"] else 0
-    ev_clr = "green" if ev >= 0 else "red"
-    summary_table.add_row("每筆期望值",
-        f"[{ev_clr}]{ev:+.2f}%[/{ev_clr}] [dim](各筆 pnl_pct 平均，不等於資金報酬)[/dim]")
-    summary_table.add_row("平均獲利",     f"[green]+{s['avg_win_pct']:.2f}%[/green]")
-    summary_table.add_row("平均虧損",     f"[red]{s['avg_loss_pct']:.2f}%[/red]")
-    summary_table.add_row("平均持有天數", f"{s['avg_hold_days']} 天")
-    console.print(summary_table)
-
-    # 各策略明細
-    console.print("\n[bold]各策略統計[/bold]")
-    st = s["by_strategy"].reset_index()
-    strat_table = Table(show_header=True)
-    strat_table.add_column("策略", style="cyan")
-    strat_table.add_column("筆數", justify="right")
-    strat_table.add_column("合計報酬", justify="right")
-    strat_table.add_column("平均報酬", justify="right")
-    for _, row in st.iterrows():
-        clr = "green" if row["sum"] >= 0 else "red"
-        strat_table.add_row(
-            str(row["strategy"]),
-            str(int(row["count"])),
-            f"[{clr}]{row['sum']:+.2f}%[/{clr}]",
-            f"[{clr}]{row['mean']:+.2f}%[/{clr}]",
-        )
-    console.print(strat_table)
-
-    # 最佳 / 最差 10 筆
-    trades_df = s["trades"].sort_values("pnl_pct", ascending=False)
-
-    def _trade_table(title: str, rows: pd.DataFrame):
-        t = Table(title=title, show_header=True)
-        t.add_column("代碼", style="cyan")
-        t.add_column("名稱")
-        t.add_column("進場", style="dim")
-        t.add_column("出場", style="dim")
-        t.add_column("進場價", justify="right")
-        t.add_column("出場價", justify="right")
-        t.add_column("損益%", justify="right")
-        t.add_column("持有", justify="right")
-        t.add_column("原因", style="dim")
-        t.add_column("策略", style="dim")
-        for _, r in rows.iterrows():
-            clr = "green" if r["pnl_pct"] > 0 else "red"
-            t.add_row(
-                str(r["code"]),
-                str(r.get("name", "")),
-                str(r["entry_date"]),
-                str(r["exit_date"]),
-                f"{r['entry_price']:.2f}",
-                f"{r['exit_price']:.2f}",
-                f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
-                f"{r['hold_days']}天",
-                str(r["result"]),
-                str(r["strategy"]),
-            )
-        return t
-
-    console.print()
-    console.print(_trade_table("最佳 10 筆", trades_df.head(10)))
-    console.print()
-    console.print(_trade_table("最差 10 筆", trades_df.tail(10).iloc[::-1]))
-
-    # 出場原因統計
-    reason_counts = s["trades"]["result"].value_counts()
-    console.print(f"\n出場原因: " +
-        " | ".join(f"{k}: {v}筆" for k, v in reason_counts.items()))
-
-    # ── 資金模擬（先跑，把真實報酬提前顯示）──
+    # ── 資金模擬 ──
     psim = portfolio_simulation(
         all_trades,
         args.capital,
@@ -726,101 +772,210 @@ def main():
         tax_etf_rate=args.tax_etf_rate,
     )
 
+    taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
+    holding_df  = taken_df[taken_df["result"] == "回測結束"].copy() if not taken_df.empty else pd.DataFrame()
+    realized_df = taken_df[taken_df["result"] != "回測結束"].copy() if not taken_df.empty else pd.DataFrame()
+
+    realized_wins  = realized_df[realized_df["pnl_pct"] > 0] if not realized_df.empty else pd.DataFrame()
+    realized_total = realized_df["net_pnl_dollars"].sum() if not realized_df.empty else 0
+    holding_total  = holding_df["net_pnl_dollars"].sum()  if not holding_df.empty  else 0
+    win_rate_r = (len(realized_wins) / len(realized_df) * 100) if len(realized_df) > 0 else 0
+
+    # ── 0050 基準 ──
+    bench = None
+    if market_df is not None:
+        bench = calc_benchmark(market_df, start, end, args.capital, args.fee_rate, args.min_fee)
+
+    # ════════════════════════════════════════
+    # 1. 績效總覽
+    # ════════════════════════════════════════
     cap_clr = "green" if psim["total_return_pct"] >= 0 else "red"
-    console.rule(f"\n[bold]資金模擬結果（初始 {args.capital:,.0f} 元）[/bold]")
-    cap_table = Table(show_header=False, box=None)
-    cap_table.add_column("項目", style="dim")
-    cap_table.add_column("數值", justify="right")
-    cap_table.add_row("初始資金",   f"{psim['initial_capital']:>12,.0f} 元")
-    cap_table.add_row("最終資金",   f"[{cap_clr}]{psim['final_capital']:>12,.0f} 元[/{cap_clr}]")
-    cap_table.add_row("[bold]實際報酬[/bold]", f"[bold {cap_clr}]{psim['total_return_pct']:+.2f}%[/bold {cap_clr}]  ← 這才是真實資金報酬")
-    cap_table.add_row("最大回撤",   f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]")
-    cap_table.add_row("總手續費+稅", f"{psim['total_fee_tax']:>12,.0f} 元")
-    cap_table.add_row("實際執行筆數", f"{len(psim['taken_trades'])} 筆（跳過 {psim['skipped']} 筆）")
-    console.print(cap_table)
+    console.rule("[bold]績效總覽[/bold]")
+    ov = Table(show_header=False, box=None, padding=(0, 2))
+    ov.add_column("項目", style="dim", min_width=16)
+    ov.add_column("數值", justify="right")
+    ov.add_row("回測區間",      f"{args.start}  →  {args.end}")
+    ov.add_row("初始資金",      f"{psim['initial_capital']:>14,.0f} 元")
+    ov.add_row("最終資金",      f"[{cap_clr}]{psim['final_capital']:>14,.0f} 元[/{cap_clr}]")
+    ov.add_row("[bold]實際報酬[/bold]",
+               f"[bold {cap_clr}]{psim['total_return_pct']:+.2f}%[/bold {cap_clr}]")
+    ov.add_row("最大回撤",      f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]")
+    ov.add_row("已實現損益",
+               f"[{'green' if realized_total>=0 else 'red'}]{realized_total:+,.0f} 元[/]"
+               f"  [dim]({len(realized_df)} 筆已出場)[/dim]")
+    ov.add_row("持倉中（未實現）",
+               f"[{'green' if holding_total>=0 else 'red'}]{holding_total:+,.0f} 元[/]"
+               f"  [dim]({len(holding_df)} 筆)[/dim]")
+    ov.add_row("總手續費+稅",   f"{psim['total_fee_tax']:>14,.0f} 元")
+    ov.add_row("執行/跳過",
+               f"{len(taken_df)} 筆執行  [dim]{psim['skipped']} 筆跳過[/dim]")
+    console.print(ov)
 
-    if psim["taken_trades"]:
-        taken_df = pd.DataFrame(psim["taken_trades"]).sort_values("net_pnl_dollars", ascending=False)
+    # ════════════════════════════════════════
+    # 2. vs 0050 對比
+    # ════════════════════════════════════════
+    console.rule("[bold]vs 0050 買進持有[/bold]")
+    if bench:
+        alpha     = psim["total_return_pct"] - bench["total_return_pct"]
+        alpha_clr = "green" if alpha >= 0 else "red"
+        strat_clr = "green" if psim["total_return_pct"] >= 0 else "red"
+        bench_clr = "green" if bench["total_return_pct"] >= 0 else "red"
+        cmp = Table(show_header=True, box=None, padding=(0, 3))
+        cmp.add_column("項目",                 style="dim")
+        cmp.add_column("策略",                 justify="right")
+        cmp.add_column("0050 買進持有",        justify="right")
+        cmp.add_column("Alpha（策略−0050）",   justify="right")
+        cmp.add_row("報酬率",
+            f"[{strat_clr}]{psim['total_return_pct']:+.2f}%[/{strat_clr}]",
+            f"[{bench_clr}]{bench['total_return_pct']:+.2f}%[/{bench_clr}]",
+            f"[bold {alpha_clr}]{alpha:+.2f}%[/bold {alpha_clr}]")
+        cmp.add_row("最大回撤",
+            f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]",
+            f"[red]-{bench['max_drawdown_pct']:.2f}%[/red]", "—")
+        console.print(cmp)
+        console.print(
+            f"[dim]0050：{bench['buy_date']} 買 {bench['buy_price']:.2f} → "
+            f"{bench['sell_date']} {bench['sell_price']:.2f}，{bench['lots']} 張[/dim]")
+    else:
+        console.print("[dim]（未載入 0050 K 棒，無法比較）[/dim]")
 
-        def _money_table(title: str, rows: pd.DataFrame):
-            t = Table(title=title, show_header=True)
-            t.add_column("代碼", style="cyan")
+    # ════════════════════════════════════════
+    # 3. 交易統計
+    # ════════════════════════════════════════
+    console.rule("[bold]交易統計[/bold]")
+    reason_counts = s["trades"]["result"].value_counts()
+    ev = s["total_return_pct"] / s["total_trades"] if s["total_trades"] else 0
+    ev_clr = "green" if ev >= 0 else "red"
+    ts = Table(show_header=False, box=None, padding=(0, 2))
+    ts.add_column("項目", style="dim", min_width=16)
+    ts.add_column("數值", justify="right")
+    ts.add_row("總訊號筆數",   f"{s['total_trades']} 筆")
+    ts.add_row("已出場勝率",
+               f"[{'green' if win_rate_r>=50 else 'red'}]{win_rate_r:.1f}%[/]"
+               f"  [dim]({len(realized_wins)}/{len(realized_df)} 筆)[/dim]")
+    ts.add_row("每筆期望值",   f"[{ev_clr}]{ev:+.2f}%[/{ev_clr}]  [dim](等權平均)[/dim]")
+    ts.add_row("平均獲利",     f"[green]+{s['avg_win_pct']:.2f}%[/green]")
+    ts.add_row("平均虧損",     f"[red]{s['avg_loss_pct']:.2f}%[/red]")
+    ts.add_row("平均持有天數", f"{s['avg_hold_days']} 天")
+    ts.add_row("出場原因",
+               "  ".join(f"{k}:{v}筆" for k, v in reason_counts.items()))
+    console.print(ts)
+
+    # ════════════════════════════════════════
+    # 4. 各策略統計
+    # ════════════════════════════════════════
+    console.rule("[bold]各策略統計[/bold]")
+    trades_full = s["trades"]
+    by_strat = trades_full.groupby("strategy").apply(
+        lambda g: pd.Series({
+            "筆數":   len(g),
+            "勝率":   f"{len(g[g['pnl_pct']>0])/len(g)*100:.1f}%",
+            "合計%":  f"{g['pnl_pct'].sum():+.2f}%",
+            "平均%":  f"{g['pnl_pct'].mean():+.2f}%",
+            "avg_win":  g.loc[g['pnl_pct']>0, 'pnl_pct'].mean() if len(g[g['pnl_pct']>0]) else 0,
+            "avg_loss": g.loc[g['pnl_pct']<=0,'pnl_pct'].mean() if len(g[g['pnl_pct']<=0]) else 0,
+            "avg_hold": f"{g['hold_days'].mean():.1f}天",
+        }), include_groups=False
+    ).reset_index()
+    st_tbl = Table(show_header=True, box=None, padding=(0, 2))
+    st_tbl.add_column("策略",   style="cyan")
+    st_tbl.add_column("筆數",   justify="right")
+    st_tbl.add_column("勝率",   justify="right")
+    st_tbl.add_column("合計報酬", justify="right")
+    st_tbl.add_column("平均報酬", justify="right")
+    st_tbl.add_column("平均獲利", justify="right")
+    st_tbl.add_column("平均虧損", justify="right")
+    st_tbl.add_column("平均持有", justify="right")
+    for _, r in by_strat.iterrows():
+        clr = "green" if "+" in str(r["合計%"]) else "red"
+        st_tbl.add_row(
+            str(r["strategy"]), str(int(r["筆數"])), str(r["勝率"]),
+            f"[{clr}]{r['合計%']}[/{clr}]", f"[{clr}]{r['平均%']}[/{clr}]",
+            f"[green]+{r['avg_win']:.2f}%[/green]",
+            f"[red]{r['avg_loss']:.2f}%[/red]",
+            str(r["avg_hold"]),
+        )
+    console.print(st_tbl)
+
+    # ════════════════════════════════════════
+    # 5. 持倉中（未實現）
+    # ════════════════════════════════════════
+    if not holding_df.empty:
+        console.rule(f"[bold]持倉中（{len(holding_df)} 筆，回測截止仍在場）[/bold]")
+        h_tbl = Table(show_header=True, box=None, padding=(0, 1))
+        h_tbl.add_column("代碼",    style="cyan")
+        h_tbl.add_column("名稱")
+        h_tbl.add_column("買入日",  style="dim")
+        h_tbl.add_column("持有天",  justify="right")
+        h_tbl.add_column("張數",    justify="right")
+        h_tbl.add_column("買入價",  justify="right")
+        h_tbl.add_column("現價",    justify="right")
+        h_tbl.add_column("損益%",   justify="right")
+        h_tbl.add_column("損益元",  justify="right")
+        h_tbl.add_column("策略",    style="dim")
+        for _, r in holding_df.sort_values("pnl_pct", ascending=False).iterrows():
+            clr = "green" if r["pnl_pct"] > 0 else "red"
+            h_tbl.add_row(
+                str(r["code"]), str(r.get("name", "")),
+                str(r["entry_date"]), f"{r['hold_days']}天",
+                str(int(r["lots"])),
+                f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
+                f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
+                f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
+                str(r["strategy"]),
+            )
+        console.print(h_tbl)
+
+    # ════════════════════════════════════════
+    # 6. 已實現明細（最佳/最差各 10 筆）
+    # ════════════════════════════════════════
+    if not realized_df.empty:
+        console.rule("[bold]已實現損益明細[/bold]")
+        r_sorted = realized_df.sort_values("net_pnl_dollars", ascending=False)
+
+        def _realized_table(title: str, rows: pd.DataFrame) -> Table:
+            t = Table(title=title, show_header=True, box=None, padding=(0, 1))
+            t.add_column("代碼",    style="cyan")
             t.add_column("名稱")
-            t.add_column("進場", style="dim")
-            t.add_column("出場", style="dim")
-            t.add_column("進場價", justify="right")
-            t.add_column("出場價", justify="right")
-            t.add_column("張數", justify="right")
-            t.add_column("成本(元)", justify="right")
-            t.add_column("費稅(元)", justify="right")
-            t.add_column("毛損益(元)", justify="right")
-            t.add_column("淨損益(元)", justify="right")
-            t.add_column("損益%", justify="right")
-            t.add_column("策略", style="dim")
+            t.add_column("買入日",  style="dim")
+            t.add_column("賣出日",  style="dim")
+            t.add_column("持有",    justify="right")
+            t.add_column("張數",    justify="right")
+            t.add_column("買入價",  justify="right")
+            t.add_column("賣出價",  justify="right")
+            t.add_column("損益%",   justify="right")
+            t.add_column("淨損益",  justify="right")
+            t.add_column("原因",    style="dim")
+            t.add_column("策略",    style="dim")
             for _, r in rows.iterrows():
                 clr = "green" if r["net_pnl_dollars"] > 0 else "red"
                 t.add_row(
-                    str(r["code"]),
-                    str(r.get("name", "")),
-                    str(r["entry_date"]),
-                    str(r["exit_date"]),
-                    f"{r['entry_price']:.2f}",
-                    f"{r['exit_price']:.2f}",
-                    str(int(r["lots"])),
-                    f"{r['cost']:,.0f}",
-                    f"{r.get('fee_tax_total', 0):,.0f}",
-                    f"{r.get('gross_pnl_dollars', 0):+,.0f}",
-                    f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
+                    str(r["code"]), str(r.get("name", "")),
+                    str(r["entry_date"]), str(r["exit_date"]),
+                    f"{r['hold_days']}天", str(int(r["lots"])),
+                    f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
                     f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
-                    str(r["strategy"]),
+                    f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
+                    str(r["result"]), str(r["strategy"]),
                 )
             return t
 
+        console.print(_realized_table("▲ 最佳 10 筆", r_sorted.head(10)))
         console.print()
-        console.print(_money_table("最佳 10 筆（損益金額）", taken_df.head(10)))
-        console.print()
-        console.print(_money_table("最差 10 筆（損益金額）", taken_df.tail(10).iloc[::-1]))
+        console.print(_realized_table("▼ 最差 10 筆", r_sorted.tail(10).iloc[::-1]))
 
-    # 存 CSV（含張數與損益金額）
+    # ════════════════════════════════════════
+    # 7. 存 CSV（持倉中 + 已實現 全部）
+    # ════════════════════════════════════════
     out_path = Path("backtest_result.csv")
-    if psim["taken_trades"]:
-        pd.DataFrame(psim["taken_trades"]).to_csv(out_path, index=False, encoding="utf-8-sig")
+    if not taken_df.empty:
+        csv_df = taken_df.copy()
+        csv_df.insert(0, "status", csv_df["result"].apply(
+            lambda x: "持倉中" if x == "回測結束" else "已實現"))
+        csv_df.to_csv(out_path, index=False, encoding="utf-8-sig")
     else:
         s["trades"].to_csv(out_path, index=False, encoding="utf-8-sig")
-    console.print(f"\n[dim]詳細明細（含張數/損益元）已存至 {out_path}[/dim]")
-
-    # ── 0050 買進持有基準比較 ──
-    if market_df is not None:
-        bench = calc_benchmark(market_df, start, end, args.capital, args.fee_rate, args.min_fee)
-        if bench:
-            alpha     = psim["total_return_pct"] - bench["total_return_pct"]
-            alpha_clr = "green" if alpha >= 0 else "red"
-            strat_clr = "green" if psim["total_return_pct"] >= 0 else "red"
-            bench_clr = "green" if bench["total_return_pct"] >= 0 else "red"
-
-            console.rule("\n[bold]vs 0050 買進持有 基準比較[/bold]")
-            cmp = Table(show_header=True)
-            cmp.add_column("項目",                style="dim")
-            cmp.add_column("策略",                justify="right")
-            cmp.add_column("0050 買進持有",       justify="right")
-            cmp.add_column("Alpha（策略 − 0050）", justify="right")
-            cmp.add_row(
-                "報酬率",
-                f"[{strat_clr}]{psim['total_return_pct']:+.2f}%[/{strat_clr}]",
-                f"[{bench_clr}]{bench['total_return_pct']:+.2f}%[/{bench_clr}]",
-                f"[bold {alpha_clr}]{alpha:+.2f}%[/bold {alpha_clr}]",
-            )
-            cmp.add_row(
-                "最大回撤",
-                f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]",
-                f"[red]-{bench['max_drawdown_pct']:.2f}%[/red]",
-                "—",
-            )
-            console.print(cmp)
-            console.print(
-                f"[dim]0050：{bench['buy_date']} 買入 {bench['buy_price']:.2f} → "
-                f"{bench['sell_date']} {bench['sell_price']:.2f}，{bench['lots']} 張[/dim]"
-            )
+    console.print(f"\n[dim]完整明細（持倉中 + 已實現）已存至 {out_path}[/dim]")
 
 
 if __name__ == "__main__":

@@ -47,25 +47,29 @@ class EmaTrendStrategy(BaseStrategy):
         if not (bullish_now and bullish_prev):
             return None
 
-        # ADX 過濾：橫盤市場不進場
-        if self.adx_min > 0 and "High" in df.columns and "Low" in df.columns:
+        # ADX 計算（同時用於過濾與信心評分）
+        adx_val = None
+        if "High" in df.columns and "Low" in df.columns:
             adx_val = adx(df["High"].astype(float), df["Low"].astype(float), close, self.adx_period).iloc[-1]
-            if pd.isna(adx_val) or adx_val < self.adx_min:
+            if self.adx_min > 0 and (pd.isna(adx_val) or adx_val < self.adx_min):
                 return None
 
         # 量能不得嚴重萎縮
-        if self.vol_confirm:
-            avg_vol = volume.iloc[-6:-1].mean()
-            if avg_vol > 0 and volume.iloc[-1] < avg_vol * 0.7:
-                return None
+        avg_vol = volume.iloc[-6:-1].mean()
+        vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
+        if self.vol_confirm and vol_ratio < 0.7:
+            return None
 
-        # 信心：均線差距越大趨勢越強
+        # 信心評分：EMA 差距（0–0.5）+ ADX 強度（0–0.35）+ 量能超量（0–0.15）
         spread = (ef_now - es_now) / es_now if es_now > 0 else 0
-        confidence = min(spread * 15, 1.0)
+        spread_score = min(spread * 10, 0.50)
+        adx_score = min(adx_val / 100, 0.35) if adx_val is not None and not pd.isna(adx_val) else 0.15
+        vol_score = min(max(vol_ratio - 1.0, 0) * 0.15, 0.15)
+        confidence = round(min(spread_score + adx_score + vol_score, 1.0), 2)
 
         return Signal(
             code=code, action="Buy", price=price,
-            confidence=round(max(confidence, 0.30), 2),
+            confidence=max(confidence, 0.30),
             reason=(
                 f"EMA多頭排列 "
                 f"EMA{self.ema_fast}={ef_now:.2f}>"
