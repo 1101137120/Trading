@@ -179,6 +179,7 @@ class TradingSystem:
         self.engine: StrategyEngine = None
         self.market_filter: MarketFilter = None
         self._exit_queue: queue.Queue = queue.Queue()
+        self._code_to_name: dict = {}  # 代碼 → 股票名稱，篩選時更新
 
     def setup(self) -> bool:
         console.print("[bold cyan]正在連線永豐金...[/bold cyan]")
@@ -318,6 +319,9 @@ class TradingSystem:
                 self.logger.warning("連線異常，本週期略過")
                 return
             now = datetime.now()
+            n_pos = len(self.portfolio.positions)
+            max_pos = self.config.get("risk", {}).get("max_positions", 5)
+            console.rule(f"[dim]週期 {now.strftime('%H:%M')} | 持倉 {n_pos}/{max_pos}[/dim]")
             self.logger.info(f"===== 執行交易週期 {now.strftime('%H:%M:%S')} =====")
             self.feed.clear_cache()
 
@@ -505,6 +509,15 @@ class TradingSystem:
     def _sync_tick_subscriptions(self):
         self.broker.subscribe_ticks(list(self.portfolio.positions.keys()))
 
+    def _get_market_return_20d(self) -> float:
+        """計算 0050 近 20 日報酬，用於 RS 過濾"""
+        df = self.feed.get_kbars("0050", lookback_days=30)
+        if df is None or len(df) < 21:
+            return 0.0
+        close = df["Close"].astype(float)
+        base = close.iloc[-21]
+        return float((close.iloc[-1] - base) / base) if base > 0 else 0.0
+
     def _evaluate_candidates(self, candidates: list[dict]) -> list:
         signals = []
         lookback = max(
@@ -515,27 +528,50 @@ class TradingSystem:
             self.config["strategies"].get("kd_cross", {}).get("lookback_days", 30),
         )
         max_evaluate = self.config["screener"].get("max_evaluate", 30)
+        min_rs = self.config["screener"].get("min_rs_entry", 0)
+        mkt_ret = self._get_market_return_20d() if min_rs > 0 else 0.0
+
+        code_to_name = {c["code"]: c.get("name", "") for c in candidates}
+        self._code_to_name.update(code_to_name)
+
+        evaluated = skipped_pos = skipped_limit = skipped_rs = 0
         for c in candidates[:max_evaluate]:
             code = c["code"]
             if self.portfolio.has_position_or_pending(code):
+                skipped_pos += 1
                 continue
             if self.portfolio.is_in_loss_cooldown(code):
                 until = self.portfolio.loss_cooldowns.get(code)
                 self.logger.info(f"跳過 {code}：停損冷卻中（至 {until.strftime('%m/%d') if until else '?'}）")
                 continue
-            # 漲停保護：接近漲停的標的不追高
             if self.risk.is_limit_up(c.get("change_pct", 0)):
+                skipped_limit += 1
                 self.logger.info(f"跳過 {code}：漲幅 {c['change_pct']:.1%} 接近漲停")
                 continue
             df = self.feed.get_kbars(code, lookback_days=lookback + 30)
             if df is None:
                 continue
+            # RS 過濾：近 20 日超額報酬需 >= min_rs
+            if min_rs > 0 and len(df) >= 21:
+                close = df["Close"].astype(float)
+                base = close.iloc[-21]
+                if base > 0:
+                    rs_score = float((close.iloc[-1] - base) / base) - mkt_ret
+                    if rs_score < min_rs:
+                        self.logger.info(f"跳過 {code} {code_to_name.get(code,'')}：RS {rs_score:+.3f} < {min_rs}")
+                        skipped_rs += 1
+                        continue
+            evaluated += 1
             sig = self.engine.evaluate(code, df)
             if sig and sig.action == "Buy":
                 signals.append(sig)
-        code_to_name = {c["code"]: c.get("name", "") for c in candidates}
+
         signals.sort(key=lambda s: s.confidence, reverse=True)
-        self.logger.info(f"共 {len(signals)} 個買入訊號")
+        self.logger.info(
+            f"評估 {evaluated} 檔 | 已持倉跳過 {skipped_pos} | "
+            f"漲停跳過 {skipped_limit} | RS 不足跳過 {skipped_rs} | "
+            f"訊號 {len(signals)} 個"
+        )
         for s in signals:
             name = code_to_name.get(s.code, "")
             news = get_stock_news(s.code, name)
@@ -699,39 +735,61 @@ class TradingSystem:
 
     def _print_summary(self):
         summary = self.portfolio.summary()
+        now = datetime.now()
         if self.portfolio.positions:
             trail_cfg = self.config.get("risk", {}).get("trailing_stop", {})
             trail_pct = trail_cfg.get("trail_pct", 0)
-            table = Table(title="持倉摘要", show_header=True)
+            table = Table(title=f"持倉摘要（{len(self.portfolio.positions)} 筆）", show_header=True)
             table.add_column("代碼", style="cyan")
-            table.add_column("張數")
+            table.add_column("名稱", style="dim", max_width=6)
+            table.add_column("張數", justify="right")
             table.add_column("成本", justify="right")
             table.add_column("現價", justify="right")
-            table.add_column("損益", justify="right")
-            table.add_column("移停", justify="right")
+            table.add_column("損益%", justify="right")
+            table.add_column("損益(元)", justify="right")
+            table.add_column("持有天", justify="right")
+            table.add_column("移停/停損", justify="right")
             for code, pos in self.portfolio.positions.items():
                 clr = "green" if pos.pnl >= 0 else "red"
+                pnl_pct = (pos.current_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
+                hold_days = (now - pos.entry_time).days if pos.entry_time else 0
+                name = self._code_to_name.get(code, "")[:6]
                 if pos.trailing_active and trail_pct:
                     trail_price = pos.highest_price * (1 - trail_pct)
-                    trail_str = f"[yellow]{trail_price:.2f}[/yellow]"
+                    exit_str = f"[yellow]移{trail_price:.2f}[/yellow]"
                 else:
-                    trail_str = "-"
-                table.add_row(code, str(pos.quantity), f"{pos.entry_price:.2f}",
-                             f"{pos.current_price:.2f}", f"[{clr}]{pos.pnl:+,.0f}[/{clr}]",
-                             trail_str)
+                    exit_str = f"[dim]停{pos.stop_loss:.2f}[/dim]"
+                table.add_row(
+                    code, name, str(pos.quantity),
+                    f"{pos.entry_price:.2f}", f"{pos.current_price:.2f}",
+                    f"[{clr}]{pnl_pct:+.1%}[/{clr}]",
+                    f"[{clr}]{pos.pnl:+,.0f}[/{clr}]",
+                    f"{hold_days}天",
+                    exit_str,
+                )
             console.print(table)
         if self.portfolio.pending_orders:
             ptable = Table(title="掛單追蹤", show_header=True)
             ptable.add_column("代碼", style="yellow")
+            ptable.add_column("名稱", style="dim", max_width=6)
             ptable.add_column("張數")
             ptable.add_column("掛單價", justify="right")
+            ptable.add_column("停損", justify="right")
             for code, po in self.portfolio.pending_orders.items():
-                ptable.add_row(code, str(po.quantity), f"{po.price:.2f}")
+                ptable.add_row(
+                    code, self._code_to_name.get(code, "")[:6],
+                    str(po.quantity), f"{po.price:.2f}", f"{po.stop_loss:.2f}",
+                )
             console.print(ptable)
+
+        mkt_status = "✅ 多頭" if (self.market_filter and self.market_filter.allow_long()) else "🚫 偏空"
         console.print(
-            f"  總資金: [bold]{summary['total_capital']:,.0f}[/bold] | "
-            f"可用: [bold]{summary['available_capital']:,.0f}[/bold] | "
-            f"未實現損益: [bold cyan]{summary['unrealized_pnl']:+,.0f}[/bold cyan]"
+            f"  [{now.strftime('%H:%M')}] "
+            f"大盤: {mkt_status}  |  "
+            f"總資金: [bold]{summary['total_capital']:,.0f}[/bold]  |  "
+            f"可用: [bold]{summary['available_capital']:,.0f}[/bold]  |  "
+            f"未實現: [bold cyan]{summary['unrealized_pnl']:+,.0f}[/bold cyan]  |  "
+            f"當日損益: [bold]{summary['daily_pnl']:+,.0f}[/bold]"
         )
 
 

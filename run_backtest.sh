@@ -2,7 +2,7 @@
 # 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
 
 .venv/bin/python backtest.py \
-  --start          2024-01-01 \
+  --start          2025-04-01 \
   --capital        2000000 \
   --strategies     ema_trend \
   --stop-loss      8 \
