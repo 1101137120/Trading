@@ -146,16 +146,25 @@ def calc_benchmark(
     buy_date   = df.iloc[0]["_date"]
     sell_date  = df.iloc[-1]["_date"]
 
+    # 整張買不起就改用零股（與實盤邏輯一致）
     lots = int(capital / (buy_price * 1000))
-    if lots <= 0:
-        return None
+    is_odd_lot = lots <= 0
+    if is_odd_lot:
+        shares = int(capital / buy_price)
+        if shares <= 0:
+            return None
+        unit_size = 1
+        qty = shares
+    else:
+        unit_size = 1000
+        qty = lots
 
-    cost       = lots * buy_price * 1000
+    cost       = qty * buy_price * unit_size
     fee_buy    = max(cost * fee_rate, min_fee)
-    sell_amt   = lots * sell_price * 1000
+    sell_amt   = qty * sell_price * unit_size
     fee_sell   = max(sell_amt * fee_rate, min_fee)
     tax        = sell_amt * 0.001  # ETF 稅率
-    net_pnl    = lots * 1000 * (sell_price - buy_price) - fee_buy - fee_sell - tax
+    net_pnl    = qty * unit_size * (sell_price - buy_price) - fee_buy - fee_sell - tax
     ret_pct    = net_pnl / (cost + fee_buy) * 100
 
     # 最大回撤
@@ -172,7 +181,8 @@ def calc_benchmark(
         "sell_date":        sell_date,
         "buy_price":        buy_price,
         "sell_price":       sell_price,
-        "lots":             lots,
+        "lots":             qty,
+        "odd_lot":          is_odd_lot,
         "total_return_pct": round(ret_pct, 2),
         "max_drawdown_pct": round(max_dd, 2),
     }
@@ -380,7 +390,7 @@ def portfolio_simulation(
     規則：
     - 每筆最多投入 position_pct × 當下可用資金
     - 同時持倉不超過 max_positions
-    - 1 張 = 1000 股
+    - 1 張 = 1000 股；若預算不足 1 張則自動改用零股（與實盤一致）
     """
     # 同日多筆訊號：RS 高（近期跑贏大盤）的優先進場
     trades_sorted = sorted(all_trades, key=lambda x: (x["entry_date"], -x.get("rs_score", 0)))
@@ -417,26 +427,37 @@ def portfolio_simulation(
             continue
 
         alloc = capital * position_pct
-        one_lot_cost = trade["entry_price"] * 1000
-        one_lot_fee_buy = max(one_lot_cost * fee_rate, min_fee)
-        if alloc < one_lot_cost + one_lot_fee_buy:
-            continue  # 買不起 1 張
+        price = trade["entry_price"]
+        one_lot_cost = price * 1000
 
-        lots = int(alloc / (trade["entry_price"] * 1000 * (1 + fee_rate)))
-        if lots <= 0:
-            continue
+        # 判斷整張或零股（與實盤 calculate_quantity 邏輯一致）
+        is_odd_lot = alloc < one_lot_cost * (1 + fee_rate)
 
-        cost = lots * trade["entry_price"] * 1000
+        if is_odd_lot:
+            shares = int(alloc / (price * (1 + fee_rate)))
+            if shares <= 0:
+                continue
+            unit_size = 1
+            qty = shares
+        else:
+            lots = int(alloc / (one_lot_cost * (1 + fee_rate)))
+            if lots <= 0:
+                continue
+            unit_size = 1000
+            qty = lots
+
+        cost = qty * price * unit_size
         fee_buy = max(cost * fee_rate, min_fee)
-        while lots > 0 and (cost + fee_buy) > alloc:
-            lots -= 1
-            cost = lots * trade["entry_price"] * 1000
-            fee_buy = max(cost * fee_rate, min_fee) if lots > 0 else 0
-        if lots <= 0:
+        # 微調：確保 cost+fee 不超過 alloc
+        while qty > 0 and (cost + fee_buy) > alloc:
+            qty -= 1
+            cost = qty * price * unit_size
+            fee_buy = max(cost * fee_rate, min_fee) if qty > 0 else 0
+        if qty <= 0:
             continue
 
-        gross_pnl_dollars = lots * 1000 * (trade["exit_price"] - trade["entry_price"])
-        sell_amount = lots * trade["exit_price"] * 1000
+        gross_pnl_dollars = qty * unit_size * (trade["exit_price"] - price)
+        sell_amount = qty * trade["exit_price"] * unit_size
         fee_sell = max(sell_amount * fee_rate, min_fee)
         tax_rate = tax_etf_rate if is_etf_code(trade["code"]) else tax_stock_rate
         tax = sell_amount * tax_rate
@@ -447,9 +468,13 @@ def portfolio_simulation(
         total_fees += fee_buy + fee_sell
         total_taxes += tax
 
+        # lots 欄位：整張時為張數，零股時為股數（顯示用）
+        lots = qty
+
         taken.append({
             **trade,
             "lots": lots,
+            "odd_lot": is_odd_lot,
             "cost": round(cost, 0),
             "fee_buy": round(fee_buy, 0),
             "fee_sell": round(fee_sell, 0),
@@ -668,6 +693,13 @@ def main():
     else:
         console.print("[dim]大盤過濾：停用[/dim]")
 
+    # ── 載入 00631L（0050正2）K棒，用於 benchmark 比較 ──
+    lookback_bench = (end - start).days + 30
+    bench2x_df = fetch_kbars("00631L", lookback_days=lookback_bench)
+    if bench2x_df is None or bench2x_df.empty:
+        console.print("[dim]00631L K 棒不足，正2 基準略過[/dim]")
+        bench2x_df = None
+
     loss_cooldown = args.loss_cooldown
 
     # ── 第一輪：下載所有 K 棒 ──
@@ -781,10 +813,13 @@ def main():
     holding_total  = holding_df["net_pnl_dollars"].sum()  if not holding_df.empty  else 0
     win_rate_r = (len(realized_wins) / len(realized_df) * 100) if len(realized_df) > 0 else 0
 
-    # ── 0050 基準 ──
+    # ── 基準：0050 / 00631L正2 ──
     bench = None
+    bench2x = None
     if market_df is not None:
         bench = calc_benchmark(market_df, start, end, args.capital, args.fee_rate, args.min_fee)
+    if bench2x_df is not None:
+        bench2x = calc_benchmark(bench2x_df, start, end, args.capital, args.fee_rate, args.min_fee)
 
     # ════════════════════════════════════════
     # 1. 績效總覽
@@ -812,32 +847,53 @@ def main():
     console.print(ov)
 
     # ════════════════════════════════════════
-    # 2. vs 0050 對比
+    # 2. vs 0050 / 00631L正2 對比
     # ════════════════════════════════════════
-    console.rule("[bold]vs 0050 買進持有[/bold]")
-    if bench:
-        alpha     = psim["total_return_pct"] - bench["total_return_pct"]
-        alpha_clr = "green" if alpha >= 0 else "red"
+    console.rule("[bold]vs 大盤基準[/bold]")
+    if bench or bench2x:
         strat_clr = "green" if psim["total_return_pct"] >= 0 else "red"
-        bench_clr = "green" if bench["total_return_pct"] >= 0 else "red"
         cmp = Table(show_header=True, box=None, padding=(0, 3))
-        cmp.add_column("項目",                 style="dim")
-        cmp.add_column("策略",                 justify="right")
-        cmp.add_column("0050 買進持有",        justify="right")
-        cmp.add_column("Alpha（策略−0050）",   justify="right")
-        cmp.add_row("報酬率",
-            f"[{strat_clr}]{psim['total_return_pct']:+.2f}%[/{strat_clr}]",
-            f"[{bench_clr}]{bench['total_return_pct']:+.2f}%[/{bench_clr}]",
-            f"[bold {alpha_clr}]{alpha:+.2f}%[/bold {alpha_clr}]")
-        cmp.add_row("最大回撤",
-            f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]",
-            f"[red]-{bench['max_drawdown_pct']:.2f}%[/red]", "—")
+        cmp.add_column("項目",                   style="dim")
+        cmp.add_column("策略",                   justify="right")
+        if bench:
+            cmp.add_column("0050",               justify="right")
+            cmp.add_column("Alpha（策略−0050）", justify="right")
+        if bench2x:
+            cmp.add_column("00631L 正2",         justify="right")
+            cmp.add_column("Alpha（策略−正2）",  justify="right")
+
+        ret_row  = [f"[{strat_clr}]{psim['total_return_pct']:+.2f}%[/{strat_clr}]"]
+        dd_row   = [f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]"]
+        if bench:
+            b_clr   = "green" if bench["total_return_pct"] >= 0 else "red"
+            alpha   = psim["total_return_pct"] - bench["total_return_pct"]
+            a_clr   = "green" if alpha >= 0 else "red"
+            ret_row += [f"[{b_clr}]{bench['total_return_pct']:+.2f}%[/{b_clr}]",
+                        f"[bold {a_clr}]{alpha:+.2f}%[/bold {a_clr}]"]
+            dd_row  += [f"[red]-{bench['max_drawdown_pct']:.2f}%[/red]", "—"]
+        if bench2x:
+            b2_clr  = "green" if bench2x["total_return_pct"] >= 0 else "red"
+            alpha2x = psim["total_return_pct"] - bench2x["total_return_pct"]
+            a2_clr  = "green" if alpha2x >= 0 else "red"
+            ret_row += [f"[{b2_clr}]{bench2x['total_return_pct']:+.2f}%[/{b2_clr}]",
+                        f"[bold {a2_clr}]{alpha2x:+.2f}%[/bold {a2_clr}]"]
+            dd_row  += [f"[red]-{bench2x['max_drawdown_pct']:.2f}%[/red]", "—"]
+
+        cmp.add_row("報酬率",  *ret_row)
+        cmp.add_row("最大回撤", *dd_row)
         console.print(cmp)
-        console.print(
-            f"[dim]0050：{bench['buy_date']} 買 {bench['buy_price']:.2f} → "
-            f"{bench['sell_date']} {bench['sell_price']:.2f}，{bench['lots']} 張[/dim]")
+        if bench:
+            unit_str = f"{bench['lots']}{'股' if bench.get('odd_lot') else '張'}"
+            console.print(
+                f"[dim]0050：{bench['buy_date']} 買 {bench['buy_price']:.2f} → "
+                f"{bench['sell_date']} {bench['sell_price']:.2f}，{unit_str}[/dim]")
+        if bench2x:
+            unit_str2 = f"{bench2x['lots']}{'股' if bench2x.get('odd_lot') else '張'}"
+            console.print(
+                f"[dim]00631L：{bench2x['buy_date']} 買 {bench2x['buy_price']:.2f} → "
+                f"{bench2x['sell_date']} {bench2x['sell_price']:.2f}，{unit_str2}[/dim]")
     else:
-        console.print("[dim]（未載入 0050 K 棒，無法比較）[/dim]")
+        console.print("[dim]（未載入 K 棒，無法比較）[/dim]")
 
     # ════════════════════════════════════════
     # 3. 交易統計
@@ -918,7 +974,7 @@ def main():
             h_tbl.add_row(
                 str(r["code"]), str(r.get("name", "")),
                 str(r["entry_date"]), f"{r['hold_days']}天",
-                str(int(r["lots"])),
+                f"{int(r['lots'])}{'股' if r.get('odd_lot') else '張'}",
                 f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
                 f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
                 f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
@@ -952,7 +1008,7 @@ def main():
                 t.add_row(
                     str(r["code"]), str(r.get("name", "")),
                     str(r["entry_date"]), str(r["exit_date"]),
-                    f"{r['hold_days']}天", str(int(r["lots"])),
+                    f"{r['hold_days']}天", f"{int(r['lots'])}{'股' if r.get('odd_lot') else '張'}",
                     f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
                     f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
                     f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",

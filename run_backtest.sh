@@ -2,9 +2,9 @@
 # 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
 
 .venv/bin/python backtest.py \
-  --start          2024-01-01 \
-  --capital        2000000 \
-  --strategies     ema_trend \
+  --start          2026-01-01 \
+  --capital        100000 \
+  --strategies      mean_reversion kd_cross \
   --stop-loss      8 \
   --trail-stop     0.12 \
   --trail-stop-bull     0.22 \

@@ -793,6 +793,21 @@ class TradingSystem:
             console.print(ptable)
 
         mkt_status = "✅ 多頭" if (self.market_filter and self.market_filter.allow_long()) else "🚫 偏空"
+
+        # 取 0050 / 00631L 今日漲跌%
+        bench_parts = []
+        for etf_code in ("0050", "00631L"):
+            try:
+                snap = self.feed.get_snapshot(etf_code)
+                if snap and snap.get("change_pct") is not None:
+                    pct = snap["change_pct"] * 100
+                    clr = "green" if pct >= 0 else "red"
+                    label = "0050" if etf_code == "0050" else "正2"
+                    bench_parts.append(f"{label}[{clr}]{pct:+.2f}%[/{clr}]")
+            except Exception:
+                pass
+        bench_str = "  |  " + "  ".join(bench_parts) if bench_parts else ""
+
         console.print(
             f"  [{now.strftime('%H:%M')}] "
             f"大盤: {mkt_status}  |  "
@@ -800,6 +815,7 @@ class TradingSystem:
             f"可用: [bold]{summary['available_capital']:,.0f}[/bold]  |  "
             f"未實現: [bold cyan]{summary['unrealized_pnl']:+,.0f}[/bold cyan]  |  "
             f"當日損益: [bold]{summary['daily_pnl']:+,.0f}[/bold]"
+            f"{bench_str}"
         )
 
 
