@@ -20,4 +20,4 @@
   --time-stop-days      45 \
   --time-stop-min-pct   0.05 \
   --breadth-filter \
-  --breadth-min         0.40
+  --breadth-min         0.50

@@ -28,7 +28,7 @@ from rich.table import Table
 from shared.standalone_feed import fetch_tse_daily_all, fetch_kbars
 from tech.strategies.engine import StrategyEngine
 
-console = Console()
+console = Console(record=True)
 logging.basicConfig(level=logging.WARNING)
 
 
@@ -631,6 +631,12 @@ def main():
                         help="啟用市場廣度過濾：股票池中 >EMA20 比例不足時禁止開倉")
     parser.add_argument("--breadth-min", type=float, default=0.40,
                         help="廣度門檻：股票池中站上 EMA20 比例需 >= 此值才允許開倉（預設 0.40）")
+    parser.add_argument("--no-log", action="store_true", default=False,
+                        help="停用回測 log 記錄（預設會 append 到 backtest_history.md）")
+    parser.add_argument("--log-file", type=str, default="backtest_history.md",
+                        help="回測 log 檔路徑（預設 backtest_history.md）")
+    parser.add_argument("--log-dir", type=str, default="backtest_logs",
+                        help="可視化 log 目錄，每次跑完存一份完整輸出（預設 backtest_logs/）")
     parser.add_argument("--market-ma", type=int, default=20,
                         help="大盤過濾 MA 週期（預設 20）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
@@ -1097,6 +1103,84 @@ def main():
     else:
         s["trades"].to_csv(out_path, index=False, encoding="utf-8-sig")
     console.print(f"\n[dim]完整明細（持倉中 + 已實現）已存至 {out_path}[/dim]")
+
+    # ════════════════════════════════════════
+    # 8. 回測 log（append）
+    # ════════════════════════════════════════
+    if not args.no_log:
+        from datetime import datetime as _dt
+        active_strats = cfg["strategies"].get("active", [])
+        breadth_info  = f"廣度>{args.breadth_min*100:.0f}%" if args.breadth_filter else "停用"
+        trail_info    = f"{args.trail_stop*100:.0f}%（牛{args.trail_stop_bull*100:.0f}%）" if args.trail_stop else "停用"
+
+        bench_ret   = f"{bench['total_return_pct']:+.2f}%"   if bench   else "—"
+        bench2x_ret = f"{bench2x['total_return_pct']:+.2f}%" if bench2x else "—"
+        alpha_str   = f"{psim['total_return_pct'] - bench['total_return_pct']:+.2f}%"   if bench   else "—"
+        alpha2x_str = f"{psim['total_return_pct'] - bench2x['total_return_pct']:+.2f}%" if bench2x else "—"
+
+        reason_str = "  ".join(f"{k}:{v}" for k, v in reason_counts.items())
+
+        log_lines = [
+            f"## {_dt.now().strftime('%Y-%m-%d %H:%M')}",
+            f"",
+            f"**參數**",
+            f"| 項目 | 值 |",
+            f"|------|---|",
+            f"| 區間 | {args.start} → {args.end} |",
+            f"| 策略 | {', '.join(active_strats)} |",
+            f"| 停損 | {args.stop_loss}% |",
+            f"| 追蹤停利 | {trail_info} |",
+            f"| 廣度過濾 | {breadth_info} |",
+            f"| 大盤過濾 | MA{args.market_ma} |",
+            f"| min-rs | {args.min_rs} |",
+            f"| 時間停損 | {args.time_stop_days}天 / 最低{args.time_stop_min_pct*100:.0f}% |",
+            f"| 每筆倉位 | {args.position_pct*100:.0f}%，最多{max_pos}筆 |",
+            f"| 股票數 | {args.stocks} |",
+            f"",
+            f"**績效總覽**",
+            f"| 項目 | 值 |",
+            f"|------|---|",
+            f"| 報酬 | {psim['total_return_pct']:+.2f}% |",
+            f"| 最大回撤 | -{psim['max_drawdown_pct']:.2f}% |",
+            f"| 最終資金 | {psim['final_capital']:,.0f} 元 |",
+            f"| 已實現損益 | {realized_total:+,.0f} 元（{len(realized_df)}筆）|",
+            f"| 執行/跳過 | {len(taken_df)} / {psim['skipped']} |",
+            f"",
+            f"**vs 大盤**",
+            f"| | 策略 | 0050 | Alpha | 00631L正2 | Alpha |",
+            f"|--|------|------|-------|----------|-------|",
+            f"| 報酬 | {psim['total_return_pct']:+.2f}% | {bench_ret} | {alpha_str} | {bench2x_ret} | {alpha2x_str} |",
+            f"| 最大回撤 | -{psim['max_drawdown_pct']:.2f}% | -{bench['max_drawdown_pct']:.2f}% | — | -{bench2x['max_drawdown_pct']:.2f}% | — |" if bench and bench2x else "",
+            f"",
+            f"**交易統計**",
+            f"| 項目 | 值 |",
+            f"|------|---|",
+            f"| 總訊號 | {s['total_trades']} 筆 |",
+            f"| 勝率 | {win_rate_r:.1f}%（{len(realized_wins)}/{len(realized_df)}）|",
+            f"| 期望值 | {ev:+.2f}% |",
+            f"| 平均獲利 | +{s['avg_win_pct']:.2f}% |",
+            f"| 平均虧損 | {s['avg_loss_pct']:.2f}% |",
+            f"| 平均持有 | {s['avg_hold_days']} 天 |",
+            f"| 出場原因 | {reason_str} |",
+            f"",
+            f"---",
+            f"",
+        ]
+
+        log_path = Path(args.log_file)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n".join(log_lines) + "\n")
+        console.print(f"[dim]回測記錄已 append 至 {log_path}[/dim]")
+
+        # ── 可視化完整輸出存檔 ──
+        if args.log_dir:
+            log_dir = Path(args.log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            strat_tag = "_".join(active_strats)
+            ts_tag    = _dt.now().strftime("%Y%m%d_%H%M")
+            vis_path  = log_dir / f"{ts_tag}_{args.start}_{strat_tag}.log"
+            vis_path.write_text(console.export_text(), encoding="utf-8")
+            console.print(f"[dim]可視化 log 已存至 {vis_path}[/dim]")
 
 
 if __name__ == "__main__":
