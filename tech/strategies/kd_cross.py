@@ -7,7 +7,7 @@ from typing import Optional
 import logging
 
 from .base import BaseStrategy, Signal
-from .indicators import kd, rsi
+from .indicators import kd, rsi, adx as _adx, ema as _ema
 
 logger = logging.getLogger("strategy.kd_cross")
 
@@ -21,6 +21,9 @@ class KdCrossStrategy(BaseStrategy):
         self.k_oversold = cfg.get("k_oversold", 25)
         self.rsi_period = cfg.get("rsi_period", 14)
         self.lookback = cfg.get("lookback_days", 30)
+        self.adx_period = cfg.get("adx_period", 14)
+        self.adx_min = cfg.get("adx_min", 0)          # 0 = 停用
+        self.ema_trend = cfg.get("ema_trend_period", 20)  # 0 = 停用
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.kd_period + self.rsi_period + 10
@@ -30,6 +33,12 @@ class KdCrossStrategy(BaseStrategy):
         close = df["Close"].astype(float)
         high = df["High"].astype(float)
         low = df["Low"].astype(float)
+
+        # ── EMA 方向確認：收盤需站上 EMA，避免跌勢中假交叉 ──
+        if self.ema_trend > 0:
+            ema_val = _ema(close, self.ema_trend).iloc[-1]
+            if pd.isna(ema_val) or close.iloc[-1] < ema_val:
+                return None
 
         k, d = kd(high, low, close, self.kd_period)
         rsi_vals = rsi(close, self.rsi_period)

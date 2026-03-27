@@ -124,6 +124,53 @@ def build_dynamic_pool(
     return pool_by_date
 
 
+def build_breadth_map(
+    all_kbars: dict[str, pd.DataFrame],
+    ema_period: int = 20,
+    min_ratio: float = 0.40,
+) -> dict:
+    """
+    逐日計算市場廣度：股票池中收盤 > EMA{ema_period} 的比例。
+    比例低於 min_ratio 的交易日禁止開倉（個股環境太差）。
+    回傳 {date: bool}，True = 廣度健康可進場。
+    """
+    from tech.strategies.indicators import ema as _ema
+
+    all_dates = sorted({
+        row.date()
+        for df in all_kbars.values()
+        for row in df["ts"]
+    })
+
+    # 預先算好每檔的 EMA 序列 {code: {date: ema_val}}
+    ema_by_code: dict[str, dict] = {}
+    for code, df in all_kbars.items():
+        ema_series = _ema(df["Close"].astype(float), ema_period)
+        date_map = {}
+        for ts, val in zip(df["ts"], ema_series):
+            d = ts.date() if hasattr(ts, "date") else ts
+            date_map[d] = val
+        ema_by_code[code] = date_map
+
+    breadth_allow: dict[date, bool] = {}
+    for d in all_dates:
+        above = 0
+        total = 0
+        for code, date_map in ema_by_code.items():
+            ema_val = date_map.get(d)
+            # 取當日收盤
+            df = all_kbars[code]
+            row = df[df["ts"].dt.date == d]
+            if row.empty or ema_val is None or pd.isna(ema_val):
+                continue
+            total += 1
+            if float(row["Close"].iloc[-1]) > ema_val:
+                above += 1
+        ratio = above / total if total > 0 else 1.0
+        breadth_allow[d] = ratio >= min_ratio
+    return breadth_allow
+
+
 def calc_benchmark(
     market_df: pd.DataFrame,
     start: date,
@@ -208,6 +255,7 @@ def simulate_trades(
     min_rs_entry: float = 0.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
+    breadth_allow: dict = None,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -318,6 +366,10 @@ def simulate_trades(
 
         # ── 空倉：大盤過濾 ──
         if market_allow and not market_allow.get(row_date, True):
+            continue
+
+        # ── 空倉：市場廣度過濾 ──
+        if breadth_allow is not None and not breadth_allow.get(row_date, True):
             continue
 
         # ── 空倉：動態股票池（消除存活者偏差）──
@@ -575,6 +627,10 @@ def main():
                         help="啟用大盤過濾（0050 > MA20 才開倉），預設開啟")
     parser.add_argument("--no-market-filter", action="store_true",
                         help="停用大盤過濾")
+    parser.add_argument("--breadth-filter", action="store_true", default=False,
+                        help="啟用市場廣度過濾：股票池中 >EMA20 比例不足時禁止開倉")
+    parser.add_argument("--breadth-min", type=float, default=0.40,
+                        help="廣度門檻：股票池中站上 EMA20 比例需 >= 此值才允許開倉（預設 0.40）")
     parser.add_argument("--market-ma", type=int, default=20,
                         help="大盤過濾 MA 週期（預設 20）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
@@ -739,6 +795,14 @@ def main():
             dynamic_pool = build_dynamic_pool(all_kbars, args.stocks)
         console.print(f"[dim]動態池建立完成（{len(dynamic_pool)} 個交易日）[/dim]")
 
+    # ── 市場廣度地圖 ──
+    breadth_map = None
+    if args.breadth_filter and all_kbars:
+        with console.status("[dim]計算市場廣度（逐日 EMA20 廣度）...[/dim]"):
+            breadth_map = build_breadth_map(all_kbars, ema_period=20, min_ratio=args.breadth_min)
+        blocked = sum(1 for v in breadth_map.values() if not v)
+        console.print(f"[dim]廣度過濾：門檻 {args.breadth_min*100:.0f}%，共 {blocked} 個交易日禁止開倉[/dim]")
+
     # ── 第二輪：逐檔回測 ──
     all_trades: list[dict] = []
 
@@ -770,6 +834,7 @@ def main():
                 min_rs_entry=args.min_rs,
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
+                breadth_allow=breadth_map,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
