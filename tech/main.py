@@ -217,27 +217,61 @@ class TradingSystem:
     def _sync_positions_from_broker(self):
         saved, saved_pending = self.portfolio.load_from_file()
         broker_positions = self.broker.get_positions()
-        broker_map = {p["code"]: p for p in broker_positions}
+
+        # 同一檔股票可能同時有整張 + 零股 → 合併成一筆，整張優先
+        broker_map: dict[str, dict] = {}
+        for p in broker_positions:
+            code = str(p["code"])
+            qty  = p.get("quantity", 0)
+            if code in broker_map:
+                prev = broker_map[code]
+                prev_qty = prev.get("quantity", 0)
+                # 加權平均成本
+                total_qty = prev_qty + qty
+                if total_qty > 0:
+                    prev["price"] = (
+                        prev.get("price", 0) * prev_qty + p.get("price", 0) * qty
+                    ) / total_qty
+                prev["quantity"] = total_qty
+                self.logger.warning(
+                    f"{code} 同時有整張+零股持倉，已合併（共 {total_qty}）"
+                )
+            else:
+                broker_map[code] = dict(p)
 
         synced = 0
         for code, bp in broker_map.items():
-            raw_dir = str(bp.get("direction", "")).lower()
+            raw_dir   = str(bp.get("direction", "")).lower()
             direction = "Buy" if raw_dir in ("long", "buy", "b") else "Sell"
 
             if code in saved:
                 pos = saved[code]
-                pos.direction = direction
-                pos.quantity = bp["quantity"]
+                pos.direction     = direction
                 pos.current_price = bp.get("last_price", pos.entry_price)
+                broker_qty   = bp["quantity"]
+                broker_price = bp.get("price", 0)
+                if broker_qty != pos.quantity and broker_price > 0:
+                    # 數量有變（加碼）→ 更新均價和停損，保留追蹤停利狀態
+                    self.logger.info(
+                        f"{code} 數量變動 {pos.quantity}→{broker_qty}，"
+                        f"均價更新 {pos.entry_price:.2f}→{broker_price:.2f}，"
+                        f"trailing_active={pos.trailing_active} highest={pos.highest_price:.2f} 保留"
+                    )
+                    pos.entry_price = broker_price
+                    pos.stop_loss   = self.risk.calc_stop_loss(broker_price, direction)
+                pos.quantity = broker_qty
             else:
                 self.logger.warning(f"發現未追蹤持倉 {code}，套用預設停損停利")
-                entry = bp["price"]
+                entry = bp.get("price", bp.get("last_price", 0))
                 pos = Position(
                     code=code, direction=direction, quantity=bp["quantity"],
                     entry_price=entry, entry_time=datetime.now(),
                     stop_loss=self.risk.calc_stop_loss(entry, direction),
                     take_profit=self.risk.calc_take_profit(entry, direction),
                     current_price=bp.get("last_price", entry),
+                    odd_lot=saved.get(code, Position(code=code, direction="Buy",
+                        quantity=0, entry_price=0, entry_time=datetime.now(),
+                        stop_loss=0, take_profit=0)).odd_lot,
                 )
 
             with self.portfolio._lock:
@@ -580,6 +614,57 @@ class TradingSystem:
             self.logger.info(f"[買入訊號] {s.code} {name} 價格={s.price} 信心={s.confidence:.2f} 理由={s.reason} | {ai_note}")
         return signals
 
+    def _is_gap_up_blocked(self, code: str, snap: dict, df: "pd.DataFrame | None") -> bool:
+        """
+        開盤跳空過濾：
+        - gap < threshold → 不擋（回傳 False）
+        - gap ≥ threshold 且時間 < delay_time → 擋（回傳 True）
+        - gap ≥ threshold 且時間 ≥ delay_time 且量足夠 → 不擋（回傳 False）
+        - gap ≥ threshold 且時間 ≥ delay_time 但量不夠 → 擋（回傳 True）
+        """
+        ef = self.config.get("entry_filter", {})
+        threshold = ef.get("gap_up_threshold", 0.03)
+        if threshold <= 0:
+            return False
+
+        prev_close = snap.get("prev_close", 0)
+        open_price = snap.get("open", 0)
+        if prev_close <= 0 or open_price <= 0:
+            return False
+
+        gap = (open_price - prev_close) / prev_close
+        if gap < threshold:
+            return False
+
+        # 開盤噴出，判斷時間
+        delay_time_str = ef.get("gap_up_delay_time", "09:30")
+        h, m = map(int, delay_time_str.split(":"))
+        now = datetime.now()
+        delay_dt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+        if now < delay_dt:
+            self.logger.info(
+                f"{code} 跳空 {gap:.1%}（開 {open_price} 昨收 {prev_close}），"
+                f"等 {delay_time_str} 後再評估，本輪跳過"
+            )
+            return True
+
+        # 時間到了，檢查量能
+        vol_ratio = ef.get("gap_up_volume_ratio", 0.8)
+        if vol_ratio > 0 and df is not None and len(df) >= 20:
+            avg_vol = df["Volume"].iloc[-20:].mean()
+            cur_vol = snap.get("volume", 0)
+            if avg_vol > 0 and cur_vol < avg_vol * vol_ratio:
+                self.logger.info(
+                    f"{code} 跳空 {gap:.1%} 但量能不足（今量 {cur_vol:.0f} < 均量 {avg_vol:.0f} × {vol_ratio}），跳過"
+                )
+                return True
+
+        self.logger.info(
+            f"{code} 跳空 {gap:.1%}，已過 {delay_time_str} 且量能確認，允許進場"
+        )
+        return False
+
     def _execute_buy_signals(self, signals: list):
         simulation = self.config["broker"].get("simulation", False)
         for signal in signals:
@@ -600,6 +685,14 @@ class TradingSystem:
             if price <= 0:
                 self.logger.warning(f"跳過 {code}：快照價格為 0（停牌、盤前或資料異常）")
                 continue
+
+            # 跳空過濾：取快照 + K 棒做判斷（simulation 模式跳過）
+            if not simulation:
+                snap = self.feed.get_snapshot(code)
+                df_gap = self.feed.get_kbars(code, lookback_days=25)
+                if snap and self._is_gap_up_blocked(code, snap, df_gap):
+                    continue
+
             qty, is_odd_lot = self.portfolio.calculate_quantity(price)
             if qty <= 0:
                 continue

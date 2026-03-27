@@ -103,6 +103,7 @@ class MarketDataFeed:
             return {
                 "code": code, "open": s.open, "high": s.high, "low": s.low,
                 "close": s.close, "volume": s.total_volume,
+                "prev_close": float(prev) if prev else 0.0,
                 "change_pct": s.change_price / prev if prev else 0,
             }
         except Exception as e:
