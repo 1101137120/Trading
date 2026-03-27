@@ -600,21 +600,25 @@ class TradingSystem:
             if price <= 0:
                 self.logger.warning(f"跳過 {code}：快照價格為 0（停牌、盤前或資料異常）")
                 continue
-            qty = self.portfolio.calculate_quantity(price)
+            qty, is_odd_lot = self.portfolio.calculate_quantity(price)
             if qty <= 0:
                 continue
-            order_value = price * qty * 1000
+            order_value = price * qty * (1 if is_odd_lot else 1000)
             if not self.portfolio.can_open_position(order_value):
                 continue
-            if not self.risk.is_valid_order(price, qty):
+            if not is_odd_lot and not self.risk.is_valid_order(price, qty):
                 continue
             stop_loss = self.risk.calc_stop_loss(price)
             take_profit = self.risk.calc_take_profit(price)
-            self.logger.info(f"[BUY] {code} {qty}張 @ {price} | 信心={signal.confidence:.2f}")
+            unit = "股" if is_odd_lot else "張"
+            self.logger.info(f"[BUY] {code} {qty}{unit} @ {price} | 信心={signal.confidence:.2f} | {'零股' if is_odd_lot else '整張'}")
 
             trade = None
             if not self.dry_run:
-                trade = self.broker.place_limit_order(code, "Buy", price, qty)
+                if is_odd_lot:
+                    trade = self.broker.place_odd_lot_order(code, "Buy", price, qty)
+                else:
+                    trade = self.broker.place_limit_order(code, "Buy", price, qty)
                 if trade is None:
                     self.notifier.notify(f"⚠️ 開倉下單失敗 {code}")
                     continue
@@ -622,18 +626,20 @@ class TradingSystem:
             po = PendingOrder(
                 code=code, action="Buy", quantity=qty, price=price,
                 stop_loss=stop_loss, take_profit=take_profit,
-                placed_time=datetime.now(), trade_ref=trade,
+                placed_time=datetime.now(), trade_ref=trade, odd_lot=is_odd_lot,
             )
             self.portfolio.add_pending(po)
             mode = "[模擬] " if self.dry_run else ""
+            lot_note = "零股" if is_odd_lot else "整張"
             self.notifier.notify(
-                f"📈 {mode}開倉委託 {code} {qty}張 @ {price:.2f}\n"
+                f"📈 {mode}開倉委託 {code} {qty}{unit}({lot_note}) @ {price:.2f}\n"
                 f"停損: {stop_loss:.2f} | 停利: {take_profit:.2f}"
             )
 
     def _execute_sell(self, code: str, pos, reason: str):
         exit_price = pos.current_price
-        self.logger.info(f"[SELL] {code} {pos.quantity}張 @ {exit_price} | {reason}")
+        unit = "股" if pos.odd_lot else "張"
+        self.logger.info(f"[SELL] {code} {pos.quantity}{unit} @ {exit_price} | {reason}")
 
         # 跌停警告：市價單可能無法成交
         snap = self.feed.get_snapshot(code)
@@ -650,7 +656,10 @@ class TradingSystem:
             )
             return
 
-        trade = self.broker.place_market_order(code, "Sell", pos.quantity)
+        if pos.odd_lot:
+            trade = self.broker.place_odd_lot_market_order(code, "Sell", pos.quantity)
+        else:
+            trade = self.broker.place_market_order(code, "Sell", pos.quantity)
         if trade is None:
             self.logger.error(f"賣出下單失敗 {code}，解除退出標記待下週期重試")
             with self.portfolio._lock:
@@ -759,8 +768,9 @@ class TradingSystem:
                     exit_str = f"[yellow]移{trail_price:.2f}[/yellow]"
                 else:
                     exit_str = f"[dim]停{pos.stop_loss:.2f}[/dim]"
+                qty_str = f"{pos.quantity}{'股' if pos.odd_lot else '張'}"
                 table.add_row(
-                    code, name, str(pos.quantity),
+                    code, name, qty_str,
                     f"{pos.entry_price:.2f}", f"{pos.current_price:.2f}",
                     f"[{clr}]{pnl_pct:+.1%}[/{clr}]",
                     f"[{clr}]{pos.pnl:+,.0f}[/{clr}]",

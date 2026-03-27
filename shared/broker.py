@@ -257,6 +257,54 @@ class Broker:
             logger.error(f"市價單失敗 {code}: {e}")
             return None
 
+    def place_odd_lot_order(self, code: str, action: str, price: float, quantity: int):
+        """零股限價單（quantity 單位：股）"""
+        contract = self.get_contract(code)
+        if contract is None:
+            logger.error(f"找不到合約: {code}")
+            return None
+        act = constant.Action.Buy if action == "Buy" else constant.Action.Sell
+        order = self.api.Order(
+            price=price,
+            quantity=quantity,
+            action=act,
+            price_type=constant.StockPriceType.LMT,
+            order_type=constant.OrderType.ROD,
+            order_lot=constant.StockOrderLot.Odd,
+            account=self.api.stock_account,
+        )
+        try:
+            trade = self.api.place_order(contract, order)
+            logger.info(f"零股下單 {action} {code} x{quantity}股 @ {price} | id={trade.order.id}")
+            return trade
+        except Exception as e:
+            logger.error(f"零股下單失敗 {code}: {e}")
+            return None
+
+    def place_odd_lot_market_order(self, code: str, action: str, quantity: int):
+        """零股市價單（quantity 單位：股）"""
+        contract = self.get_contract(code)
+        if contract is None:
+            return None
+        act = constant.Action.Buy if action == "Buy" else constant.Action.Sell
+        price_type = getattr(constant.StockPriceType, "MKT", constant.StockPriceType.MKP)
+        order = self.api.Order(
+            price=0,
+            quantity=quantity,
+            action=act,
+            price_type=price_type,
+            order_type=constant.OrderType.IOC,
+            order_lot=constant.StockOrderLot.Odd,
+            account=self.api.stock_account,
+        )
+        try:
+            trade = self.api.place_order(contract, order)
+            logger.info(f"零股市價 {action} {code} x{quantity}股 | id={trade.order.id}")
+            return trade
+        except Exception as e:
+            logger.error(f"零股市價失敗 {code}: {e}")
+            return None
+
     def cancel_order(self, trade) -> bool:
         try:
             self.api.cancel_order(trade)

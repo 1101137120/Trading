@@ -27,10 +27,11 @@ class PendingOrder:
     placed_time: datetime
     trade_ref: object = None
     chase_count: int = 0       # 已追單次數
+    odd_lot: bool = False      # True = 零股（股），False = 整張（張）
 
     @property
     def order_value(self) -> float:
-        return self.price * self.quantity * 1000
+        return self.price * self.quantity * (1 if self.odd_lot else 1000)
 
 
 @dataclass
@@ -47,12 +48,17 @@ class Position:
     # 移動停損
     trailing_active: bool = False
     highest_price: float = 0.0     # 啟動後追蹤的最高價
+    odd_lot: bool = False          # True = 零股（股），False = 整張（張）
+
+    @property
+    def _lot_multiplier(self) -> int:
+        return 1 if self.odd_lot else 1000
 
     @property
     def pnl(self) -> float:
         if self.direction == "Buy":
-            return (self.current_price - self.entry_price) * self.quantity * 1000
-        return (self.entry_price - self.current_price) * self.quantity * 1000
+            return (self.current_price - self.entry_price) * self.quantity * self._lot_multiplier
+        return (self.entry_price - self.current_price) * self.quantity * self._lot_multiplier
 
     @property
     def pnl_pct(self) -> float:
@@ -97,7 +103,7 @@ class Portfolio:
     def update_capital(self, balance: float):
         with self._lock:
             self.total_capital = balance
-            used_positions = sum(p.entry_price * p.quantity * 1000 for p in self.positions.values())
+            used_positions = sum(p.entry_price * p.quantity * p._lot_multiplier for p in self.positions.values())
             reserved_pending = sum(po.order_value for po in self.pending_orders.values())
             self.available_capital = balance - used_positions - reserved_pending
 
@@ -106,7 +112,8 @@ class Portfolio:
             self.positions[position.code] = position
             self.pending_orders.pop(position.code, None)
             self._recalc_available()
-        logger.info(f"新增持倉 {position.code} | {position.quantity}張 @ {position.entry_price}")
+        unit = "股" if position.odd_lot else "張"
+        logger.info(f"新增持倉 {position.code} | {position.quantity}{unit} @ {position.entry_price}")
         self.save_to_file()
 
     def remove_position(self, code: str, exit_price: float):
@@ -212,7 +219,8 @@ class Portfolio:
         with self._lock:
             self.pending_orders[po.code] = po
             self._recalc_available()
-        logger.info(f"掛單追蹤 {po.code} {po.action} {po.quantity}張 @ {po.price}")
+        unit = "股" if po.odd_lot else "張"
+        logger.info(f"掛單追蹤 {po.code} {po.action} {po.quantity}{unit} @ {po.price}")
         self.save_to_file()
 
     def promote_pending_to_position(self, code: str, fill_price: float, fill_qty: int):
@@ -223,10 +231,11 @@ class Portfolio:
         pos = Position(
             code=code, direction=po.action, quantity=fill_qty, entry_price=fill_price,
             entry_time=datetime.now(), stop_loss=po.stop_loss, take_profit=po.take_profit,
-            current_price=fill_price, trade_ref=po.trade_ref,
+            current_price=fill_price, trade_ref=po.trade_ref, odd_lot=po.odd_lot,
         )
         self.add_position(pos)
-        logger.info(f"掛單成交升格持倉: {code} {fill_qty}張 @ {fill_price}")
+        unit = "股" if po.odd_lot else "張"
+        logger.info(f"掛單成交升格持倉: {code} {fill_qty}{unit} @ {fill_price}")
 
     def cancel_pending(self, code: str):
         with self._lock:
@@ -249,7 +258,9 @@ class Portfolio:
                 "quantity": quantity,
                 "placed_time": datetime.now(),
             }
-        logger.info(f"賣出追蹤: {code} {quantity}張")
+        pos = self.positions.get(code)
+        unit = "股" if (pos and pos.odd_lot) else "張"
+        logger.info(f"賣出追蹤: {code} {quantity}{unit}")
 
     def confirm_sell(self, code: str, fill_price: float, fill_qty: int):
         """成交確認：移除持倉並更新損益"""
@@ -305,13 +316,23 @@ class Portfolio:
             return False
         return True
 
-    def calculate_quantity(self, price: float) -> int:
+    def calculate_quantity(self, price: float) -> tuple[int, bool]:
+        """
+        計算買入數量。
+        回傳 (quantity, is_odd_lot)：
+          - 整張可買 ≥ 1 張時：回傳 (張數, False)
+          - 整張不足 1 張時：回傳零股股數 (is_odd_lot=True)，最小 1 股
+        """
         if price <= 0:
-            return 0
+            return 0, False
         max_val = self.total_capital * self.risk_cfg["max_position_pct"]
         max_val = min(max_val, self.available_capital, self.risk_cfg["max_order_value"])
-        qty = int(max_val / (price * 1000))
-        return max(qty, 0)
+        qty_lots = int(max_val / (price * 1000))
+        if qty_lots >= 1:
+            return qty_lots, False
+        # 整張買不到，改用零股
+        qty_shares = int(max_val / price)
+        return max(qty_shares, 0), True
 
     def save_to_file(self, path: Path = None):
         path = path or self._persist_path
@@ -322,7 +343,7 @@ class Portfolio:
                 {"code": p.code, "direction": p.direction, "quantity": p.quantity,
                  "entry_price": p.entry_price, "entry_time": p.entry_time.isoformat(),
                  "stop_loss": p.stop_loss, "take_profit": p.take_profit,
-                 "current_price": p.current_price,
+                 "current_price": p.current_price, "odd_lot": p.odd_lot,
                  "trailing_active": p.trailing_active, "highest_price": p.highest_price}
                 for p in self.positions.values()
             ],
@@ -362,6 +383,7 @@ class Portfolio:
                     current_price=d.get("current_price", d["entry_price"]),
                     trailing_active=d.get("trailing_active", False),
                     highest_price=d.get("highest_price", 0.0),
+                    odd_lot=d.get("odd_lot", False),
                 )
                 positions[d["code"]] = pos
             pending = {}
@@ -414,6 +436,6 @@ class Portfolio:
         logger.info("每日狀態重置")
 
     def _recalc_available(self):
-        used = sum(p.entry_price * p.quantity * 1000 for p in self.positions.values())
+        used = sum(p.entry_price * p.quantity * p._lot_multiplier for p in self.positions.values())
         reserved = sum(po.order_value for po in self.pending_orders.values())
         self.available_capital = self.total_capital - used - reserved
