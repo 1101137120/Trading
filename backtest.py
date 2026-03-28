@@ -26,6 +26,10 @@ from rich.console import Console
 from rich.table import Table
 
 from shared.standalone_feed import fetch_tse_daily_all, fetch_kbars
+from shared.db import (
+    DB_PATH, get_conn as _db_conn, load_kbars as _db_load_kbars,
+    get_all_stocks as _db_all_stocks,
+)
 from tech.strategies.engine import StrategyEngine
 
 console = Console(record=True)
@@ -256,17 +260,22 @@ def simulate_trades(
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
     breadth_allow: dict = None,
+    slippage_pct: float = 0.002,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
-    - 買入：訊號日收盤價
-    - 出場：次日起每日收盤檢查停損 / 停利；回測結束強制平倉
+    - 買入：訊號日次日開盤價（避免 lookahead bias）+ slippage_pct
+    - 出場：
+        1. Gap stop  — 開盤已跳空穿停損，以開盤成交
+        2. 盤中停損  — Low <= stop 時假設以 stop 成交
+        3. 追蹤/固定停利 — 收盤觸發
+        4. 時間/到期/回測結束 — 收盤成交
+      所有出場均扣 slippage_pct（賣出少收）
     - market_df：0050 日 K，有傳時只在大盤 > MA20 時開倉
     - loss_cooldown_days：停損後冷卻天數內不再進場
     - dynamic_pool：{date: set(code)}，有傳時只在該股票當日在池內才進場
-    - trail_stop_pct > 0：啟用追蹤停利，停利從最高點回落此比例出場；
-      固定停利停用，讓贏家持續跑；初始停損仍有效（保護剛進場的部位）
-    - trail_activation_pct：漲幅達此值後追蹤停利才啟動（避免剛進場就被微幅回落觸發）
+    - trail_stop_pct > 0：啟用追蹤停利；固定停利停用
+    - trail_activation_pct：漲幅達此值後追蹤停利才啟動
     回傳每筆交易的明細。
     """
     trades = []
@@ -303,62 +312,81 @@ def simulate_trades(
         if current_price <= 0:
             continue
 
-        # ── 持倉中：更新最高價 → 檢查停損 / 追蹤停利 / 固定停利 ──
+        # ── 持倉中：Gap停損 → 盤中停損 → 追蹤/固定停利 → 時間/到期 ──
         if position:
-            # 更新最高價（追蹤停利用）
-            if current_price > position["peak_price"]:
-                position["peak_price"] = current_price
-
-            pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
-            hold = (row_date - position["entry_date"]).days
+            open_price = float(df["Open"].iloc[i])
+            low_price  = float(df["Low"].iloc[i])
             exit_reason = None
+            exit_price  = None
 
-            if current_price <= position["stop"]:
-                exit_reason = "停損"
-            elif trail_stop_pct > 0:
-                # 追蹤停利模式：漲幅達 trail_activation_pct 後才啟動
-                if pnl_pct >= trail_activation_pct:
-                    # 動態調寬：0050 MA20>MA60（持續上行）→ 用 bull trail
-                    is_bull = market_bull.get(row_date, False)
-                    eff_trail = (trail_stop_bull_pct
-                                 if (is_bull and trail_stop_bull_pct > 0)
-                                 else trail_stop_pct)
-                    # 強勢個股加成：RS > 0.1 再多給一點空間
-                    rs = position.get("rs_score", 0.0)
-                    if trail_stop_rs_bonus > 0 and rs > 0.1:
-                        eff_trail += trail_stop_rs_bonus
-                    trail_floor = position["peak_price"] * (1 - eff_trail)
-                    if current_price <= trail_floor:
-                        exit_reason = "追蹤停利"
-            elif current_price >= position["target"]:
-                # 固定停利（僅在未使用追蹤停利時有效）
-                exit_reason = "停利"
+            # 1. Gap stop：開盤已跳空穿停損線 → 以開盤成交（最壞情況）
+            if open_price > 0 and open_price <= position["stop"]:
+                exit_price  = open_price * (1 - slippage_pct)
+                exit_reason = "停損(跳空)"
+            else:
+                # 更新最高價（追蹤停利用）
+                if current_price > position["peak_price"]:
+                    position["peak_price"] = current_price
 
+                pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
+
+                # 2. 盤中觸停損（用 Low 近似，假設在停損價成交）
+                if low_price > 0 and low_price <= position["stop"]:
+                    exit_price  = position["stop"] * (1 - slippage_pct)
+                    exit_reason = "停損"
+                elif trail_stop_pct > 0:
+                    # 追蹤停利模式：漲幅達 trail_activation_pct 後才啟動
+                    if pnl_pct_cur >= trail_activation_pct:
+                        # 動態調寬：0050 MA20>MA60（持續上行）→ 用 bull trail
+                        is_bull = market_bull.get(row_date, False)
+                        eff_trail = (trail_stop_bull_pct
+                                     if (is_bull and trail_stop_bull_pct > 0)
+                                     else trail_stop_pct)
+                        # 強勢個股加成：RS > 0.1 再多給一點空間
+                        rs = position.get("rs_score", 0.0)
+                        if trail_stop_rs_bonus > 0 and rs > 0.1:
+                            eff_trail += trail_stop_rs_bonus
+                        trail_floor = position["peak_price"] * (1 - eff_trail)
+                        if current_price <= trail_floor:
+                            exit_price  = current_price * (1 - slippage_pct)
+                            exit_reason = "追蹤停利"
+                elif current_price >= position["target"]:
+                    # 固定停利（僅在未使用追蹤停利時有效）
+                    exit_price  = current_price * (1 - slippage_pct)
+                    exit_reason = "停利"
+
+            hold = (row_date - position["entry_date"]).days
             if exit_reason is None:
+                pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
                 if max_hold_days > 0 and hold >= max_hold_days:
+                    exit_price  = current_price * (1 - slippage_pct)
                     exit_reason = "到期出場"
                 elif (time_stop_days > 0 and hold >= time_stop_days
-                      and pnl_pct < time_stop_min_pct):
+                      and pnl_pct_cur < time_stop_min_pct):
                     # 持倉超過 N 天但漲幅未達門檻 → 佔位不賺，強制出場
+                    exit_price  = current_price * (1 - slippage_pct)
                     exit_reason = "時間停損"
                 elif row_date == end or i == len(df) - 1:
+                    exit_price  = current_price * (1 - slippage_pct)
                     exit_reason = "回測結束"
 
             if exit_reason:
+                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"]
                 trades.append({
                     "code": code,
                     "entry_date": position["entry_date"],
                     "exit_date": row_date,
                     "entry_price": position["entry_price"],
-                    "exit_price": current_price,
+                    "exit_price": exit_price,
                     "pnl_pct": round(pnl_pct * 100, 2),
-                    "hold_days": (row_date - position["entry_date"]).days,
+                    "hold_days": hold,
                     "result": exit_reason,
                     "strategy": position["strategy"],
                     "confidence": position.get("confidence", 0.30),
                     "rs_score": position.get("rs_score", 0.0),
+                    "day_volume": position.get("day_volume", 0),
                 })
-                if exit_reason == "停損" and loss_cooldown_days > 0:
+                if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
                     cooldown_until = row_date + timedelta(days=loss_cooldown_days)
                 position = None
@@ -384,10 +412,20 @@ def simulate_trades(
         df_slice = df.iloc[: i + 1].copy()
         sig = engine.evaluate(code, df_slice)
         if sig and sig.action == "Buy":
-            stop = current_price * (1 - stop_loss_pct)
-            target = current_price * (1 + take_profit_pct)
+            # 次日開盤進場（避免訊號日收盤 lookahead bias）
+            if i + 1 >= len(df):
+                continue  # 無次日資料，無法進場
+            next_open = float(df["Open"].iloc[i + 1])
+            next_date = df["ts"].iloc[i + 1].date()
+            next_vol  = float(df["Volume"].iloc[i + 1])
+            if next_open <= 0:
+                continue
 
-            # 計算相對強弱（RS）：個股近 20 交易日報酬 − 大盤近 20 交易日報酬
+            entry_price = next_open * (1 + slippage_pct)
+            stop   = entry_price * (1 - stop_loss_pct)
+            target = entry_price * (1 + take_profit_pct)
+
+            # RS 仍以訊號日收盤計算（代表當下可觀察到的強弱）
             rs_score = 0.0
             lookback = min(20, i)
             if lookback >= 5 and df["Close"].iloc[i - lookback] > 0:
@@ -410,11 +448,12 @@ def simulate_trades(
                 continue
 
             position = {
-                "entry_date": row_date,
-                "entry_price": current_price,
-                "peak_price": current_price,
+                "entry_date": next_date,
+                "entry_price": entry_price,
+                "peak_price": entry_price,
                 "stop": stop,
                 "target": target,
+                "day_volume": next_vol,
                 "strategy": sig.strategy,
                 "confidence": sig.confidence,
                 "rs_score": rs_score,
@@ -436,6 +475,7 @@ def portfolio_simulation(
     min_fee: float = 20.0,
     tax_stock_rate: float = 0.003,
     tax_etf_rate: float = 0.001,
+    max_vol_pct: float = 0.03,
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -497,6 +537,16 @@ def portfolio_simulation(
                 continue
             unit_size = 1000
             qty = lots
+
+        # 成交量限制：單筆不超過進場日成交量的 max_vol_pct
+        if max_vol_pct > 0 and trade.get("day_volume", 0) > 0:
+            vol_cap_lots = max(1, int(trade["day_volume"] * max_vol_pct))
+            if not is_odd_lot:
+                qty = min(qty, vol_cap_lots)
+            else:
+                qty = min(qty, vol_cap_lots * 1000)
+            if qty <= 0:
+                continue
 
         cost = qty * price * unit_size
         fee_buy = max(cost * fee_rate, min_fee)
@@ -668,6 +718,10 @@ def main():
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
                         help="時間停損最低漲幅門檻（預設 0.05 = 5%%），搭配 --time-stop-days 使用")
+    parser.add_argument("--slippage", type=float, default=0.002,
+                        help="單邊滑價率（預設 0.002 = 0.2%%），買入多付、賣出少收")
+    parser.add_argument("--max-vol-pct", type=float, default=0.03,
+                        help="單筆最多佔進場日成交量比例（預設 0.03 = 3%%；0=停用）")
     parser.add_argument("--fee-rate", type=float, default=0.001425,
                         help="手續費率（單邊），預設 0.001425")
     parser.add_argument("--min-fee", type=float, default=20.0,
@@ -676,6 +730,8 @@ def main():
                         help="股票賣出證交稅率，預設 0.003")
     parser.add_argument("--tax-etf-rate", type=float, default=0.001,
                         help="ETF 賣出稅率，預設 0.001")
+    parser.add_argument("--no-db", action="store_true",
+                        help="強制使用 API 模式，忽略本地 DB（預設：DB 存在時自動使用）")
     args = parser.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -714,41 +770,108 @@ def main():
 
     engine = StrategyEngine(cfg)
 
-    # ── 取候選標的（當前市場快照作為股票池）──
-    console.print("\n[dim]取得股票池（TWSE 當日快照）...[/dim]")
-    snapshots = fetch_tse_daily_all()
-    if not snapshots:
-        console.print("[red]無法取得快照資料[/red]")
-        sys.exit(1)
-
-    exclude_etf = args.exclude_etf and not args.include_etf
+    exclude_etf   = args.exclude_etf and not args.include_etf
     use_dynamic_pool = args.dynamic_pool and not args.no_dynamic_pool
-
-    candidates = [
-        s for s in snapshots.values()
-        if args.min_price <= s["close"] <= args.max_price
-        and s["volume"] >= args.min_volume
-        and (not exclude_etf or not is_etf_code(s["code"]))
-    ]
-    candidates.sort(key=lambda x: x["volume"], reverse=True)
-
-    # 動態池模式：多下載 universe_mult 倍股票，每日排名取前 stocks 檔
+    use_db        = DB_PATH.exists() and not args.no_db
+    etf_note      = "（已排除 ETF）" if exclude_etf else "（含 ETF）"
     universe_size = args.stocks * args.universe_mult if use_dynamic_pool else args.stocks
-    pool = candidates[:universe_size]
-    etf_note = "（已排除 ETF）" if exclude_etf else "（含 ETF）"
-    if use_dynamic_pool:
-        console.print(f"Universe: [bold]{len(pool)}[/bold] 檔下載 → 每日動態取前 [bold]{args.stocks}[/bold] 檔 [dim]{etf_note}[/dim]")
+
+    # ════════════════════════════════════════════
+    # 股票池 + K 棒（DB 模式 vs API 模式）
+    # ════════════════════════════════════════════
+    if use_db:
+        # ── DB 模式：從 universe_snapshots 取歷史宇宙（含已下市）──
+        console.print(f"\n[dim]DB 模式：讀取 {DB_PATH.name}...[/dim]")
+        start_str = start.strftime("%Y-%m-%d")
+        end_str   = end.strftime("%Y-%m-%d")
+
+        with _db_conn() as _conn:
+            # 取回測期間曾進前 universe_size 名的所有股票
+            rows = _conn.execute(
+                "SELECT DISTINCT u.code, s.name "
+                "FROM universe_snapshots u "
+                "LEFT JOIN stocks s ON u.code=s.code "
+                "WHERE u.date>=? AND u.date<=? AND u.vol_rank<=? "
+                + ("AND (s.code IS NULL OR s.code NOT LIKE '00%')" if exclude_etf else ""),
+                (start_str, end_str, universe_size),
+            ).fetchall()
+
+            # 若有指定 min/max price，從 daily_prices 取回測期間平均收盤做篩選
+            if args.min_price > 0 or args.max_price < 9999:
+                price_rows = _conn.execute(
+                    "SELECT code, AVG(close) as avg_close "
+                    "FROM daily_prices "
+                    "WHERE date>=? AND date<=? "
+                    "GROUP BY code",
+                    (start_str, end_str),
+                ).fetchall()
+                avg_price = {r[0]: r[1] for r in price_rows}
+                rows = [
+                    r for r in rows
+                    if args.min_price <= avg_price.get(r[0], 999) <= args.max_price
+                ]
+
+            # 取歷史動態池（universe_snapshots 中 rank <= stocks 的每日快照）
+            pool_rows = _conn.execute(
+                "SELECT date, code FROM universe_snapshots "
+                "WHERE date>=? AND date<=? AND vol_rank<=? "
+                + ("AND code NOT LIKE '00%'" if exclude_etf else ""),
+                (start_str, end_str, args.stocks),
+            ).fetchall()
+
+        pool = [{"code": r[0], "name": r[1] or ""} for r in rows]
+
+        # 建立動態池（直接從 DB 快照，不需重算）
+        dynamic_pool_db: dict[date, set] = {}
+        for d_str, code in pool_rows:
+            d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            dynamic_pool_db.setdefault(d, set()).add(code)
+
+        n_ever_delisted = sum(1 for r in rows if r[1] is None)
+        console.print(
+            f"Universe: [bold]{len(pool)}[/bold] 支"
+            + (f"（含 {n_ever_delisted} 支曾下市）" if n_ever_delisted else "")
+            + f" → 每日動態取前 [bold]{args.stocks}[/bold] 支 "
+            f"[dim]{etf_note}（DB 宇宙快照，{len(dynamic_pool_db)} 個交易日）[/dim]"
+        )
     else:
-        console.print(f"股票池: [bold]{len(pool)}[/bold] 檔 [dim]（固定，存在存活者偏差）{etf_note}[/dim]")
+        # ── API 模式：今日快照（原始行為）──
+        console.print("\n[dim]取得股票池（TWSE 當日快照）...[/dim]")
+        snapshots = fetch_tse_daily_all()
+        if not snapshots:
+            console.print("[red]無法取得快照資料[/red]")
+            sys.exit(1)
+
+        candidates = [
+            s for s in snapshots.values()
+            if args.min_price <= s["close"] <= args.max_price
+            and s["volume"] >= args.min_volume
+            and (not exclude_etf or not is_etf_code(s["code"]))
+        ]
+        candidates.sort(key=lambda x: x["volume"], reverse=True)
+        pool = candidates[:universe_size]
+
+        if use_dynamic_pool:
+            console.print(f"Universe: [bold]{len(pool)}[/bold] 檔下載 → 每日動態取前 [bold]{args.stocks}[/bold] 檔 [dim]{etf_note}[/dim]")
+        else:
+            console.print(f"股票池: [bold]{len(pool)}[/bold] 檔 [dim]（固定，存在存活者偏差）{etf_note}[/dim]")
 
     # ── 載入大盤 K 棒（0050）──
     use_market_filter = args.market_filter and not args.no_market_filter
     market_df = None
+    lookback_market = (end - start).days + args.market_ma + 90
     if use_market_filter:
-        lookback_market = (end - start).days + args.market_ma + 30
-        market_df = fetch_kbars("0050", lookback_days=lookback_market)
+        if use_db:
+            market_df = _db_load_kbars(
+                "0050",
+                (start - __import__("datetime").timedelta(days=args.market_ma + 90)).strftime("%Y-%m-%d"),
+                end.strftime("%Y-%m-%d"),
+            )
+        if market_df is None:
+            market_df = fetch_kbars("0050", lookback_days=lookback_market)
         if market_df is not None and len(market_df) >= args.market_ma:
-            console.print(f"[dim]大盤過濾：0050 > MA{args.market_ma}（{len(market_df)} 根 K 棒）[/dim]")
+            src = "DB" if use_db else "API"
+            console.print(f"[dim]大盤過濾：0050 > MA{args.market_ma}（{len(market_df)} 根 K 棒，來源 {src}）[/dim]")
         else:
             console.print("[yellow]警告：0050 K 棒不足，大盤過濾停用[/yellow]")
             market_df = None
@@ -757,49 +880,84 @@ def main():
 
     # ── 載入 00631L（0050正2）K棒，用於 benchmark 比較 ──
     lookback_bench = (end - start).days + 30
-    bench2x_df = fetch_kbars("00631L", lookback_days=lookback_bench)
+    bench2x_df = None
+    if use_db:
+        bench2x_df = _db_load_kbars(
+            "00631L",
+            (start - __import__("datetime").timedelta(days=30)).strftime("%Y-%m-%d"),
+            end.strftime("%Y-%m-%d"),
+        )
+    if bench2x_df is None:
+        bench2x_df = fetch_kbars("00631L", lookback_days=lookback_bench)
     if bench2x_df is None or bench2x_df.empty:
         console.print("[dim]00631L K 棒不足，正2 基準略過[/dim]")
         bench2x_df = None
 
     loss_cooldown = args.loss_cooldown
 
-    # ── 第一輪：下載所有 K 棒 ──
+    # ── 第一輪：載入所有 K 棒（DB 優先，缺的才打 API）──
     all_kbars: dict[str, pd.DataFrame] = {}
-    stock_meta: dict[str, str] = {}  # code → name
+    stock_meta: dict[str, str] = {}
     failed = 0
     failed_items: list[tuple[str, str]] = []
     lookback_needed = (end - start).days + 90  # 多拉 90 天供 EMA60 warmup
 
-    with console.status("[dim]下載 K 棒...[/dim]") as status:
+    db_hits = 0
+    api_hits = 0
+
+    with console.status("[dim]載入 K 棒...[/dim]") as status:
         for i, stock in enumerate(pool):
             code = stock["code"]
-            status.update(f"[dim]({i+1}/{len(pool)}) {code} {stock.get('name','')}[/dim]")
+            name = stock.get("name", "")
+            status.update(f"[dim]({i+1}/{len(pool)}) {code} {name}[/dim]")
 
             df = None
-            for attempt in range(1, max(1, args.kbars_retries) + 1):
-                df = fetch_kbars(code, lookback_days=lookback_needed)
+
+            # 1. 嘗試從 DB 讀
+            if use_db:
+                db_start = (start - __import__("datetime").timedelta(days=lookback_needed)).strftime("%Y-%m-%d")
+                df = _db_load_kbars(code, db_start, end.strftime("%Y-%m-%d"))
                 if df is not None and len(df) >= 60:
-                    break
-                if attempt < args.kbars_retries:
-                    sleep_s = args.retry_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.15)
-                    time.sleep(sleep_s)
+                    db_hits += 1
+
+            # 2. DB 沒有或不夠，fallback 到 API
             if df is None or len(df) < 60:
-                failed += 1
-                failed_items.append((code, str(stock.get("name", "")).strip()))
-                continue
+                df = None
+                for attempt in range(1, max(1, args.kbars_retries) + 1):
+                    df = fetch_kbars(code, lookback_days=lookback_needed)
+                    if df is not None and len(df) >= 60:
+                        break
+                    if attempt < args.kbars_retries:
+                        sleep_s = args.retry_sleep * (2 ** (attempt - 1)) + random.uniform(0, 0.15)
+                        time.sleep(sleep_s)
+                if df is not None and len(df) >= 60:
+                    api_hits += 1
+                else:
+                    failed += 1
+                    failed_items.append((code, str(name).strip()))
+                    continue
 
             df = adjust_splits(df)
             all_kbars[code] = df
-            stock_meta[code] = str(stock.get("name", "")).strip()
-            time.sleep(0.15)
+            stock_meta[code] = str(name).strip()
+            if not use_db:
+                time.sleep(0.15)
+
+    if use_db:
+        console.print(f"[dim]K 棒來源：DB {db_hits} 支 / API fallback {api_hits} 支[/dim]")
 
     # ── 建立動態股票池（消除存活者偏差）──
     dynamic_pool = None
-    if use_dynamic_pool and all_kbars:
-        with console.status("[dim]建立動態股票池（逐日排名）...[/dim]"):
-            dynamic_pool = build_dynamic_pool(all_kbars, args.stocks)
-        console.print(f"[dim]動態池建立完成（{len(dynamic_pool)} 個交易日）[/dim]")
+    if use_dynamic_pool:
+        if use_db and dynamic_pool_db:
+            # DB 模式：直接用從 universe_snapshots 載入的歷史快照
+            dynamic_pool = dynamic_pool_db
+            console.print(f"[dim]動態池：DB 歷史快照（{len(dynamic_pool)} 個交易日，含已下市宇宙）[/dim]")
+        elif all_kbars:
+            # API 模式：從 K 棒即時計算
+            with console.status("[dim]建立動態股票池（逐日排名）...[/dim]"):
+                dynamic_pool = build_dynamic_pool(all_kbars, args.stocks)
+            console.print(f"[dim]動態池建立完成（{len(dynamic_pool)} 個交易日）[/dim]")
 
     # ── 市場廣度地圖 ──
     breadth_map = None
@@ -841,6 +999,7 @@ def main():
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
                 breadth_allow=breadth_map,
+                slippage_pct=args.slippage,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -873,6 +1032,7 @@ def main():
         min_fee=args.min_fee,
         tax_stock_rate=args.tax_stock_rate,
         tax_etf_rate=args.tax_etf_rate,
+        max_vol_pct=args.max_vol_pct,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()

@@ -2,7 +2,8 @@
 # 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
 
 .venv/bin/python backtest.py \
-  --start          2017-01-01 \
+  --no-db   \
+  --start          2023-01-01 \
   --capital        1000000 \
   --strategies     ema_trend \
   --stop-loss      8 \
@@ -20,4 +21,6 @@
   --time-stop-days      45 \
   --time-stop-min-pct   0.05 \
   --breadth-filter \
-  --breadth-min         0.50
+  --breadth-min         0.50 \
+  --slippage            0.002 \
+  --max-vol-pct         0.03
