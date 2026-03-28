@@ -2,19 +2,19 @@
 # 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
 
 .venv/bin/python backtest.py \
-  --start          2024-01-01 \
-  --capital        100000 \
+  --start          2017-01-01 \
+  --capital        1000000 \
   --strategies     ema_trend \
   --stop-loss      8 \
-  --trail-stop     0.12 \
-  --trail-stop-bull     0.22 \
+  --trail-stop     0.10 \
+  --trail-stop-bull     0.18 \
   --trail-stop-rs-bonus 0.05 \
   --trail-activation    0.08 \
   --max-positions  15 \
   --position-pct   0.30 \
   --stocks         60 \
   --max-price      2000 \
-  --min-rs         0.03 \
+  --min-rs         0.0 \
   --market-filter \
   --market-ma      20 \
   --time-stop-days      45 \
