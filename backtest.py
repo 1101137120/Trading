@@ -239,6 +239,63 @@ def calc_benchmark(
     }
 
 
+def _forward_scan(
+    df: pd.DataFrame,
+    entry_idx: int,
+    entry_price: float,
+    stop: float,
+    target: float,
+    end: date,
+    slippage_pct: float,
+) -> dict:
+    """
+    從 entry_idx+1 起向前掃描，模擬假設持倉的結果。
+    回傳 {exit_price, exit_reason, hold_days, pnl_pct, max_gain_pct}
+    """
+    peak = entry_price
+    entry_date = df["ts"].iloc[entry_idx].date()
+    for j in range(entry_idx + 1, len(df)):
+        row_date = df["ts"].iloc[j].date()
+        if row_date > end:
+            break
+        open_p  = float(df["Open"].iloc[j])
+        low_p   = float(df["Low"].iloc[j])
+        high_p  = float(df["High"].iloc[j])
+        close_p = float(df["Close"].iloc[j])
+        if close_p <= 0:
+            continue
+        peak = max(peak, high_p)
+        exit_price, exit_reason = None, None
+        if open_p > 0 and open_p <= stop:
+            exit_price, exit_reason = open_p, "停損(跳空)"
+        elif low_p <= stop:
+            exit_price, exit_reason = stop, "停損"
+        elif high_p >= target:
+            exit_price, exit_reason = target, "停利"
+        if exit_price:
+            hold_days = (row_date - entry_date).days
+            exit_price *= (1 - slippage_pct)
+            return {
+                "exit_price": round(exit_price, 2),
+                "exit_reason": exit_reason,
+                "hold_days": hold_days,
+                "pnl_pct": round((exit_price - entry_price) / entry_price * 100, 2),
+                "max_gain_pct": round((peak - entry_price) / entry_price * 100, 2),
+            }
+    # 掃到結束
+    last_i = len(df) - 1
+    last_close = float(df["Close"].iloc[last_i]) * (1 - slippage_pct)
+    last_date  = df["ts"].iloc[last_i].date()
+    peak = max(peak, last_close)
+    return {
+        "exit_price": round(last_close, 2),
+        "exit_reason": "區間結束",
+        "hold_days": (last_date - entry_date).days,
+        "pnl_pct": round((last_close - entry_price) / entry_price * 100, 2),
+        "max_gain_pct": round((peak - entry_price) / entry_price * 100, 2),
+    }
+
+
 def simulate_trades(
     df: pd.DataFrame,
     engine: StrategyEngine,
@@ -261,6 +318,7 @@ def simulate_trades(
     time_stop_min_pct: float = 0.05,
     breadth_allow: dict = None,
     slippage_pct: float = 0.002,
+    skipped_out: list = None,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -394,10 +452,32 @@ def simulate_trades(
 
         # ── 空倉：大盤過濾 ──
         if market_allow and not market_allow.get(row_date, True):
+            if skipped_out is not None and i + 1 < len(df):
+                df_slice = df.iloc[: i + 1].copy()
+                sig = engine.evaluate(code, df_slice)
+                if sig and sig.action == "Buy":
+                    _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                    if _ep > 0:
+                        _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                             _ep * (1 + take_profit_pct), end, slippage_pct)
+                        skipped_out.append({"code": code, "signal_date": row_date,
+                                            "skip_reason": "大盤偏空", "entry_price": round(_ep, 2),
+                                            "strategy": sig.strategy, **_fwd})
             continue
 
         # ── 空倉：市場廣度過濾 ──
         if breadth_allow is not None and not breadth_allow.get(row_date, True):
+            if skipped_out is not None and i + 1 < len(df):
+                df_slice = df.iloc[: i + 1].copy()
+                sig = engine.evaluate(code, df_slice)
+                if sig and sig.action == "Buy":
+                    _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                    if _ep > 0:
+                        _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                             _ep * (1 + take_profit_pct), end, slippage_pct)
+                        skipped_out.append({"code": code, "signal_date": row_date,
+                                            "skip_reason": "廣度過濾", "entry_price": round(_ep, 2),
+                                            "strategy": sig.strategy, **_fwd})
             continue
 
         # ── 空倉：動態股票池（消除存活者偏差）──
@@ -406,6 +486,17 @@ def simulate_trades(
 
         # ── 空倉：個股冷卻 ──
         if cooldown_until and row_date <= cooldown_until:
+            if skipped_out is not None and i + 1 < len(df):
+                df_slice = df.iloc[: i + 1].copy()
+                sig = engine.evaluate(code, df_slice)
+                if sig and sig.action == "Buy":
+                    _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                    if _ep > 0:
+                        _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                             _ep * (1 + take_profit_pct), end, slippage_pct)
+                        skipped_out.append({"code": code, "signal_date": row_date,
+                                            "skip_reason": "個股冷卻", "entry_price": round(_ep, 2),
+                                            "strategy": sig.strategy, **_fwd})
             continue
 
         # ── 空倉：評估策略訊號 ──
@@ -445,6 +536,12 @@ def simulate_trades(
 
             # RS 過濾：個股近期跑輸大盤超過門檻則不進場
             if min_rs_entry > 0 and rs_score < min_rs_entry:
+                if skipped_out is not None:
+                    _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
+                    skipped_out.append({"code": code, "signal_date": row_date,
+                                        "skip_reason": f"RS不足({rs_score:+.3f})",
+                                        "entry_price": round(entry_price, 2),
+                                        "strategy": sig.strategy, **_fwd})
                 continue
 
             position = {
@@ -603,7 +700,7 @@ def portfolio_simulation(
 
     total_return_pct = (capital - initial_capital) / initial_capital * 100
     return {
-        "taken_trades": taken,
+        "taken_trades": taken,   # 用於 show-skipped 推導倉位已滿的跳過
         "initial_capital": initial_capital,
         "final_capital": round(capital, 0),
         "total_return_pct": round(total_return_pct, 2),
@@ -732,6 +829,8 @@ def main():
                         help="ETF 賣出稅率，預設 0.001")
     parser.add_argument("--no-db", action="store_true",
                         help="強制使用 API 模式，忽略本地 DB（預設：DB 存在時自動使用）")
+    parser.add_argument("--show-skipped", action="store_true", default=False,
+                        help="顯示被過濾掉但假設持有會高報酬的標的（大盤/廣度/RS/冷卻過濾）")
     args = parser.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -969,6 +1068,7 @@ def main():
 
     # ── 第二輪：逐檔回測 ──
     all_trades: list[dict] = []
+    all_skipped_signals: list[dict] = [] if args.show_skipped else None
 
     with console.status("[dim]模擬交易...[/dim]") as status:
         items = list(all_kbars.items())
@@ -1000,6 +1100,7 @@ def main():
                 time_stop_min_pct=args.time_stop_min_pct,
                 breadth_allow=breadth_map,
                 slippage_pct=args.slippage,
+                skipped_out=all_skipped_signals,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -1265,7 +1366,66 @@ def main():
     console.print(f"\n[dim]完整明細（持倉中 + 已實現）已存至 {out_path}[/dim]")
 
     # ════════════════════════════════════════
-    # 8. 回測 log（append）
+    # 8. 跳過的高報酬機會（--show-skipped）
+    # ════════════════════════════════════════
+    if args.show_skipped and all_skipped_signals is not None:
+        # 倉位已滿的跳過：all_trades 中未進入 taken 的部分
+        taken_keys = {(t["code"], t["entry_date"]) for t in psim["taken_trades"]}
+        position_skipped = [
+            {**t, "skip_reason": "倉位已滿",
+             "pnl_pct": round(t["pnl_pct"] * 100, 2) if "pnl_pct" in t else 0}
+            for t in all_trades
+            if (t["code"], t["entry_date"]) not in taken_keys
+        ]
+        all_missed = all_skipped_signals + position_skipped
+        if all_missed:
+            # 只顯示假設持有能獲利的（pnl_pct > 0），按報酬排序
+            profitable = sorted(
+                [m for m in all_missed if m.get("pnl_pct", 0) > 0],
+                key=lambda x: x.get("pnl_pct", 0), reverse=True,
+            )
+            console.rule(
+                f"[bold yellow]跳過的機會（共 {len(all_missed)} 筆，其中獲利 {len(profitable)} 筆）[/bold yellow]"
+            )
+            top = profitable[:30]
+            if top:
+                sk_tbl = Table(show_header=True, box=None, padding=(0, 1))
+                sk_tbl.add_column("代碼",       style="cyan")
+                sk_tbl.add_column("名稱")
+                sk_tbl.add_column("訊號日",     style="dim")
+                sk_tbl.add_column("跳過原因",   style="yellow")
+                sk_tbl.add_column("假設進場",   justify="right")
+                sk_tbl.add_column("假設出場",   justify="right")
+                sk_tbl.add_column("假設損益%",  justify="right")
+                sk_tbl.add_column("最大漲幅%",  justify="right")
+                sk_tbl.add_column("持有天",     justify="right")
+                sk_tbl.add_column("出場原因",   style="dim")
+                sk_tbl.add_column("策略",       style="dim")
+                for m in top:
+                    pnl = m.get("pnl_pct", 0)
+                    mg  = m.get("max_gain_pct", 0)
+                    name = stock_meta.get(m["code"], m.get("name", ""))
+                    sk_tbl.add_row(
+                        str(m["code"]), str(name),
+                        str(m.get("signal_date", m.get("entry_date", ""))),
+                        str(m["skip_reason"]),
+                        f"{m.get('entry_price', 0):.2f}",
+                        f"{m.get('exit_price', 0):.2f}",
+                        f"[green]+{pnl:.2f}%[/green]",
+                        f"[cyan]+{mg:.2f}%[/cyan]",
+                        f"{m.get('hold_days', 0)}天",
+                        str(m.get("exit_reason", "")),
+                        str(m.get("strategy", "")),
+                    )
+                console.print(sk_tbl)
+                console.print(
+                    f"\n[dim]（僅顯示前 30 筆獲利機會，總計 {len(profitable)} 筆 / 全部跳過 {len(all_missed)} 筆）[/dim]"
+                )
+            else:
+                console.print("[dim]所有跳過的訊號假設持有均無法獲利[/dim]")
+
+    # ════════════════════════════════════════
+    # 9. 回測 log（append）
     # ════════════════════════════════════════
     if not args.no_log:
         from datetime import datetime as _dt
