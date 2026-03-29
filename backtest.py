@@ -1372,8 +1372,7 @@ def main():
         # 倉位已滿的跳過：all_trades 中未進入 taken 的部分
         taken_keys = {(t["code"], t["entry_date"]) for t in psim["taken_trades"]}
         position_skipped = [
-            {**t, "skip_reason": "倉位已滿",
-             "pnl_pct": round(t["pnl_pct"] * 100, 2) if "pnl_pct" in t else 0}
+            {**t, "skip_reason": "倉位已滿"}
             for t in all_trades
             if (t["code"], t["entry_date"]) not in taken_keys
         ]
@@ -1403,7 +1402,7 @@ def main():
                 sk_tbl.add_column("策略",       style="dim")
                 for m in top:
                     pnl = m.get("pnl_pct", 0)
-                    mg  = m.get("max_gain_pct", 0)
+                    mg  = m.get("max_gain_pct")   # 倉位已滿的跳過沒有此欄
                     name = stock_meta.get(m["code"], m.get("name", ""))
                     sk_tbl.add_row(
                         str(m["code"]), str(name),
@@ -1412,7 +1411,7 @@ def main():
                         f"{m.get('entry_price', 0):.2f}",
                         f"{m.get('exit_price', 0):.2f}",
                         f"[green]+{pnl:.2f}%[/green]",
-                        f"[cyan]+{mg:.2f}%[/cyan]",
+                        f"[cyan]+{mg:.2f}%[/cyan]" if mg is not None else "—",
                         f"{m.get('hold_days', 0)}天",
                         str(m.get("exit_reason", "")),
                         str(m.get("strategy", "")),
