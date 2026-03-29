@@ -563,6 +563,21 @@ def simulate_trades(
 # 資金模擬（含張數、實際損益）
 # ──────────────────────────────────────────────
 
+def _resolve_alloc(capital: float, confidence: float,
+                   position_pct: float,
+                   conf_tiers: list[tuple[float, float]] | None) -> float:
+    """
+    根據訊號信心度決定本次倉位金額。
+    conf_tiers: [(threshold, pct), ...] 已按 threshold 由高到低排序。
+    """
+    if not conf_tiers:
+        return capital * position_pct
+    for threshold, pct in conf_tiers:
+        if confidence >= threshold:
+            return capital * pct
+    return capital * position_pct
+
+
 def portfolio_simulation(
     all_trades: list[dict],
     initial_capital: float,
@@ -573,16 +588,20 @@ def portfolio_simulation(
     tax_stock_rate: float = 0.003,
     tax_etf_rate: float = 0.001,
     max_vol_pct: float = 0.03,
+    conf_tiers: list[tuple[float, float]] | None = None,
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
     規則：
-    - 每筆最多投入 position_pct × 當下可用資金
+    - 每筆最多投入 position_pct（或 conf_tiers 對應比例）× 當下可用資金
     - 同時持倉不超過 max_positions
     - 1 張 = 1000 股；若預算不足 1 張則自動改用零股（與實盤一致）
     """
-    # 同日多筆訊號：RS 高（近期跑贏大盤）的優先進場
-    trades_sorted = sorted(all_trades, key=lambda x: (x["entry_date"], -x.get("rs_score", 0)))
+    # 同日多筆訊號：信心高（→ RS 高）的優先進場
+    trades_sorted = sorted(all_trades,
+                           key=lambda x: (x["entry_date"],
+                                          -x.get("confidence", 0),
+                                          -x.get("rs_score", 0)))
 
     capital = initial_capital
     peak_capital = initial_capital
@@ -615,7 +634,7 @@ def portfolio_simulation(
         if len(active) >= max_positions:
             continue
 
-        alloc = capital * position_pct
+        alloc = _resolve_alloc(capital, trade.get("confidence", 0), position_pct, conf_tiers)
         price = trade["entry_price"]
         one_lot_cost = price * 1000
 
@@ -675,6 +694,7 @@ def portfolio_simulation(
             "lots": lots,
             "odd_lot": is_odd_lot,
             "cost": round(cost, 0),
+            "alloc_pct": round(alloc / capital * 100, 1) if capital > 0 else 0,
             "fee_buy": round(fee_buy, 0),
             "fee_sell": round(fee_sell, 0),
             "tax": round(tax, 0),
@@ -831,7 +851,25 @@ def main():
                         help="強制使用 API 模式，忽略本地 DB（預設：DB 存在時自動使用）")
     parser.add_argument("--show-skipped", action="store_true", default=False,
                         help="顯示被過濾掉但假設持有會高報酬的標的（大盤/廣度/RS/冷卻過濾）")
+    parser.add_argument("--conf-tiers", type=str, default=None,
+                        help="信心度倉位分層，格式：閾值:倉位%%,...（由高到低）。"
+                             "例：0.8:40,0.5:25,0:15 → 信心>=0.8用40%%，>=0.5用25%%，其他15%%。"
+                             "未設定時一律使用 --position-pct")
     args = parser.parse_args()
+
+    # ── 解析信心分層 ──
+    conf_tiers: list[tuple[float, float]] | None = None
+    if args.conf_tiers:
+        try:
+            pairs = [p.strip() for p in args.conf_tiers.split(",")]
+            conf_tiers = sorted(
+                [(float(t.split(":")[0]), float(t.split(":")[1]) / 100)
+                 for t in pairs],
+                reverse=True,   # 由高閾值到低閾值
+            )
+        except Exception:
+            print("--conf-tiers 格式錯誤，應為 '0.8:40,0.5:25,0:15'")
+            sys.exit(1)
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end   = datetime.strptime(args.end,   "%Y-%m-%d").date()
@@ -1134,6 +1172,7 @@ def main():
         tax_stock_rate=args.tax_stock_rate,
         tax_etf_rate=args.tax_etf_rate,
         max_vol_pct=args.max_vol_pct,
+        conf_tiers=conf_tiers,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -1176,7 +1215,46 @@ def main():
     ov.add_row("總手續費+稅",   f"{psim['total_fee_tax']:>14,.0f} 元")
     ov.add_row("執行/跳過",
                f"{len(taken_df)} 筆執行  [dim]{psim['skipped']} 筆跳過[/dim]")
+    if conf_tiers:
+        tiers_str = "  ".join(f"≥{t:.1f}→{p*100:.0f}%" for t, p in conf_tiers)
+        ov.add_row("信心倉位分層", f"[cyan]{tiers_str}[/cyan]")
     console.print(ov)
+
+    # ── 信心分層統計（啟用時顯示）──
+    if conf_tiers and not taken_df.empty and "confidence" in taken_df.columns:
+        console.rule("[bold]信心分層統計[/bold]")
+        tier_tbl = Table(show_header=True, box=None, padding=(0, 2))
+        tier_tbl.add_column("層級",     style="cyan")
+        tier_tbl.add_column("信心範圍", style="dim")
+        tier_tbl.add_column("倉位%",    justify="right")
+        tier_tbl.add_column("筆數",     justify="right")
+        tier_tbl.add_column("勝率",     justify="right")
+        tier_tbl.add_column("平均損益%", justify="right")
+        tier_tbl.add_column("合計損益元", justify="right")
+
+        thresholds = [t for t, _ in conf_tiers] + [0.0]
+        for i, (thr, pct) in enumerate(conf_tiers):
+            lower = thresholds[i + 1]
+            mask = (taken_df["confidence"] >= thr) if i == 0 else (
+                (taken_df["confidence"] >= thr) & (taken_df["confidence"] < conf_tiers[i-1][0])
+            )
+            sub = taken_df[mask]
+            if sub.empty:
+                continue
+            wins = sub[sub["pnl_pct"] > 0]
+            wr = len(wins) / len(sub) * 100
+            avg_pnl = sub["pnl_pct"].mean()
+            total_pnl = sub["net_pnl_dollars"].sum() if "net_pnl_dollars" in sub.columns else 0
+            clr = "green" if avg_pnl >= 0 else "red"
+            range_str = f">= {thr:.1f}" if i == len(conf_tiers) - 1 else f"{thr:.1f} ~ {conf_tiers[i-1][0]:.1f}" if i > 0 else f">= {thr:.1f}"
+            tier_tbl.add_row(
+                f"Tier {i+1}", range_str, f"{pct*100:.0f}%",
+                str(len(sub)),
+                f"[{'green' if wr>=50 else 'red'}]{wr:.1f}%[/]",
+                f"[{clr}]{avg_pnl:+.2f}%[/{clr}]",
+                f"[{clr}]{total_pnl:+,.0f}[/{clr}]",
+            )
+        console.print(tier_tbl)
 
     # ════════════════════════════════════════
     # 2. vs 0050 / 00631L正2 對比
