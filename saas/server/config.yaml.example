@@ -1,0 +1,25 @@
+# Signal Server 設定（僅需策略相關設定，不需券商憑證）
+screener:
+  min_price: 20
+  max_price: 800
+  min_volume: 2000
+  max_stocks: 50
+  exclude_etf: true
+  min_avg_volume_5d: 3000
+
+strategies:
+  active:
+    - ema_trend
+    - kd_cross
+    - momentum
+    - breakout
+
+market_filter:
+  enabled: true
+  proxy_code: "0050"
+  ma_period: 20
+
+risk:
+  stop_loss_pct: 0.06
+  take_profit_pct: 0.12
+  position_size_pct: 0.30
