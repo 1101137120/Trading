@@ -1378,9 +1378,11 @@ def main():
         h_tbl.add_column("現價",    justify="right")
         h_tbl.add_column("損益%",   justify="right")
         h_tbl.add_column("損益元",  justify="right")
+        h_tbl.add_column("信心",    justify="right")
         h_tbl.add_column("策略",    style="dim")
         for _, r in holding_df.sort_values("pnl_pct", ascending=False).iterrows():
             clr = "green" if r["pnl_pct"] > 0 else "red"
+            conf = r.get("confidence", float("nan"))
             h_tbl.add_row(
                 str(r["code"]), str(r.get("name", "")),
                 str(r["entry_date"]), f"{r['hold_days']}天",
@@ -1388,6 +1390,7 @@ def main():
                 f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
                 f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
                 f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
+                f"{conf:.2f}" if conf == conf else "—",
                 str(r["strategy"]),
             )
         console.print(h_tbl)
@@ -1411,10 +1414,12 @@ def main():
             t.add_column("賣出價",  justify="right")
             t.add_column("損益%",   justify="right")
             t.add_column("淨損益",  justify="right")
+            t.add_column("信心",    justify="right")
             t.add_column("原因",    style="dim")
             t.add_column("策略",    style="dim")
             for _, r in rows.iterrows():
                 clr = "green" if r["net_pnl_dollars"] > 0 else "red"
+                conf = r.get("confidence", float("nan"))
                 t.add_row(
                     str(r["code"]), str(r.get("name", "")),
                     str(r["entry_date"]), str(r["exit_date"]),
@@ -1422,6 +1427,7 @@ def main():
                     f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
                     f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
                     f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
+                    f"{conf:.2f}" if conf == conf else "—",
                     str(r["result"]), str(r["strategy"]),
                 )
             return t
@@ -1475,12 +1481,14 @@ def main():
                 sk_tbl.add_column("假設出場",   justify="right")
                 sk_tbl.add_column("假設損益%",  justify="right")
                 sk_tbl.add_column("最大漲幅%",  justify="right")
+                sk_tbl.add_column("信心",       justify="right")
                 sk_tbl.add_column("持有天",     justify="right")
                 sk_tbl.add_column("出場原因",   style="dim")
                 sk_tbl.add_column("策略",       style="dim")
                 for m in top:
-                    pnl = m.get("pnl_pct", 0)
-                    mg  = m.get("max_gain_pct")   # 倉位已滿的跳過沒有此欄
+                    pnl  = m.get("pnl_pct", 0)
+                    mg   = m.get("max_gain_pct")   # 倉位已滿的跳過沒有此欄
+                    conf = m.get("confidence", float("nan"))
                     name = stock_meta.get(m["code"], m.get("name", ""))
                     sk_tbl.add_row(
                         str(m["code"]), str(name),
@@ -1490,6 +1498,7 @@ def main():
                         f"{m.get('exit_price', 0):.2f}",
                         f"[green]+{pnl:.2f}%[/green]",
                         f"[cyan]+{mg:.2f}%[/cyan]" if mg is not None else "—",
+                        f"{conf:.2f}" if conf == conf else "—",
                         f"{m.get('hold_days', 0)}天",
                         str(m.get("exit_reason", "")),
                         str(m.get("strategy", "")),
