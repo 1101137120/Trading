@@ -50,6 +50,12 @@ class SignalClient:
         self.feed: MarketDataFeed = None
         self._exit_queue: queue.Queue = queue.Queue()
 
+        # dashboard / bot 共用狀態
+        self.paused: bool = False
+        self.cached_signals: list[dict] = []
+        self.last_scan_at: datetime | None = None
+        self._code_names: dict[str, str] = {}
+
     def setup(self) -> bool:
         if not self.broker.connect():
             logger.error("連線券商失敗")
@@ -64,6 +70,11 @@ class SignalClient:
         self.broker.setup_tick_callback(self._on_tick)
         if self.portfolio.positions:
             self.broker.subscribe_ticks(list(self.portfolio.positions.keys()))
+
+        # 啟動本地控制 API
+        from . import api as local_api
+        local_api.start(self, port=self.config.get("signal_client", {}).get("local_api_port", 8001))
+
         self.notifier.notify("✅ Signal Client 啟動")
         return True
 
@@ -76,15 +87,20 @@ class SignalClient:
         pos = self.portfolio.positions.get(code)
         if not pos:
             return
+        pos.current_price = price
         if price <= pos.stop_loss:
             self._exit_queue.put({"code": code, "price": price, "reason": "停損"})
         elif price >= pos.take_profit:
             self._exit_queue.put({"code": code, "price": price, "reason": "停利"})
 
     def _process_exits(self):
+        seen = set()
         while not self._exit_queue.empty():
             item = self._exit_queue.get_nowait()
             code, price, reason = item["code"], item["price"], item["reason"]
+            if code in seen:
+                continue
+            seen.add(code)
             pos = self.portfolio.positions.get(code)
             if not pos:
                 continue
@@ -106,6 +122,12 @@ class SignalClient:
                 return []
             resp.raise_for_status()
             data = resp.json()
+            self.cached_signals = data.get("signals", [])
+            self.last_scan_at = datetime.now()
+            # 更新股票名稱對照表
+            for s in self.cached_signals:
+                if s.get("name"):
+                    self._code_names[s["code"]] = s["name"]
             if not data.get("market_open", True):
                 logger.info("伺服器：大盤偏空，本輪無訊號")
                 return []
@@ -114,7 +136,7 @@ class SignalClient:
                 f"（掃描耗時 {data.get('scan_time_sec', '?')}s，"
                 f"更新於 {data.get('updated_at', '?')}）"
             )
-            return data.get("signals", [])
+            return self.cached_signals
         except Exception as e:
             logger.error(f"取得訊號失敗: {e}")
             return []
@@ -173,9 +195,13 @@ class SignalClient:
                     continue
 
                 self._process_exits()
-                signals = self.fetch_signals()
-                if signals:
-                    self.execute_signals(signals)
+
+                if not self.paused:
+                    signals = self.fetch_signals()
+                    if signals:
+                        self.execute_signals(signals)
+                else:
+                    logger.info("自動交易已暫停，跳過本輪")
 
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
