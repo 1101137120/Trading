@@ -1,8 +1,8 @@
 """
-本地 SQLite 資料庫存取層
+DuckDB 資料庫存取層（取代原 SQLite 版）
 
 Schema：
-  stocks              — 股票主檔（含已下市），記錄 listed_date / delisted_date
+  stocks              — 股票主檔（含已下市）
   daily_prices        — 日 K 棒 OHLCV，單位：價格元、成交量張
   universe_snapshots  — 每日宇宙快照（5 日均量排名），解決存活者偏差
   db_meta             — 版本 / 最後更新時間等 key-value
@@ -13,10 +13,11 @@ Schema：
   df = load_kbars("2330", "2022-01-01", "2026-03-28")
   codes = load_universe("2024-06-01", top_n=60)
 """
-import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
+import duckdb
 import pandas as pd
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stocks.db"
@@ -26,52 +27,61 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stocks.db"
 # 連線 / Schema
 # ──────────────────────────────────────────────
 
-def get_conn(db_path: Path = DB_PATH) -> sqlite3.Connection:
+@contextmanager
+def get_conn(db_path: Path = DB_PATH):
+    """DuckDB 連線 context manager，離開時自動 commit / rollback / close。"""
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA cache_size=-32000")   # 32 MB page cache
-    return conn
+    conn = duckdb.connect(str(db_path))
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def init_schema(conn: sqlite3.Connection):
+def init_schema(conn: duckdb.DuckDBPyConnection):
     """建立（或升級）所有資料表。冪等，可重複呼叫。"""
-    conn.executescript("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS stocks (
-            code          TEXT PRIMARY KEY,
-            name          TEXT,
-            market        TEXT,         -- 'TSE' / 'OTC'
-            listed_date   TEXT,         -- YYYY-MM-DD
-            delisted_date TEXT          -- NULL = 仍上市
-        );
-
+            code          VARCHAR PRIMARY KEY,
+            name          VARCHAR,
+            market        VARCHAR,
+            listed_date   VARCHAR,
+            delisted_date VARCHAR
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_prices (
-            code    TEXT NOT NULL,
-            date    TEXT NOT NULL,      -- YYYY-MM-DD
-            open    REAL,
-            high    REAL,
-            low     REAL,
-            close   REAL,
-            volume  REAL,              -- 單位：張（1000 股）
+            code    VARCHAR NOT NULL,
+            date    VARCHAR NOT NULL,
+            open    DOUBLE,
+            high    DOUBLE,
+            low     DOUBLE,
+            close   DOUBLE,
+            volume  DOUBLE,
             PRIMARY KEY (code, date)
-        );
-        CREATE INDEX IF NOT EXISTS idx_dp_date ON daily_prices(date);
-        CREATE INDEX IF NOT EXISTS idx_dp_code ON daily_prices(code);
-
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dp_date ON daily_prices(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_dp_code ON daily_prices(code)")
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS universe_snapshots (
-            date       TEXT    NOT NULL,
-            code       TEXT    NOT NULL,
-            avg_vol_5d REAL,
+            date       VARCHAR NOT NULL,
+            code       VARCHAR NOT NULL,
+            avg_vol_5d DOUBLE,
             vol_rank   INTEGER,
             PRIMARY KEY (date, code)
-        );
-        CREATE INDEX IF NOT EXISTS idx_univ_date ON universe_snapshots(date);
-
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_univ_date ON universe_snapshots(date)")
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS db_meta (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        );
+            key   VARCHAR PRIMARY KEY,
+            value VARCHAR
+        )
     """)
     conn.commit()
 
@@ -94,15 +104,14 @@ def load_kbars(
     if not db_path.exists():
         return None
     with get_conn(db_path) as conn:
-        df = pd.read_sql_query(
+        df = conn.execute(
             "SELECT date AS ts, open AS Open, high AS High, "
             "       low AS Low, close AS Close, volume AS Volume "
             "FROM daily_prices "
             "WHERE code=? AND date>=? AND date<=? "
             "ORDER BY date",
-            conn,
-            params=(code, start, end),
-        )
+            [code, start, end],
+        ).df()
     if len(df) < 10:
         return None
     df["ts"] = pd.to_datetime(df["ts"])
@@ -118,10 +127,7 @@ def load_kbars_with_warmup(
     warmup_days: int = 90,
     db_path: Path = DB_PATH,
 ) -> Optional[pd.DataFrame]:
-    """
-    含 warmup 期的 K 棒（EMA60 等指標需要 warmup）。
-    start 往前推 warmup_days 個日曆日取資料。
-    """
+    """含 warmup 期的 K 棒（EMA60 等指標需要 warmup）。"""
     from datetime import datetime, timedelta
     start_dt = datetime.strptime(start, "%Y-%m-%d") - timedelta(days=warmup_days)
     return load_kbars(code, start_dt.strftime("%Y-%m-%d"), end, db_path)
@@ -132,22 +138,19 @@ def load_universe(
     top_n: int,
     db_path: Path = DB_PATH,
 ) -> list[str]:
-    """
-    取得某交易日成交量前 top_n 的股票代碼（歷史宇宙快照）。
-    若 DB 無該日快照，回傳空 list（呼叫端自行 fallback 到當日 API 快照）。
-    """
+    """取得某交易日成交量前 top_n 的股票代碼（歷史宇宙快照）。"""
     if not db_path.exists():
         return []
     with get_conn(db_path) as conn:
         rows = conn.execute(
             "SELECT code FROM universe_snapshots "
             "WHERE date=? AND vol_rank<=? ORDER BY vol_rank",
-            (trade_date, top_n),
+            [trade_date, top_n],
         ).fetchall()
     return [r[0] for r in rows]
 
 
-def get_all_stocks(conn: sqlite3.Connection) -> list[dict]:
+def get_all_stocks(conn: duckdb.DuckDBPyConnection) -> list[dict]:
     """回傳 stocks 表所有記錄 [{code, name, market, listed_date, delisted_date}]"""
     rows = conn.execute(
         "SELECT code, name, market, listed_date, delisted_date FROM stocks ORDER BY code"
@@ -159,10 +162,10 @@ def get_all_stocks(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
-def get_latest_date(code: str, conn: sqlite3.Connection) -> Optional[str]:
+def get_latest_date(code: str, conn: duckdb.DuckDBPyConnection) -> Optional[str]:
     """取得 DB 中某股最新的 K 棒日期（YYYY-MM-DD），無資料回傳 None"""
     row = conn.execute(
-        "SELECT MAX(date) FROM daily_prices WHERE code=?", (code,)
+        "SELECT MAX(date) FROM daily_prices WHERE code=?", [code]
     ).fetchone()
     return row[0] if row and row[0] else None
 
@@ -202,48 +205,55 @@ def upsert_stock(
     market: str,
     listed_date: Optional[str],
     delisted_date: Optional[str],
-    conn: sqlite3.Connection,
+    conn: duckdb.DuckDBPyConnection,
 ):
     conn.execute(
-        "INSERT OR REPLACE INTO stocks(code,name,market,listed_date,delisted_date) "
-        "VALUES (?,?,?,?,?)",
-        (code, name, market, listed_date, delisted_date),
+        "INSERT INTO stocks(code, name, market, listed_date, delisted_date) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT (code) DO UPDATE SET "
+        "name=excluded.name, market=excluded.market, "
+        "listed_date=excluded.listed_date, delisted_date=excluded.delisted_date",
+        [code, name, market, listed_date, delisted_date],
     )
 
 
-def upsert_kbars(code: str, df: pd.DataFrame, conn: sqlite3.Connection):
+def upsert_kbars(code: str, df: pd.DataFrame, conn: duckdb.DuckDBPyConnection):
     """
-    將 K 棒批次寫入 DB（INSERT OR REPLACE，可重複執行）。
+    將 K 棒批次寫入 DB（upsert，可重複執行）。
     df 格式：ts (datetime-like), Open, High, Low, Close, Volume (張)
+    DuckDB 版本：DataFrame 直接 register，一次性批次 INSERT，速度比 executemany 快數倍。
     """
-    rows = []
-    for _, r in df.iterrows():
-        ts = r["ts"]
-        d = ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
-        rows.append((
-            code, d,
-            round(float(r["Open"]),  2),
-            round(float(r["High"]),  2),
-            round(float(r["Low"]),   2),
-            round(float(r["Close"]), 2),
-            float(r["Volume"]),
-        ))
-    conn.executemany(
-        "INSERT OR REPLACE INTO daily_prices(code,date,open,high,low,close,volume) "
-        "VALUES (?,?,?,?,?,?,?)",
-        rows,
-    )
+    rows_df = pd.DataFrame({
+        "code":   code,
+        "date":   pd.to_datetime(df["ts"]).dt.strftime("%Y-%m-%d"),
+        "open":   df["Open"].round(2).astype(float),
+        "high":   df["High"].round(2).astype(float),
+        "low":    df["Low"].round(2).astype(float),
+        "close":  df["Close"].round(2).astype(float),
+        "volume": df["Volume"].astype(float),
+    })
+    conn.register("_upsert_rows", rows_df)
+    conn.execute("""
+        INSERT INTO daily_prices(code, date, open, high, low, close, volume)
+        SELECT code, date, open, high, low, close, volume FROM _upsert_rows
+        ON CONFLICT (code, date) DO UPDATE SET
+            open=excluded.open, high=excluded.high, low=excluded.low,
+            close=excluded.close, volume=excluded.volume
+    """)
+    conn.unregister("_upsert_rows")
 
 
-def set_meta(key: str, value: str, conn: sqlite3.Connection):
+def set_meta(key: str, value: str, conn: duckdb.DuckDBPyConnection):
     conn.execute(
-        "INSERT OR REPLACE INTO db_meta(key,value) VALUES (?,?)", (key, value)
+        "INSERT INTO db_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value=excluded.value",
+        [key, value],
     )
 
 
-def get_meta(key: str, conn: sqlite3.Connection) -> Optional[str]:
+def get_meta(key: str, conn: duckdb.DuckDBPyConnection) -> Optional[str]:
     row = conn.execute(
-        "SELECT value FROM db_meta WHERE key=?", (key,)
+        "SELECT value FROM db_meta WHERE key=?", [key]
     ).fetchone()
     return row[0] if row else None
 
@@ -252,55 +262,34 @@ def get_meta(key: str, conn: sqlite3.Connection) -> Optional[str]:
 # 宇宙快照重建
 # ──────────────────────────────────────────────
 
-def rebuild_universe_snapshots(conn: sqlite3.Connection, vol_window: int = 5):
+def rebuild_universe_snapshots(conn: duckdb.DuckDBPyConnection, vol_window: int = 5):
     """
     從 daily_prices 重新計算每日宇宙快照並寫入 universe_snapshots。
-    完整重建，舊資料先清除。可在 build_db 完成後呼叫，也可按需重跑。
+    DuckDB 版本：全程在資料庫內用 SQL 視窗函數完成，不需載入 pandas，速度大幅提升。
     """
     print("重建宇宙快照（universe_snapshots）...")
-    df = pd.read_sql_query(
-        "SELECT code, date, volume FROM daily_prices ORDER BY code, date",
-        conn,
-    )
-    if df.empty:
-        print("  daily_prices 無資料，略過")
-        return
-
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values(["code", "date"])
-
-    df["avg_vol"] = (
-        df.groupby("code")["volume"]
-        .transform(lambda x: x.rolling(vol_window, min_periods=1).mean())
-    )
-    df["vol_rank"] = (
-        df.groupby("date")["avg_vol"]
-        .rank(ascending=False, method="min")
-        .astype(int)
-    )
-
-    snap = (
-        df[["date", "code", "avg_vol", "vol_rank"]]
-        .copy()
-        .rename(columns={"avg_vol": "avg_vol_5d"})
-    )
-    snap["date"] = snap["date"].dt.strftime("%Y-%m-%d")
-
     conn.execute("DELETE FROM universe_snapshots")
-    # 分批寫入避免記憶體問題
-    batch_size = 50_000
-    for i in range(0, len(snap), batch_size):
-        batch = snap.iloc[i:i + batch_size]
-        conn.executemany(
-            "INSERT INTO universe_snapshots(date,code,avg_vol_5d,vol_rank) "
-            "VALUES (?,?,?,?)",
-            batch.itertuples(index=False, name=None),
+    conn.execute(f"""
+        INSERT INTO universe_snapshots (date, code, avg_vol_5d, vol_rank)
+        WITH rolling AS (
+            SELECT
+                date, code,
+                AVG(volume) OVER (
+                    PARTITION BY code
+                    ORDER BY date
+                    ROWS BETWEEN {vol_window - 1} PRECEDING AND CURRENT ROW
+                ) AS avg_vol_5d
+            FROM daily_prices
         )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_univ_date ON universe_snapshots(date)"
-    )
+        SELECT
+            date, code, avg_vol_5d,
+            RANK() OVER (PARTITION BY date ORDER BY avg_vol_5d DESC)::INTEGER AS vol_rank
+        FROM rolling
+    """)
     conn.commit()
 
-    n_dates  = snap["date"].nunique()
-    n_stocks = snap["code"].nunique()
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT date), COUNT(DISTINCT code) FROM universe_snapshots"
+    ).fetchone()
+    n_dates, n_stocks = row
     print(f"  完成：{n_dates:,} 個交易日 × {n_stocks:,} 支股票")

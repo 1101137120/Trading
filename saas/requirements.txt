@@ -3,3 +3,4 @@ uvicorn[standard]>=0.29.0
 requests>=2.31.0
 streamlit>=1.35.0
 python-telegram-bot>=21.0
+duckdb>=0.10.0
