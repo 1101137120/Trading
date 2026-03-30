@@ -22,12 +22,10 @@ class EmaTrendStrategy(BaseStrategy):
         self.ema_slow = cfg.get("ema_slow", 60)
         self.vol_confirm = cfg.get("vol_confirm", True)
         self.lookback = cfg.get("lookback_days", 70)
-        self.adx_period    = cfg.get("adx_period", 14)
-        self.adx_min       = cfg.get("adx_min", 20)    # < 20 視為橫盤，不進場
-        self.max_ema_dev   = cfg.get("max_ema_dev", 0.0)  # 收盤距 EMA20 乖離率上限（0=停用）
-        self.min_atr_pct   = cfg.get("min_atr_pct", 0.0)  # ATR% 下限，過低視為死魚股（0=停用）
-        self.pullback_entry = cfg.get("pullback_entry", False)  # 等回踩 EMA20 才進場
-        self.pullback_band  = cfg.get("pullback_band", 0.02)    # 回踩允許偏差 ±N%
+        self.adx_period  = cfg.get("adx_period", 14)
+        self.adx_min     = cfg.get("adx_min", 20)    # < 20 視為橫盤，不進場
+        self.max_ema_dev = cfg.get("max_ema_dev", 0.0)  # 收盤距 EMA20 乖離率上限（0=停用）
+        self.min_atr_pct = cfg.get("min_atr_pct", 0.0)  # ATR% 下限，過低視為死魚股（0=停用）
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.ema_slow + self.adx_period + 5
@@ -50,15 +48,9 @@ class EmaTrendStrategy(BaseStrategy):
         for k in range(confirm_bars):
             if not (ef.iloc[-(k+1)] > em.iloc[-(k+1)] > es.iloc[-(k+1)]):
                 return None
-        # 最新一根價格條件
-        if self.pullback_entry:
-            # 回調進場：價格需回踩到 EMA20 ± pullback_band（跌穿則不進）
-            dev = (price - em_now) / em_now if em_now > 0 else 0
-            if not (-self.pullback_band <= dev <= self.pullback_band):
-                return None
-        else:
-            if price <= em_now:
-                return None
+        # 最新一根：價格需站上 EMA20
+        if price <= em_now:
+            return None
 
         # ADX 計算（同時用於過濾與信心評分）
         adx_val = None
@@ -73,24 +65,17 @@ class EmaTrendStrategy(BaseStrategy):
             if price > 0 and (atr_val / price) * 100 < self.min_atr_pct:
                 return None
 
-        # 乖離率過濾：回調模式已由 pullback_band 取代，標準模式才套用上限
-        if not self.pullback_entry and self.max_ema_dev > 0 and em_now > 0:
+        # 乖離率過濾：收盤距 EMA20 過遠則視為追高，跳過
+        if self.max_ema_dev > 0 and em_now > 0:
             dev = (price - em_now) / em_now
             if dev > self.max_ema_dev:
                 return None
 
-        # 量能確認
+        # 量能不得嚴重萎縮
         avg_vol = volume.iloc[-6:-1].mean()
         vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
-        if self.pullback_entry:
-            # 回調模式：量不得異常放大（> 2× 均量視為主力出貨，跌穿風險高）
-            # 不要求量縮——量縮與趨勢跟蹤本意背離，且會壓低 confidence
-            if self.vol_confirm and vol_ratio >= 2.0:
-                return None
-        else:
-            # 標準模式：量不得嚴重萎縮
-            if self.vol_confirm and vol_ratio < 0.7:
-                return None
+        if self.vol_confirm and vol_ratio < 0.7:
+            return None
 
         # 信心評分：EMA 差距（0–0.5）+ ADX 強度（0–0.35）+ 量能超量（0–0.15）
         spread = (ef_now - es_now) / es_now if es_now > 0 else 0

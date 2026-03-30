@@ -17,7 +17,6 @@
   --market-filter \
   --early-exit-days     10 \
   --early-exit-lag      0.03 \
-  --pullback-entry \
   --market-ma           20 \
   --time-stop-days      20 \
   --time-stop-min-pct   0.05 \

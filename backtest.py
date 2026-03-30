@@ -878,8 +878,6 @@ def main():
                         help="動態提早出場：持倉 N 天仍虧且跑輸大盤超過門檻則出場（0=停用，建議 10）")
     parser.add_argument("--early-exit-lag", type=float, default=0.03,
                         help="跑輸大盤門檻（預設 0.03 = 3%%），搭配 --early-exit-days 使用")
-    parser.add_argument("--pullback-entry", action="store_true", default=False,
-                        help="回調進場：等 EMA trend 股票回踩 EMA20 ±2%% 且量縮才進場")
     parser.add_argument("--gap-up-threshold", type=float, default=0.03,
                         help="開盤跳空進場過濾：次日開盤跳空 >= 此比例則跳過進場（預設 0.03=3%%；0=停用）。"
                              "與 live entry_filter.gap_up_threshold 對應。")
@@ -930,9 +928,6 @@ def main():
         sys.exit(1)
 
     cfg = make_backtest_config(base_cfg, args.strategies)
-    # CLI 覆寫 ema_trend 策略參數
-    if args.pullback_entry:
-        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["pullback_entry"] = True
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
@@ -1379,6 +1374,16 @@ def main():
     ts.add_row("平均持有天數", f"{s['avg_hold_days']} 天")
     ts.add_row("出場原因",
                "  ".join(f"{k}:{v}筆" for k, v in reason_counts.items()))
+    # A/B 型停損分析（需要 max_gain_pct 欄位）
+    if "max_gain_pct" in realized_df.columns:
+        stop_df = realized_df[realized_df["result"].str.startswith("停損")]
+        if not stop_df.empty:
+            type_a = stop_df[stop_df["max_gain_pct"] < 2.0]   # 進場就跌，入場訊號問題
+            type_b = stop_df[stop_df["max_gain_pct"] >= 2.0]  # 漲了又拉回，出場邏輯問題
+            ts.add_row("停損 A 型[dim](max<2%)[/dim]",
+                       f"[red]{len(type_a)}筆[/red]  [dim]入場訊號問題[/dim]")
+            ts.add_row("停損 B 型[dim](max≥2%)[/dim]",
+                       f"[yellow]{len(type_b)}筆[/yellow]  [dim]出場邏輯問題[/dim]")
     console.print(ts)
 
     # ════════════════════════════════════════
@@ -1466,6 +1471,7 @@ def main():
             t.add_column("張數",    justify="right")
             t.add_column("買入價",  justify="right")
             t.add_column("賣出價",  justify="right")
+            t.add_column("最高%",   justify="right")
             t.add_column("損益%",   justify="right")
             t.add_column("淨損益",  justify="right")
             t.add_column("信心",    justify="right")
@@ -1474,11 +1480,13 @@ def main():
             for _, r in rows.iterrows():
                 clr = "green" if r["net_pnl_dollars"] > 0 else "red"
                 conf = r.get("confidence", float("nan"))
+                mg = r.get("max_gain_pct", float("nan"))
                 t.add_row(
                     str(r["code"]), str(r.get("name", "")),
                     str(r["entry_date"]), str(r["exit_date"]),
                     f"{r['hold_days']}天", f"{int(r['lots'])}{'股' if r.get('odd_lot') else '張'}",
                     f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
+                    f"[dim]+{mg:.1f}%[/dim]" if mg == mg else "—",
                     f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
                     f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
                     f"{conf:.2f}" if conf == conf else "—",
