@@ -1,26 +1,20 @@
 #!/usr/bin/env bash
 # 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
+# 風控參數（stop-loss / trail / time-stop / min-rs / breadth-min）
+# 已在 tech/config/config.yaml 設定，與 live trading 共用同一份。
 
-.venv/bin/python backtest.py --show-skipped \
-  --no-db   \
-  --start          2022-01-01 \
+.venv/bin/python backtest.py \
+  --config         tech/config/config.yaml \
+  --conf-tiers     "0.9:50,0.7:30,0:10" \
+  --show-skipped   \
+  --start          2025-01-01 \
   --capital        1000000 \
   --strategies     ema_trend \
-  --stop-loss      8 \
-  --trail-stop     0.10 \
-  --trail-stop-bull     0.18 \
-  --trail-stop-rs-bonus 0.05 \
-  --trail-activation    0.08 \
   --max-positions  20 \
   --position-pct   0.30 \
   --stocks         60 \
   --max-price      2000 \
-  --min-rs         0.05 \
   --market-filter \
-  --market-ma      20 \
-  --time-stop-days      20 \
-  --time-stop-min-pct   0.05 \
   --breadth-filter \
-  --breadth-min         0.50 \
-  --slippage            0.002 \
-  --max-vol-pct         0.03
+  --slippage       0.002 \
+  --max-vol-pct    0.03
