@@ -15,6 +15,35 @@ class MarketFilter:
         self.ma_period = cfg.get("ma_period", 20)
         self.feed = feed
 
+    def check_breadth(self, candidates: list[dict], feed, min_ratio: float = 0.0) -> bool:
+        """
+        市場廣度過濾：候選股中站上 EMA20 的比例需 >= min_ratio 才允許開倉。
+        min_ratio=0 時直接回傳 True（停用）。
+        """
+        if min_ratio <= 0:
+            return True
+        above = total = 0
+        for c in candidates[:30]:  # 只取前 30 檔，避免拖慢週期
+            df = feed.get_kbars(c["code"], lookback_days=25, use_cache=True)
+            if df is None or len(df) < 20:
+                continue
+            ema20 = float(df["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
+            close = float(df["Close"].iloc[-1])
+            above += int(close > ema20)
+            total += 1
+        if total < 5:
+            logger.info("市場廣度：樣本不足，略過廣度過濾")
+            return True
+        ratio = above / total
+        if ratio < min_ratio:
+            logger.info(
+                f"市場廣度不足：{above}/{total}={ratio:.0%} 站上EMA20 "
+                f"< 門檻{min_ratio:.0%}，暫停開倉"
+            )
+            return False
+        logger.info(f"市場廣度正常：{above}/{total}={ratio:.0%} 站上EMA20")
+        return True
+
     def allow_long(self) -> bool:
         if not self.enabled:
             return True

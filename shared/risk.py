@@ -46,7 +46,11 @@ class RiskManager:
             return False
         return True
 
-    def check_exit_conditions(self, position) -> str | None:
+    def check_exit_conditions(self, position, open_price: float = 0.0) -> str | None:
+        # Gap stop：開盤已跳空穿停損，優先出場（比 tick 更早觸發，以開盤價成交）
+        if open_price > 0 and open_price <= position.stop_loss:
+            return "gap_stop"
+
         # 移動停損（優先於固定停損，保護已累積的獲利）
         trail_cfg = self.cfg.get("trailing_stop", {})
         if position.trailing_active and trail_cfg:

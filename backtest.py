@@ -318,6 +318,7 @@ def simulate_trades(
     time_stop_min_pct: float = 0.05,
     breadth_allow: dict = None,
     slippage_pct: float = 0.002,
+    gap_up_threshold: float = 0.0,
     skipped_out: list = None,
 ) -> list[dict]:
     """
@@ -515,6 +516,22 @@ def simulate_trades(
             entry_price = next_open * (1 + slippage_pct)
             stop   = entry_price * (1 - stop_loss_pct)
             target = entry_price * (1 + take_profit_pct)
+
+            # 開盤跳空過濾：次日開盤跳空 >= threshold 視為噴出，跳過進場
+            # 與 live 的 _is_gap_up_blocked 邏輯一致（回測無法確認量能，保守全跳）
+            if gap_up_threshold > 0 and current_price > 0:
+                gap = (next_open - current_price) / current_price
+                if gap >= gap_up_threshold:
+                    if skipped_out is not None:
+                        skipped_out.append({
+                            "code": code, "signal_date": row_date,
+                            "skip_reason": f"跳空進場({gap:+.1%})",
+                            "entry_price": round(entry_price, 2),
+                            "strategy": sig.strategy,
+                            "exit_price": None, "exit_reason": None,
+                            "hold_days": 0, "pnl_pct": None, "max_gain_pct": None,
+                        })
+                    continue
 
             # RS 仍以訊號日收盤計算（代表當下可觀察到的強弱）
             rs_score = 0.0
@@ -835,6 +852,9 @@ def main():
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
                         help="時間停損最低漲幅門檻（預設 0.05 = 5%%），搭配 --time-stop-days 使用")
+    parser.add_argument("--gap-up-threshold", type=float, default=0.03,
+                        help="開盤跳空進場過濾：次日開盤跳空 >= 此比例則跳過進場（預設 0.03=3%%；0=停用）。"
+                             "與 live entry_filter.gap_up_threshold 對應。")
     parser.add_argument("--slippage", type=float, default=0.002,
                         help="單邊滑價率（預設 0.002 = 0.2%%），買入多付、賣出少收")
     parser.add_argument("--max-vol-pct", type=float, default=0.03,
@@ -1138,6 +1158,7 @@ def main():
                 time_stop_min_pct=args.time_stop_min_pct,
                 breadth_allow=breadth_map,
                 slippage_pct=args.slippage,
+                gap_up_threshold=args.gap_up_threshold,
                 skipped_out=all_skipped_signals,
             )
             for t in trades:

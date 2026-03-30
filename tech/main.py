@@ -390,6 +390,14 @@ class TradingSystem:
                 console.print(stbl)
                 signals = []
 
+            breadth_min = self.config.get("market_filter", {}).get("breadth_min", 0.0)
+            if signals and breadth_min > 0:
+                if not self.market_filter.check_breadth(candidates, self.feed, breadth_min):
+                    self.logger.info(f"市場廣度不足（門檻 {breadth_min:.0%}），本週期不開新倉")
+                    for s in signals:
+                        self.logger.info(f"[訊號-廣度過濾] {s.code} 信心={s.confidence:.2f}")
+                    signals = []
+
             if signals:
                 self._execute_buy_signals(signals)
 
@@ -536,7 +544,8 @@ class TradingSystem:
             pos = self.portfolio.get_position(code)
             if pos is None:
                 continue
-            reason = self.risk.check_exit_conditions(pos)
+            open_price = snap.get("open", 0.0)
+            reason = self.risk.check_exit_conditions(pos, open_price=open_price)
             if reason and self.portfolio.try_mark_exit(code):
                 self._execute_sell(code, pos, reason)
 
