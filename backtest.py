@@ -316,6 +316,8 @@ def simulate_trades(
     min_rs_entry: float = 0.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
+    early_exit_days: int = 0,
+    early_exit_lag: float = 0.03,
     breadth_allow: dict = None,
     slippage_pct: float = 0.002,
     gap_up_threshold: float = 0.0,
@@ -420,6 +422,17 @@ def simulate_trades(
                 if max_hold_days > 0 and hold >= max_hold_days:
                     exit_price  = current_price * (1 - slippage_pct)
                     exit_reason = "到期出場"
+                elif (early_exit_days > 0 and hold >= early_exit_days
+                      and pnl_pct_cur < 0 and _mkt_dates):
+                    # 早出場：持倉 N 天仍虧損且跑輸大盤超過門檻 → 廢訊號，不必等時間停損
+                    mkt_entry = position.get("mkt_close_at_entry")
+                    if mkt_entry and mkt_entry > 0:
+                        _mp = bisect.bisect_right(_mkt_dates, row_date) - 1
+                        if _mp >= 0:
+                            mkt_ret = (_mkt_closes[_mp] - mkt_entry) / mkt_entry
+                            if pnl_pct_cur - mkt_ret < -early_exit_lag:
+                                exit_price  = current_price * (1 - slippage_pct)
+                                exit_reason = "時間停損(跑輸大盤)"
                 elif (time_stop_days > 0 and hold >= time_stop_days
                       and pnl_pct_cur < time_stop_min_pct):
                     # 持倉超過 N 天但漲幅未達門檻 → 佔位不賺，強制出場
@@ -565,6 +578,10 @@ def simulate_trades(
                                         "strategy": sig.strategy, **_fwd})
                 continue
 
+            # 記錄進場當天大盤收盤（用於動態時間停損的相對表現比較）
+            _mpos = bisect.bisect_right(_mkt_dates, next_date) - 1
+            mkt_close_at_entry = _mkt_closes[_mpos] if (_mkt_closes and _mpos >= 0) else None
+
             position = {
                 "entry_date": next_date,
                 "entry_price": entry_price,
@@ -575,6 +592,7 @@ def simulate_trades(
                 "strategy": sig.strategy,
                 "confidence": sig.confidence,
                 "rs_score": rs_score,
+                "mkt_close_at_entry": mkt_close_at_entry,
             }
 
     return trades
@@ -856,6 +874,10 @@ def main():
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
                         help="時間停損最低漲幅門檻（預設 0.05 = 5%%），搭配 --time-stop-days 使用")
+    parser.add_argument("--early-exit-days", type=int, default=0,
+                        help="動態提早出場：持倉 N 天仍虧且跑輸大盤超過門檻則出場（0=停用，建議 10）")
+    parser.add_argument("--early-exit-lag", type=float, default=0.03,
+                        help="跑輸大盤門檻（預設 0.03 = 3%%），搭配 --early-exit-days 使用")
     parser.add_argument("--gap-up-threshold", type=float, default=0.03,
                         help="開盤跳空進場過濾：次日開盤跳空 >= 此比例則跳過進場（預設 0.03=3%%；0=停用）。"
                              "與 live entry_filter.gap_up_threshold 對應。")
@@ -1160,6 +1182,8 @@ def main():
                 min_rs_entry=args.min_rs,
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
+                early_exit_days=args.early_exit_days,
+                early_exit_lag=args.early_exit_lag,
                 breadth_allow=breadth_map,
                 slippage_pct=args.slippage,
                 gap_up_threshold=args.gap_up_threshold,
