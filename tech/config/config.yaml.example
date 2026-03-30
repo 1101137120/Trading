@@ -115,7 +115,7 @@ strategies:
     adx_min: 20            # ADX 低於此值視為橫盤，不進場（0 = 停用）
     max_ema_dev: 0.08      # 收盤距 EMA20 乖離率上限，超過視為追高不進場（0 = 停用）
     min_atr_pct: 2.0       # ATR% 下限，低於此值視為死魚股不進場（0 = 停用）
-    pullback_entry: false  # true = 回調進場模式：等價格回踩 EMA20 ±pullback_band% 且量縮才進
+    pullback_entry: false  # true = 回調進場：等價格回踩 EMA20 ±pullback_band%（量異常放大才跳過）
     pullback_band: 0.02    # 回踩允許偏差 ±2%（pullback_entry: true 時才有效）
 
   # KD 黃金交叉：K 從超賣區上穿 D + RSI 回升（短線反彈）

@@ -83,8 +83,9 @@ class EmaTrendStrategy(BaseStrategy):
         avg_vol = volume.iloc[-6:-1].mean()
         vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
         if self.pullback_entry:
-            # 回調模式：量需萎縮（止盈賣壓），量放大視為主力出貨跳過
-            if self.vol_confirm and vol_ratio >= 1.0:
+            # 回調模式：量不得異常放大（> 2× 均量視為主力出貨，跌穿風險高）
+            # 不要求量縮——量縮與趨勢跟蹤本意背離，且會壓低 confidence
+            if self.vol_confirm and vol_ratio >= 2.0:
                 return None
         else:
             # 標準模式：量不得嚴重萎縮
