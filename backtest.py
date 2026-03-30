@@ -878,6 +878,8 @@ def main():
                         help="動態提早出場：持倉 N 天仍虧且跑輸大盤超過門檻則出場（0=停用，建議 10）")
     parser.add_argument("--early-exit-lag", type=float, default=0.03,
                         help="跑輸大盤門檻（預設 0.03 = 3%%），搭配 --early-exit-days 使用")
+    parser.add_argument("--pullback-entry", action="store_true", default=False,
+                        help="回調進場：等 EMA trend 股票回踩 EMA20 ±2%% 且量縮才進場")
     parser.add_argument("--gap-up-threshold", type=float, default=0.03,
                         help="開盤跳空進場過濾：次日開盤跳空 >= 此比例則跳過進場（預設 0.03=3%%；0=停用）。"
                              "與 live entry_filter.gap_up_threshold 對應。")
@@ -928,6 +930,9 @@ def main():
         sys.exit(1)
 
     cfg = make_backtest_config(base_cfg, args.strategies)
+    # CLI 覆寫 ema_trend 策略參數
+    if args.pullback_entry:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["pullback_entry"] = True
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
