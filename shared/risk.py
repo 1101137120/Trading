@@ -2,6 +2,7 @@
 風險管理模組：計算停損停利價位、部位大小
 """
 import logging
+from datetime import datetime
 
 logger = logging.getLogger("risk")
 
@@ -46,7 +47,9 @@ class RiskManager:
             return False
         return True
 
-    def check_exit_conditions(self, position, open_price: float = 0.0) -> str | None:
+    def check_exit_conditions(
+        self, position, open_price: float = 0.0, is_bull: bool = False
+    ) -> str | None:
         # Gap stop：開盤已跳空穿停損，優先出場（比 tick 更早觸發，以開盤價成交）
         if open_price > 0 and open_price <= position.stop_loss:
             return "gap_stop"
@@ -55,8 +58,15 @@ class RiskManager:
         trail_cfg = self.cfg.get("trailing_stop", {})
         if position.trailing_active and trail_cfg:
             trail_pct = trail_cfg.get("trail_pct", 0.03)
+            # 牛市（MA20>MA60）時用更寬的 trail，讓趨勢跑更遠
+            bull_pct = trail_cfg.get("trail_stop_bull_pct", 0.0)
+            eff_trail = (bull_pct if (is_bull and bull_pct > 0) else trail_pct)
+            # 強勢個股加成：RS > 0.1 再多給一點空間
+            rs_bonus = trail_cfg.get("trail_stop_rs_bonus", 0.0)
+            if rs_bonus > 0 and getattr(position, "rs_score", 0.0) > 0.1:
+                eff_trail += rs_bonus
             if position.highest_price > 0:
-                trail_stop = round(position.highest_price * (1 - trail_pct), 2)
+                trail_stop = round(position.highest_price * (1 - eff_trail), 2)
                 if position.current_price <= trail_stop:
                     return "trailing_stop"
 
@@ -65,6 +75,17 @@ class RiskManager:
         if position.should_take_profit:
             return "take_profit"
         return None
+
+    def check_time_stop(self, position) -> bool:
+        """時間停損：持倉超過 N 天且漲幅未達門檻，強制出場（避免資金被死股佔用）。"""
+        days_limit = self.cfg.get("time_stop_days", 0)
+        if days_limit <= 0:
+            return False
+        hold_days = (datetime.now() - position.entry_time).days
+        if hold_days < days_limit:
+            return False
+        min_pct = self.cfg.get("time_stop_min_pct", 0.05)
+        return position.pnl_pct < min_pct
 
     @staticmethod
     def is_limit_up(change_pct: float, threshold: float = 0.09) -> bool:

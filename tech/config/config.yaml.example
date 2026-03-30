@@ -17,7 +17,7 @@ market_filter:
   enabled: true
   proxy_code: "0050"
   ma_period: 10   # 建議 10（快）或 20（穩）；牛市/V型反彈偏好 10
-  breadth_min: 0.0  # 市場廣度門檻：候選股中站上EMA20比例需>=此值才開倉（0=停用；建議0.4）
+  breadth_min: 0.50 # 市場廣度門檻：候選股中站上EMA20比例需>=此值才開倉（0=停用；建議0.4~0.5）
 
 # ── 風控 ──────────────────────────────────────────────────────────────────
 risk:
@@ -39,6 +39,10 @@ risk:
   trailing_stop:
     activation_pct: 0.10   # 獲利達 10% 後啟動移動停損（配合停利 25% 調高）
     trail_pct: 0.05         # 從最高點回落 5% 出場
+    trail_stop_bull_pct: 0.18  # 牛市（MA20>MA60）時改用此值，讓趨勢跑更遠；0=不區分
+    trail_stop_rs_bonus: 0.05  # RS強勢個股（RS>0.1）額外放寬空間；0=停用
+  time_stop_days: 20        # 時間停損：持倉超過N天且漲幅未達門檻強制出場（0=停用）
+  time_stop_min_pct: 0.05   # 時間停損最低漲幅門檻（5%），搭配 time_stop_days 使用
   max_sell_retries: 5      # 賣出失敗達此次數後停止自動重試，需人工確認
   loss_cooldown_days: 5    # 個股停損出場後冷卻天數，期間不再進場；0 = 停用
   order_chase:

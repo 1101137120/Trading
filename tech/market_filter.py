@@ -44,6 +44,18 @@ class MarketFilter:
         logger.info(f"市場廣度正常：{above}/{total}={ratio:.0%} 站上EMA20")
         return True
 
+    def is_bull_trend(self) -> bool:
+        """牛市判斷：0050 MA20 > MA60（中期上行趨勢確立）。用於調寬移動停損。"""
+        if not self.enabled:
+            return False
+        df = self.feed.get_kbars(self.proxy_code, lookback_days=70, use_cache=True)
+        if df is None or len(df) < 60:
+            return False
+        close = df["Close"].astype(float)
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma60 = close.rolling(60).mean().iloc[-1]
+        return bool(ma20 > ma60)
+
     def allow_long(self) -> bool:
         if not self.enabled:
             return True

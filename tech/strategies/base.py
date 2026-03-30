@@ -15,6 +15,7 @@ class Signal:
     confidence: float
     reason: str
     strategy: str
+    rs_score: float = 0.0
 
 
 class BaseStrategy(ABC):

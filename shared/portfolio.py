@@ -28,6 +28,7 @@ class PendingOrder:
     trade_ref: object = None
     chase_count: int = 0       # 已追單次數
     odd_lot: bool = False      # True = 零股（股），False = 整張（張）
+    rs_score: float = 0.0      # 進場當時的相對強弱分數（用於移動停損加成）
 
     @property
     def order_value(self) -> float:
@@ -49,6 +50,7 @@ class Position:
     trailing_active: bool = False
     highest_price: float = 0.0     # 啟動後追蹤的最高價
     odd_lot: bool = False          # True = 零股（股），False = 整張（張）
+    rs_score: float = 0.0          # 進場當時的相對強弱分數（用於移動停損加成）
 
     @property
     def _lot_multiplier(self) -> int:
@@ -232,6 +234,7 @@ class Portfolio:
             code=code, direction=po.action, quantity=fill_qty, entry_price=fill_price,
             entry_time=datetime.now(), stop_loss=po.stop_loss, take_profit=po.take_profit,
             current_price=fill_price, trade_ref=po.trade_ref, odd_lot=po.odd_lot,
+            rs_score=po.rs_score,
         )
         self.add_position(pos)
         unit = "股" if po.odd_lot else "張"

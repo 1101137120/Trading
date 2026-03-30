@@ -179,7 +179,8 @@ class TradingSystem:
         self.engine: StrategyEngine = None
         self.market_filter: MarketFilter = None
         self._exit_queue: queue.Queue = queue.Queue()
-        self._code_to_name: dict = {}  # 代碼 → 股票名稱，篩選時更新
+        self._code_to_name: dict = {}   # 代碼 → 股票名稱，篩選時更新
+        self._is_bull_market: bool = False  # 0050 MA20>MA60，每週期更新一次
 
     def setup(self) -> bool:
         console.print("[bold cyan]正在連線永豐金...[/bold cyan]")
@@ -343,7 +344,7 @@ class TradingSystem:
         # 除息日暫停停損，避免除息貼息被誤判為下殺
         if self.exdiv.is_ex_dividend_today(code):
             return
-        reason = self.risk.check_exit_conditions(pos)
+        reason = self.risk.check_exit_conditions(pos, is_bull=self._is_bull_market)
         if reason and self.portfolio.try_mark_exit(code):
             self._exit_queue.put((code, reason))
 
@@ -363,6 +364,7 @@ class TradingSystem:
             if bal:
                 self.portfolio.update_capital(bal.get("balance", 0))
 
+            self._is_bull_market = self.market_filter.is_bull_trend()
             self._drain_exit_queue()
             self._check_pending_sells()
             self._check_pending_orders()
@@ -534,6 +536,7 @@ class TradingSystem:
         ]
         if not codes_to_check:
             return
+        is_bull = self.market_filter.is_bull_trend()
         snapshots = self.feed.get_snapshots_by_codes(codes_to_check)
         for code in codes_to_check:
             snap = snapshots.get(code)
@@ -545,7 +548,9 @@ class TradingSystem:
             if pos is None:
                 continue
             open_price = snap.get("open", 0.0)
-            reason = self.risk.check_exit_conditions(pos, open_price=open_price)
+            reason = self.risk.check_exit_conditions(pos, open_price=open_price, is_bull=is_bull)
+            if reason is None and self.risk.check_time_stop(pos):
+                reason = "time_stop"
             if reason and self.portfolio.try_mark_exit(code):
                 self._execute_sell(code, pos, reason)
 
@@ -594,19 +599,21 @@ class TradingSystem:
             df = self.feed.get_kbars(code, lookback_days=lookback + 30)
             if df is None:
                 continue
-            # RS 過濾：近 20 日超額報酬需 >= min_rs
-            if min_rs > 0 and len(df) >= 21:
+            # RS 計算（無論是否過濾，都算出來存入訊號供出場邏輯使用）
+            rs_score = 0.0
+            if len(df) >= 21:
                 close = df["Close"].astype(float)
                 base = close.iloc[-21]
                 if base > 0:
                     rs_score = float((close.iloc[-1] - base) / base) - mkt_ret
-                    if rs_score < min_rs:
-                        self.logger.info(f"跳過 {code} {code_to_name.get(code,'')}：RS {rs_score:+.3f} < {min_rs}")
-                        skipped_rs += 1
-                        continue
+            if min_rs > 0 and rs_score < min_rs:
+                self.logger.info(f"跳過 {code} {code_to_name.get(code,'')}：RS {rs_score:+.3f} < {min_rs}")
+                skipped_rs += 1
+                continue
             evaluated += 1
             sig = self.engine.evaluate(code, df)
             if sig and sig.action == "Buy":
+                sig.rs_score = rs_score
                 signals.append(sig)
 
         signals.sort(key=lambda s: s.confidence, reverse=True)
@@ -729,6 +736,7 @@ class TradingSystem:
                 code=code, action="Buy", quantity=qty, price=price,
                 stop_loss=stop_loss, take_profit=take_profit,
                 placed_time=datetime.now(), trade_ref=trade, odd_lot=is_odd_lot,
+                rs_score=signal.rs_score,
             )
             self.portfolio.add_pending(po)
             mode = "[模擬] " if self.dry_run else ""
