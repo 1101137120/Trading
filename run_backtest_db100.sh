@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
-
-.venv/bin/python backtest.py --show-skipped --no-db \
-  --start               2025-01-01 \
+# DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差
+.venv/bin/python backtest.py --show-skipped \
+  --start               2022-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
   --stop-loss           8 \

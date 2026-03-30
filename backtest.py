@@ -68,7 +68,7 @@ def adjust_splits(df: pd.DataFrame, threshold: float = 0.25) -> pd.DataFrame:
             ratio = curr / prev
             # 調整 i 之前（含 i-1）所有 K 棒的價格
             for col in price_cols:
-                df[col].iloc[:i] = df[col].iloc[:i] * ratio
+                df.iloc[:i, df.columns.get_loc(col)] = df[col].iloc[:i] * ratio
             # 同步更新 closes 以供後續迭代使用
             closes = df["Close"].values
 
@@ -146,29 +146,29 @@ def build_breadth_map(
         for row in df["ts"]
     })
 
-    # 預先算好每檔的 EMA 序列 {code: {date: ema_val}}
-    ema_by_code: dict[str, dict] = {}
+    # 預先算好每檔的 EMA 與收盤 {code: {date: (close, ema_val)}}
+    lookup: dict[str, dict] = {}
     for code, df in all_kbars.items():
         ema_series = _ema(df["Close"].astype(float), ema_period)
         date_map = {}
-        for ts, val in zip(df["ts"], ema_series):
+        for ts, close_val, ema_val in zip(df["ts"], df["Close"], ema_series):
             d = ts.date() if hasattr(ts, "date") else ts
-            date_map[d] = val
-        ema_by_code[code] = date_map
+            date_map[d] = (float(close_val), ema_val)
+        lookup[code] = date_map
 
     breadth_allow: dict[date, bool] = {}
     for d in all_dates:
         above = 0
         total = 0
-        for code, date_map in ema_by_code.items():
-            ema_val = date_map.get(d)
-            # 取當日收盤
-            df = all_kbars[code]
-            row = df[df["ts"].dt.date == d]
-            if row.empty or ema_val is None or pd.isna(ema_val):
+        for date_map in lookup.values():
+            entry = date_map.get(d)
+            if entry is None:
+                continue
+            close_val, ema_val = entry
+            if ema_val is None or pd.isna(ema_val):
                 continue
             total += 1
-            if float(row["Close"].iloc[-1]) > ema_val:
+            if close_val > ema_val:
                 above += 1
         ratio = above / total if total > 0 else 1.0
         breadth_allow[d] = ratio >= min_ratio
@@ -431,6 +431,7 @@ def simulate_trades(
 
             if exit_reason:
                 pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"]
+                max_gain_pct = (position["peak_price"] - position["entry_price"]) / position["entry_price"]
                 trades.append({
                     "code": code,
                     "entry_date": position["entry_date"],
@@ -438,6 +439,7 @@ def simulate_trades(
                     "entry_price": position["entry_price"],
                     "exit_price": exit_price,
                     "pnl_pct": round(pnl_pct * 100, 2),
+                    "max_gain_pct": round(max_gain_pct * 100, 2),
                     "hold_days": hold,
                     "result": exit_reason,
                     "strategy": position["strategy"],
@@ -533,7 +535,9 @@ def simulate_trades(
                         })
                     continue
 
-            # RS 仍以訊號日收盤計算（代表當下可觀察到的強弱）
+            # RS 以訊號日收盤計算（代表當下可觀察到的強弱）
+            # EMA trend 是短中期動能策略，用 20 根（約 1 個月）RS 過濾「現在有沒有在動」
+            # 長期 RS 與 EMA60 高度重疊，改用長期反而引入趨勢末段股票
             rs_score = 0.0
             lookback = min(20, i)
             if lookback >= 5 and df["Close"].iloc[i - lookback] > 0:
@@ -1485,8 +1489,8 @@ def main():
         if all_missed:
             # 只顯示假設持有能獲利的（pnl_pct > 0），按報酬排序
             profitable = sorted(
-                [m for m in all_missed if m.get("pnl_pct", 0) > 0],
-                key=lambda x: x.get("pnl_pct", 0), reverse=True,
+                [m for m in all_missed if (m.get("pnl_pct") or 0) > 0],
+                key=lambda x: x.get("pnl_pct") or 0, reverse=True,
             )
             console.rule(
                 f"[bold yellow]跳過的機會（共 {len(all_missed)} 筆，其中獲利 {len(profitable)} 筆）[/bold yellow]"

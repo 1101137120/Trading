@@ -50,6 +50,11 @@ RETRY_MAX     = 3
 # 抓取股票清單
 # ──────────────────────────────────────────────
 
+def _is_regular_stock(code: str) -> bool:
+    """只保留 4 位數純數字普通股，排除 ETF/權證/DR/結構型商品。"""
+    return code.isdigit() and len(code) == 4
+
+
 def fetch_listed_stocks() -> list[dict]:
     """
     取得當前上市（TSE）股票清單。
@@ -58,8 +63,8 @@ def fetch_listed_stocks() -> list[dict]:
     snap = fetch_tse_daily_all()
     result = []
     for code, info in snap.items():
-        if code.startswith("00"):
-            continue   # 排除 ETF
+        if not _is_regular_stock(code):
+            continue
         result.append({
             "code":   code,
             "name":   info.get("name", ""),
@@ -81,9 +86,7 @@ def fetch_otc_stocks() -> list[dict]:
         for row in rows:
             code = str(row.get("SecuritiesCompanyCode", "")).strip()
             name = str(row.get("CompanyName", "")).strip()
-            if not code or not code.isdigit():
-                continue
-            if code.startswith("00"):
+            if not _is_regular_stock(code):
                 continue
             result.append({"code": code, "name": name, "market": "OTC"})
     except Exception as e:
@@ -122,7 +125,7 @@ def fetch_delisted_tse() -> list[dict]:
             code    = str(row[idx_code]).strip()
             name    = str(row[idx_name]).strip()
             delist  = str(row[idx_delist]).strip()
-            if not code or not code.isdigit():
+            if not _is_regular_stock(code):
                 continue
             # 轉換民國日期 → 西元（格式：112/03/15）
             delisted_date = _roc_to_ce(delist)
@@ -154,7 +157,7 @@ def fetch_delisted_otc() -> list[dict]:
                 code = vals[0]
                 name = vals[1]
                 delist = vals[2] if len(vals) > 2 else ""
-                if not code.isdigit():
+                if not _is_regular_stock(code):
                     continue
                 result.append({
                     "code":          code,

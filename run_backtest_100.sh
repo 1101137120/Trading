@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
-
-.venv/bin/python backtest.py --show-skipped --no-db \
+.venv/bin/python backtest.py --conf-tiers "0.9:50,0.7:30,0:10" --show-skipped \
   --start               2025-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
@@ -14,12 +12,12 @@
   --position-pct        0.30 \
   --stocks              80 \
   --max-price           2000 \
-  --min-rs              0.05 \
+  --min-rs              0.10 \
   --market-filter \
   --market-ma           20 \
   --time-stop-days      20 \
   --time-stop-min-pct   0.05 \
   --breadth-filter \
-  --breadth-min         0.50 \
+  --breadth-min         0.55 \
   --slippage            0.002 \
   --max-vol-pct         0.03

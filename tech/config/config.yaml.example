@@ -113,6 +113,8 @@ strategies:
     lookback_days: 70
     adx_period: 14         # ADX 計算週期
     adx_min: 20            # ADX 低於此值視為橫盤，不進場（0 = 停用）
+    max_ema_dev: 0.08      # 收盤距 EMA20 乖離率上限，超過視為追高不進場（0 = 停用）
+    min_atr_pct: 2.0       # ATR% 下限，低於此值視為死魚股不進場（0 = 停用）
 
   # KD 黃金交叉：K 從超賣區上穿 D + RSI 回升（短線反彈）
   kd_cross:

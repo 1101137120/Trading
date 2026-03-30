@@ -7,7 +7,7 @@ from typing import Optional
 import logging
 
 from .base import BaseStrategy, Signal
-from .indicators import ema, adx
+from .indicators import ema, adx, atr
 
 logger = logging.getLogger("strategy.ema_trend")
 
@@ -23,7 +23,9 @@ class EmaTrendStrategy(BaseStrategy):
         self.vol_confirm = cfg.get("vol_confirm", True)
         self.lookback = cfg.get("lookback_days", 70)
         self.adx_period = cfg.get("adx_period", 14)
-        self.adx_min    = cfg.get("adx_min", 20)    # < 20 視為橫盤，不進場
+        self.adx_min     = cfg.get("adx_min", 20)    # < 20 視為橫盤，不進場
+        self.max_ema_dev = cfg.get("max_ema_dev", 0.0)  # 收盤距 EMA20 乖離率上限（0=停用）
+        self.min_atr_pct = cfg.get("min_atr_pct", 0.0)  # ATR% 下限，過低視為死魚股（0=停用）
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.ema_slow + self.adx_period + 5
@@ -56,6 +58,18 @@ class EmaTrendStrategy(BaseStrategy):
         if "High" in df.columns and "Low" in df.columns:
             adx_val = adx(df["High"].astype(float), df["Low"].astype(float), close, self.adx_period).iloc[-1]
             if self.adx_min > 0 and (pd.isna(adx_val) or adx_val < self.adx_min):
+                return None
+
+        # ATR% 下限過濾：波動太小的死魚股（金融等）跳過
+        if self.min_atr_pct > 0 and "High" in df.columns and "Low" in df.columns:
+            atr_val = atr(df["High"].astype(float), df["Low"].astype(float), close).iloc[-1]
+            if price > 0 and (atr_val / price) * 100 < self.min_atr_pct:
+                return None
+
+        # 乖離率過濾：收盤距 EMA20 過遠則視為追高，跳過
+        if self.max_ema_dev > 0 and em_now > 0:
+            dev = (price - em_now) / em_now
+            if dev > self.max_ema_dev:
                 return None
 
         # 量能不得嚴重萎縮

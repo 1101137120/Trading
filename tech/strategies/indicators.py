@@ -52,6 +52,17 @@ def adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> 
     return dx.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
 
 
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    """Average True Range（Wilder 平滑法）"""
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
 def kd(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 9):
     """台股 KD 指標（RSV 法，1/3 平滑）"""
     low_n = low.rolling(period).min()

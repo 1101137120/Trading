@@ -164,10 +164,11 @@ def get_all_stocks(conn: duckdb.DuckDBPyConnection) -> list[dict]:
 
 def get_latest_date(code: str, conn: duckdb.DuckDBPyConnection) -> Optional[str]:
     """取得 DB 中某股最新的 K 棒日期（YYYY-MM-DD），無資料回傳 None"""
-    row = conn.execute(
-        "SELECT MAX(date) FROM daily_prices WHERE code=?", [code]
-    ).fetchone()
-    return row[0] if row and row[0] else None
+    # 用 ORDER BY DESC LIMIT 1 避免 DuckDB 1.5.x MAX+WHERE 的 internal error
+    rows = conn.execute(
+        "SELECT date FROM daily_prices WHERE code=? ORDER BY date DESC LIMIT 1", [code]
+    ).fetchall()
+    return rows[0][0] if rows else None
 
 
 def db_stats(db_path: Path = DB_PATH) -> dict:
