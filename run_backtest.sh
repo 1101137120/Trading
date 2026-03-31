@@ -2,7 +2,7 @@
 # 回測執行腳本 — 直接編輯參數後 ./run_backtest.sh
 
 .venv/bin/python backtest.py --show-skipped --no-db \
-  --start               2025-01-01 \
+  --start               2022-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
   --stop-loss           8 \
@@ -16,6 +16,8 @@
   --max-price           2000 \
   --min-rs              0.05 \
   --market-filter \
+  --early-exit-days     10 \
+  --early-exit-lag      0.03 \
   --market-ma           20 \
   --time-stop-days      20 \
   --time-stop-min-pct   0.05 \

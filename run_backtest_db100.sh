@@ -30,4 +30,4 @@
   --dev-high-thr        0.05 \
   --dev-low-pct         0.15 \
   --dev-high-mult       1.4 \
-  --market-max-20d-gain 0.12
+  --market-max-20d-gain 0.10
