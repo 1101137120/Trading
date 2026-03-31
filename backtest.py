@@ -314,6 +314,8 @@ def simulate_trades(
     trail_stop_bull_pct: float = 0.0,
     trail_stop_rs_bonus: float = 0.0,
     min_rs_entry: float = 0.0,
+    max_rs_entry: float = 0.0,
+    market_max_20d_gain: float = 0.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
     early_exit_days: int = 0,
@@ -458,6 +460,7 @@ def simulate_trades(
                     "strategy": position["strategy"],
                     "confidence": position.get("confidence", 0.30),
                     "rs_score": position.get("rs_score", 0.0),
+                    "ema_dev": position.get("ema_dev", 0.0),
                     "day_volume": position.get("day_volume", 0),
                 })
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
@@ -480,6 +483,27 @@ def simulate_trades(
                                             "skip_reason": "大盤偏空", "entry_price": round(_ep, 2),
                                             "strategy": sig.strategy, **_fwd})
             continue
+
+        # ── 空倉：大盤近20日過熱過濾 ──
+        if market_max_20d_gain > 0 and _mkt_dates:
+            _mp = bisect.bisect_right(_mkt_dates, row_date) - 1
+            _mp20 = _mp - 20
+            if _mp >= 0 and _mp20 >= 0:
+                _mkt_20d_ret = (_mkt_closes[_mp] - _mkt_closes[_mp20]) / _mkt_closes[_mp20]
+                if _mkt_20d_ret > market_max_20d_gain:
+                    if skipped_out is not None and i + 1 < len(df):
+                        df_slice = df.iloc[: i + 1].copy()
+                        sig = engine.evaluate(code, df_slice)
+                        if sig and sig.action == "Buy":
+                            _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                            if _ep > 0:
+                                _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                                     _ep * (1 + take_profit_pct), end, slippage_pct)
+                                skipped_out.append({"code": code, "signal_date": row_date,
+                                                    "skip_reason": f"大盤過熱(+{_mkt_20d_ret*100:.0f}%)",
+                                                    "entry_price": round(_ep, 2),
+                                                    "strategy": sig.strategy, **_fwd})
+                    continue
 
         # ── 空倉：市場廣度過濾 ──
         if breadth_allow is not None and not breadth_allow.get(row_date, True):
@@ -568,7 +592,7 @@ def simulate_trades(
                 else:
                     rs_score = stock_ret
 
-            # RS 過濾：個股近期跑輸大盤超過門檻則不進場
+            # RS 過濾：跑輸大盤（下限）或趨勢末段（上限）皆不進場
             if min_rs_entry > 0 and rs_score < min_rs_entry:
                 if skipped_out is not None:
                     _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
@@ -577,10 +601,23 @@ def simulate_trades(
                                         "entry_price": round(entry_price, 2),
                                         "strategy": sig.strategy, **_fwd})
                 continue
+            if max_rs_entry > 0 and rs_score > max_rs_entry:
+                if skipped_out is not None:
+                    _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
+                    skipped_out.append({"code": code, "signal_date": row_date,
+                                        "skip_reason": f"RS過高({rs_score:+.3f})",
+                                        "entry_price": round(entry_price, 2),
+                                        "strategy": sig.strategy, **_fwd})
+                continue
 
             # 記錄進場當天大盤收盤（用於動態時間停損的相對表現比較）
             _mpos = bisect.bisect_right(_mkt_dates, next_date) - 1
             mkt_close_at_entry = _mkt_closes[_mpos] if (_mkt_closes and _mpos >= 0) else None
+
+            # 計算進場當下 EMA20 乖離率（用於動態倉位分層）
+            _close_ser = df["Close"].astype(float).iloc[:i + 1]
+            _ema20_now = _close_ser.ewm(span=20, adjust=False).mean().iloc[-1]
+            ema_dev_at_entry = ((current_price - _ema20_now) / _ema20_now) if _ema20_now > 0 else 0.0
 
             position = {
                 "entry_date": next_date,
@@ -592,6 +629,7 @@ def simulate_trades(
                 "strategy": sig.strategy,
                 "confidence": sig.confidence,
                 "rs_score": rs_score,
+                "ema_dev": ema_dev_at_entry,
                 "mkt_close_at_entry": mkt_close_at_entry,
             }
 
@@ -602,18 +640,19 @@ def simulate_trades(
 # 資金模擬（含張數、實際損益）
 # ──────────────────────────────────────────────
 
-def _resolve_alloc(capital: float, confidence: float,
-                   position_pct: float,
-                   conf_tiers: list[tuple[float, float]] | None) -> float:
+def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
+                   dev_low_thr: float = 0.03, dev_high_thr: float = 0.05,
+                   dev_low_pct: float = 0.15, dev_high_mult: float = 1.4) -> float:
     """
-    根據訊號信心度決定本次倉位金額。
-    conf_tiers: [(threshold, pct), ...] 已按 threshold 由高到低排序。
+    根據進場當下 EMA20 乖離率決定倉位：
+      乖離 < dev_low_thr  → 縮倉 dev_low_pct（貼近 EMA，動能不足）
+      乖離 > dev_high_thr → 加碼 position_pct × dev_high_mult（強動能，上限 50%）
+      中間               → 標準 position_pct
     """
-    if not conf_tiers:
-        return capital * position_pct
-    for threshold, pct in conf_tiers:
-        if confidence >= threshold:
-            return capital * pct
+    if dev_low_thr > 0 and ema_dev < dev_low_thr:
+        return capital * dev_low_pct
+    if dev_high_thr > 0 and ema_dev > dev_high_thr:
+        return capital * min(position_pct * dev_high_mult, 0.50)
     return capital * position_pct
 
 
@@ -627,12 +666,15 @@ def portfolio_simulation(
     tax_stock_rate: float = 0.003,
     tax_etf_rate: float = 0.001,
     max_vol_pct: float = 0.03,
-    conf_tiers: list[tuple[float, float]] | None = None,
+    dev_low_thr: float = 0.03,
+    dev_high_thr: float = 0.05,
+    dev_low_pct: float = 0.15,
+    dev_high_mult: float = 1.4,
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
     規則：
-    - 每筆最多投入 position_pct（或 conf_tiers 對應比例）× 當下可用資金
+    - 每筆倉位由 EMA20 乖離率動態決定（<low_thr縮倉/中間標準/>high_thr加碼）
     - 同時持倉不超過 max_positions
     - 1 張 = 1000 股；若預算不足 1 張則自動改用零股（與實盤一致）
     """
@@ -673,7 +715,8 @@ def portfolio_simulation(
         if len(active) >= max_positions:
             continue
 
-        alloc = _resolve_alloc(capital, trade.get("confidence", 0), position_pct, conf_tiers)
+        alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
+                               dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult)
         price = trade["entry_price"]
         one_lot_cost = price * 1000
 
@@ -845,6 +888,8 @@ def main():
                         help="可視化 log 目錄，每次跑完存一份完整輸出（預設 backtest_logs/）")
     parser.add_argument("--market-ma", type=int, default=20,
                         help="大盤過濾 MA 週期（預設 20）")
+    parser.add_argument("--market-max-20d-gain", type=float, default=0.0,
+                        help="大盤近20日漲幅上限：超過此值視為市場過熱停止進場（建議 0.12=12%%；0=停用）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
                         help="個股停損後冷卻天數（預設 0=停用），建議 3~7")
     parser.add_argument("--max-hold-days", type=int, default=0,
@@ -870,6 +915,8 @@ def main():
     parser.add_argument("--min-rs", type=float, default=0.0,
                         help="進場 RS 門檻：個股近 20 日跑贏大盤至少此值才進場（建議 0.03~0.08）"
                              "；0=停用。用於過濾跑輸大盤的弱勢股。")
+    parser.add_argument("--max-rs", type=float, default=0.0,
+                        help="進場 RS 上限：RS 超過此值視為趨勢末段不進場（建議 0.30~0.40）；0=停用。")
     parser.add_argument("--time-stop-days", type=int, default=0,
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
@@ -881,6 +928,19 @@ def main():
     parser.add_argument("--gap-up-threshold", type=float, default=0.03,
                         help="開盤跳空進場過濾：次日開盤跳空 >= 此比例則跳過進場（預設 0.03=3%%；0=停用）。"
                              "與 live entry_filter.gap_up_threshold 對應。")
+    parser.add_argument("--min-atr-pct", type=float, default=None,
+                        help="ATR%% 下限：進場時 ATR/price 低於此值視為低波動廢訊號跳過（建議 2.0~4.0；None=用 config）")
+    parser.add_argument("--min-ema-dev", type=float, default=None,
+                        help="EMA20 乖離率下限：進場時收盤距 EMA20 低於此值視為無動能跳過（建議 0.03=3%%；None=用 config）")
+    # ── 動態倉位（EMA 乖離率分層）──
+    parser.add_argument("--dev-low-thr",   type=float, default=0.03,
+                        help="乖離率縮倉門檻：低於此值用 dev-low-pct 倉位（預設 0.03=3%%；0=停用）")
+    parser.add_argument("--dev-high-thr",  type=float, default=0.05,
+                        help="乖離率加碼門檻：高於此值用 position-pct × dev-high-mult（預設 0.05=5%%；0=停用）")
+    parser.add_argument("--dev-low-pct",   type=float, default=0.15,
+                        help="低動能縮倉倉位比例（預設 0.15=15%%）")
+    parser.add_argument("--dev-high-mult", type=float, default=1.4,
+                        help="強動能加碼倍數，乘以 position-pct（預設 1.4，上限 50%%）")
     parser.add_argument("--slippage", type=float, default=0.002,
                         help="單邊滑價率（預設 0.002 = 0.2%%），買入多付、賣出少收")
     parser.add_argument("--max-vol-pct", type=float, default=0.03,
@@ -897,25 +957,7 @@ def main():
                         help="強制使用 API 模式，忽略本地 DB（預設：DB 存在時自動使用）")
     parser.add_argument("--show-skipped", action="store_true", default=False,
                         help="顯示被過濾掉但假設持有會高報酬的標的（大盤/廣度/RS/冷卻過濾）")
-    parser.add_argument("--conf-tiers", type=str, default=None,
-                        help="信心度倉位分層，格式：閾值:倉位%%,...（由高到低）。"
-                             "例：0.8:40,0.5:25,0:15 → 信心>=0.8用40%%，>=0.5用25%%，其他15%%。"
-                             "未設定時一律使用 --position-pct")
     args = parser.parse_args()
-
-    # ── 解析信心分層 ──
-    conf_tiers: list[tuple[float, float]] | None = None
-    if args.conf_tiers:
-        try:
-            pairs = [p.strip() for p in args.conf_tiers.split(",")]
-            conf_tiers = sorted(
-                [(float(t.split(":")[0]), float(t.split(":")[1]) / 100)
-                 for t in pairs],
-                reverse=True,   # 由高閾值到低閾值
-            )
-        except Exception:
-            print("--conf-tiers 格式錯誤，應為 '0.8:40,0.5:25,0:15'")
-            sys.exit(1)
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end   = datetime.strptime(args.end,   "%Y-%m-%d").date()
@@ -928,6 +970,10 @@ def main():
         sys.exit(1)
 
     cfg = make_backtest_config(base_cfg, args.strategies)
+    if args.min_atr_pct is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_atr_pct"] = args.min_atr_pct
+    if args.min_ema_dev is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_ema_dev"] = args.min_ema_dev
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
@@ -1180,6 +1226,8 @@ def main():
                 trail_stop_bull_pct=trail_stop_bull,
                 trail_stop_rs_bonus=trail_stop_rs_bonus,
                 min_rs_entry=args.min_rs,
+                max_rs_entry=args.max_rs,
+                market_max_20d_gain=args.market_max_20d_gain,
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
                 early_exit_days=args.early_exit_days,
@@ -1221,7 +1269,10 @@ def main():
         tax_stock_rate=args.tax_stock_rate,
         tax_etf_rate=args.tax_etf_rate,
         max_vol_pct=args.max_vol_pct,
-        conf_tiers=conf_tiers,
+        dev_low_thr=args.dev_low_thr,
+        dev_high_thr=args.dev_high_thr,
+        dev_low_pct=args.dev_low_pct,
+        dev_high_mult=args.dev_high_mult,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -1264,46 +1315,11 @@ def main():
     ov.add_row("總手續費+稅",   f"{psim['total_fee_tax']:>14,.0f} 元")
     ov.add_row("執行/跳過",
                f"{len(taken_df)} 筆執行  [dim]{psim['skipped']} 筆跳過[/dim]")
-    if conf_tiers:
-        tiers_str = "  ".join(f"≥{t:.1f}→{p*100:.0f}%" for t, p in conf_tiers)
-        ov.add_row("信心倉位分層", f"[cyan]{tiers_str}[/cyan]")
+    ov.add_row("動態倉位",
+               f"[cyan]EMA乖離<{args.dev_low_thr*100:.0f}%→{args.dev_low_pct*100:.0f}%  "
+               f"{args.dev_low_thr*100:.0f}-{args.dev_high_thr*100:.0f}%→標準  "
+               f">{args.dev_high_thr*100:.0f}%→×{args.dev_high_mult}[/cyan]")
     console.print(ov)
-
-    # ── 信心分層統計（啟用時顯示）──
-    if conf_tiers and not taken_df.empty and "confidence" in taken_df.columns:
-        console.rule("[bold]信心分層統計[/bold]")
-        tier_tbl = Table(show_header=True, box=None, padding=(0, 2))
-        tier_tbl.add_column("層級",     style="cyan")
-        tier_tbl.add_column("信心範圍", style="dim")
-        tier_tbl.add_column("倉位%",    justify="right")
-        tier_tbl.add_column("筆數",     justify="right")
-        tier_tbl.add_column("勝率",     justify="right")
-        tier_tbl.add_column("平均損益%", justify="right")
-        tier_tbl.add_column("合計損益元", justify="right")
-
-        thresholds = [t for t, _ in conf_tiers] + [0.0]
-        for i, (thr, pct) in enumerate(conf_tiers):
-            lower = thresholds[i + 1]
-            mask = (taken_df["confidence"] >= thr) if i == 0 else (
-                (taken_df["confidence"] >= thr) & (taken_df["confidence"] < conf_tiers[i-1][0])
-            )
-            sub = taken_df[mask]
-            if sub.empty:
-                continue
-            wins = sub[sub["pnl_pct"] > 0]
-            wr = len(wins) / len(sub) * 100
-            avg_pnl = sub["pnl_pct"].mean()
-            total_pnl = sub["net_pnl_dollars"].sum() if "net_pnl_dollars" in sub.columns else 0
-            clr = "green" if avg_pnl >= 0 else "red"
-            range_str = f">= {thr:.1f}" if i == len(conf_tiers) - 1 else f"{thr:.1f} ~ {conf_tiers[i-1][0]:.1f}" if i > 0 else f">= {thr:.1f}"
-            tier_tbl.add_row(
-                f"Tier {i+1}", range_str, f"{pct*100:.0f}%",
-                str(len(sub)),
-                f"[{'green' if wr>=50 else 'red'}]{wr:.1f}%[/]",
-                f"[{clr}]{avg_pnl:+.2f}%[/{clr}]",
-                f"[{clr}]{total_pnl:+,.0f}[/{clr}]",
-            )
-        console.print(tier_tbl)
 
     # ════════════════════════════════════════
     # 2. vs 0050 / 00631L正2 對比
@@ -1437,11 +1453,11 @@ def main():
         h_tbl.add_column("現價",    justify="right")
         h_tbl.add_column("損益%",   justify="right")
         h_tbl.add_column("損益元",  justify="right")
-        h_tbl.add_column("信心",    justify="right")
+        h_tbl.add_column("乖離%",   justify="right")
         h_tbl.add_column("策略",    style="dim")
         for _, r in holding_df.sort_values("pnl_pct", ascending=False).iterrows():
             clr = "green" if r["pnl_pct"] > 0 else "red"
-            conf = r.get("confidence", float("nan"))
+            dev = r.get("ema_dev", float("nan"))
             h_tbl.add_row(
                 str(r["code"]), str(r.get("name", "")),
                 str(r["entry_date"]), f"{r['hold_days']}天",
@@ -1449,7 +1465,7 @@ def main():
                 f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
                 f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
                 f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
-                f"{conf:.2f}" if conf == conf else "—",
+                f"{dev*100:+.1f}%" if dev == dev else "—",
                 str(r["strategy"]),
             )
         console.print(h_tbl)
@@ -1474,12 +1490,12 @@ def main():
             t.add_column("最高%",   justify="right")
             t.add_column("損益%",   justify="right")
             t.add_column("淨損益",  justify="right")
-            t.add_column("信心",    justify="right")
+            t.add_column("乖離%",   justify="right")
             t.add_column("原因",    style="dim")
             t.add_column("策略",    style="dim")
             for _, r in rows.iterrows():
                 clr = "green" if r["net_pnl_dollars"] > 0 else "red"
-                conf = r.get("confidence", float("nan"))
+                dev = r.get("ema_dev", float("nan"))
                 mg = r.get("max_gain_pct", float("nan"))
                 t.add_row(
                     str(r["code"]), str(r.get("name", "")),
@@ -1489,7 +1505,7 @@ def main():
                     f"[dim]+{mg:.1f}%[/dim]" if mg == mg else "—",
                     f"[{clr}]{r['pnl_pct']:+.2f}%[/{clr}]",
                     f"[{clr}]{r['net_pnl_dollars']:+,.0f}[/{clr}]",
-                    f"{conf:.2f}" if conf == conf else "—",
+                    f"{dev*100:+.1f}%" if dev == dev else "—",
                     str(r["result"]), str(r["strategy"]),
                 )
             return t
@@ -1543,14 +1559,12 @@ def main():
                 sk_tbl.add_column("假設出場",   justify="right")
                 sk_tbl.add_column("假設損益%",  justify="right")
                 sk_tbl.add_column("最大漲幅%",  justify="right")
-                sk_tbl.add_column("信心",       justify="right")
                 sk_tbl.add_column("持有天",     justify="right")
                 sk_tbl.add_column("出場原因",   style="dim")
                 sk_tbl.add_column("策略",       style="dim")
                 for m in top:
                     pnl  = m.get("pnl_pct", 0)
-                    mg   = m.get("max_gain_pct")   # 倉位已滿的跳過沒有此欄
-                    conf = m.get("confidence", float("nan"))
+                    mg   = m.get("max_gain_pct")
                     name = stock_meta.get(m["code"], m.get("name", ""))
                     sk_tbl.add_row(
                         str(m["code"]), str(name),
@@ -1560,7 +1574,6 @@ def main():
                         f"{m.get('exit_price', 0):.2f}",
                         f"[green]+{pnl:.2f}%[/green]",
                         f"[cyan]+{mg:.2f}%[/cyan]" if mg is not None else "—",
-                        f"{conf:.2f}" if conf == conf else "—",
                         f"{m.get('hold_days', 0)}天",
                         str(m.get("exit_reason", "")),
                         str(m.get("strategy", "")),

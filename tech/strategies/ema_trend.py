@@ -24,6 +24,7 @@ class EmaTrendStrategy(BaseStrategy):
         self.lookback = cfg.get("lookback_days", 70)
         self.adx_period  = cfg.get("adx_period", 14)
         self.adx_min     = cfg.get("adx_min", 20)    # < 20 視為橫盤，不進場
+        self.min_ema_dev = cfg.get("min_ema_dev", 0.0)  # 收盤距 EMA20 乖離率下限（0=停用）；太貼近無動能
         self.max_ema_dev = cfg.get("max_ema_dev", 0.0)  # 收盤距 EMA20 乖離率上限（0=停用）
         self.min_atr_pct = cfg.get("min_atr_pct", 0.0)  # ATR% 下限，過低視為死魚股（0=停用）
 
@@ -65,10 +66,12 @@ class EmaTrendStrategy(BaseStrategy):
             if price > 0 and (atr_val / price) * 100 < self.min_atr_pct:
                 return None
 
-        # 乖離率過濾：收盤距 EMA20 過遠則視為追高，跳過
-        if self.max_ema_dev > 0 and em_now > 0:
+        # 乖離率過濾：過貼（無動能）或過遠（追高）皆跳過
+        if em_now > 0:
             dev = (price - em_now) / em_now
-            if dev > self.max_ema_dev:
+            if self.min_ema_dev > 0 and dev < self.min_ema_dev:
+                return None
+            if self.max_ema_dev > 0 and dev > self.max_ema_dev:
                 return None
 
         # 量能不得嚴重萎縮

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差
 .venv/bin/python backtest.py --show-skipped \
-  --start               2025-01-01 \
+  --start               2022-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
   --stop-loss           8 \
@@ -23,4 +23,11 @@
   --breadth-filter \
   --breadth-min         0.50 \
   --slippage            0.002 \
-  --max-vol-pct         0.03
+  --max-vol-pct         0.03 \
+  --min-atr-pct         3.0 \
+  --min-ema-dev         0.03 \
+  --dev-low-thr         0.03 \
+  --dev-high-thr        0.05 \
+  --dev-low-pct         0.15 \
+  --dev-high-mult       1.4 \
+  --market-max-20d-gain 0.12
