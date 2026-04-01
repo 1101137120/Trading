@@ -94,6 +94,25 @@ def _run_standalone_scan(config: dict):
         console.print("[yellow]無符合篩選條件的標的[/yellow]")
         return
 
+    # 顯示 0050 ATR% 震盪警示
+    try:
+        _df0050 = fetch_kbars("0050", lookback_days=15)
+        if _df0050 is not None and len(_df0050) >= 10 and "High" in _df0050.columns:
+            import pandas as _pd
+            _atr_pct = ((_df0050["High"].astype(float) - _df0050["Low"].astype(float)) /
+                        _df0050["Close"].astype(float)).iloc[-10:].mean() * 100
+            if _atr_pct > 2.0:
+                _atr_clr, _atr_tag = "bold red", "⚠ 極端震盪"
+            elif _atr_pct > 1.5:
+                _atr_clr, _atr_tag = "yellow", "⚠ 高震盪"
+            elif _atr_pct > 1.0:
+                _atr_clr, _atr_tag = "cyan", "輕微震盪"
+            else:
+                _atr_clr, _atr_tag = "green", "市場平靜"
+            console.print(f"[{_atr_clr}]0050 ATR%（10日）= {_atr_pct:.2f}%  {_atr_tag}[/{_atr_clr}]")
+    except Exception:
+        pass
+
     console.print(f"\n[bold green]共篩選出 {len(candidates)} 檔[/bold green]")
     console.print("[dim]⚠ 資料來源：TWSE STOCK_DAY_ALL（收盤後約 14:00 更新；盤中執行看到的是前一交易日資料）[/dim]\n")
     logger.info(f"初步篩選通過 {len(candidates)} 檔")
@@ -376,6 +395,21 @@ class TradingSystem:
                 self.logger.info("沒有符合條件的標的")
                 self._print_summary()
                 return
+
+            # 顯示 0050 ATR% 震盪警示
+            _atr = self.market_filter.market_atr_pct()
+            if _atr is not None:
+                _atr_pct = _atr * 100
+                if _atr_pct > 2.0:
+                    _atr_clr, _atr_tag = "bold red", "⚠ 極端震盪"
+                elif _atr_pct > 1.5:
+                    _atr_clr, _atr_tag = "yellow", "⚠ 高震盪"
+                elif _atr_pct > 1.0:
+                    _atr_clr, _atr_tag = "cyan", "輕微震盪"
+                else:
+                    _atr_clr, _atr_tag = "green", "市場平靜"
+                console.print(f"[{_atr_clr}]0050 ATR%（10日）= {_atr_pct:.2f}%  {_atr_tag}[/{_atr_clr}]")
+                self.logger.info(f"0050 ATR%={_atr_pct:.2f}% {_atr_tag}")
 
             code_to_name = {c["code"]: c.get("name", "") for c in candidates}
             signals = self._evaluate_candidates(candidates)

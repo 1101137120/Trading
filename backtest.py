@@ -317,6 +317,7 @@ def simulate_trades(
     max_rs_entry: float = 0.0,
     market_max_20d_gain: float = 0.0,
     market_max_10d_gain: float = 0.0,
+    market_atr_max: float = 0.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
     early_exit_days: int = 0,
@@ -355,18 +356,28 @@ def simulate_trades(
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
     market_bull: dict[date, bool] = {}   # True = 0050 MA20 > MA60（持續上行）
+    market_atr: dict = {}                # 0050 近10日 ATR%（震盪過濾用）
     _mkt_dates: list = []   # 排序後的大盤日期（用於 RS 計算）
     _mkt_closes: list = []  # 對應大盤收盤價
     if market_df is not None and len(market_df) >= market_ma_period:
         market_df = market_df.copy()
         market_df["ma"] = market_df["Close"].rolling(market_ma_period).mean()
         market_df["ma60"] = market_df["Close"].rolling(60).mean()
+        # ATR% = 10日平均 (High-Low)/Close，衡量大盤震盪程度
+        if "High" in market_df.columns and "Low" in market_df.columns:
+            market_df["atr_pct"] = (
+                (market_df["High"] - market_df["Low"]) / market_df["Close"]
+            ).rolling(10).mean()
+        else:
+            market_df["atr_pct"] = float("nan")
+        market_atr: dict = {}
         for _, row in market_df.sort_values("ts").iterrows():
             d = row["ts"].date() if hasattr(row["ts"], "date") else row["ts"]
             market_allow[d] = (row["Close"] > row["ma"]) if pd.notna(row["ma"]) else True
             # MA20 > MA60 = 中期多頭確立，允許更寬的追蹤停利
             ma20_ok = pd.notna(row["ma"]) and pd.notna(row["ma60"])
             market_bull[d] = bool(row["ma"] > row["ma60"]) if ma20_ok else False
+            market_atr[d] = float(row["atr_pct"]) if pd.notna(row["atr_pct"]) else 0.0
             _mkt_dates.append(d)
             _mkt_closes.append(float(row["Close"]))
 
@@ -598,6 +609,22 @@ def simulate_trades(
                                                 "entry_price": round(_ep, 2),
                                                 "strategy": sig.strategy, **_fwd})
                 continue
+
+        # ── 空倉：大盤震盪過濾（ATR%）──
+        if market_atr_max > 0 and market_atr.get(row_date, 0) > market_atr_max:
+            if skipped_out is not None and i + 1 < len(df):
+                df_slice = df.iloc[: i + 1].copy()
+                sig = engine.evaluate(code, df_slice)
+                if sig and sig.action == "Buy":
+                    _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                    if _ep > 0:
+                        _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                             _ep * (1 + take_profit_pct), end, slippage_pct)
+                        skipped_out.append({"code": code, "signal_date": row_date,
+                                            "skip_reason": f"大盤震盪(ATR%{market_atr[row_date]*100:.1f}%)",
+                                            "entry_price": round(_ep, 2),
+                                            "strategy": sig.strategy, **_fwd})
+            continue
 
         # ── 空倉：市場廣度過濾 ──
         if breadth_allow is not None and not breadth_allow.get(row_date, True):
@@ -1001,6 +1028,9 @@ def main():
                         help="大盤近20日漲幅上限：超過此值視為市場過熱停止進場（建議 0.10=10%%；0=停用）")
     parser.add_argument("--market-max-10d-gain", type=float, default=0.0,
                         help="大盤近10日漲幅上限：超過此值視為急漲停止進場（建議 0.07=7%%；0=停用）")
+    parser.add_argument("--market-atr-max", type=float, default=0.0,
+                        help="大盤震盪過濾：0050近10日ATR%%超過此值時停止進場（建議 0.015=1.5%%；0=停用）"
+                             "。捕捉0050雖上漲但劇烈震盪的市況，避免個股被洗出。")
     parser.add_argument("--pyramid-gain", type=float, default=0.0,
                         help="加碼門檻（漲幅模式）：持倉漲幅達此值時加碼（建議 0.30=30%%；0=停用）")
     parser.add_argument("--pyramid-ema", action="store_true", default=False,
@@ -1371,6 +1401,7 @@ def main():
                 max_rs_entry=args.max_rs,
                 market_max_20d_gain=args.market_max_20d_gain,
                 market_max_10d_gain=args.market_max_10d_gain,
+                market_atr_max=args.market_atr_max,
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
                 early_exit_days=args.early_exit_days,
@@ -1680,6 +1711,7 @@ def main():
 
         # 取得 0050 年底收盤（用來計算未實現部位的年底市值）
         _yr_close: dict[int, float] = {}
+        _mkt_yr_ret: dict[int, float] = {}   # 0050 年度報酬率（%）
         try:
             _con2 = _duckdb.connect("data/stocks.db", read_only=True)
             _mkt_yr = _con2.execute(
@@ -1687,10 +1719,14 @@ def main():
             ).df()
             _con2.close()
             _mkt_yr["date"] = pd.to_datetime(_mkt_yr["date"])
-            for _yr in range(2017, 2030):
-                _yr_data = _mkt_yr[_mkt_yr["date"].dt.year == _yr]
+            for _yr in range(2007, 2030):
+                _yr_data = _mkt_yr[_mkt_yr["date"].dt.year == _yr].sort_values("date")
                 if not _yr_data.empty:
                     _yr_close[_yr] = float(_yr_data.iloc[-1]["close"])
+                    _first = float(_yr_data.iloc[0]["close"])
+                    _last  = float(_yr_data.iloc[-1]["close"])
+                    if _first > 0:
+                        _mkt_yr_ret[_yr] = (_last / _first - 1) * 100
         except Exception:
             pass
 
@@ -1727,11 +1763,13 @@ def main():
         _prev_cap = _cap
 
         yr_tbl = Table(show_header=True, box=None, padding=(0, 2))
-        yr_tbl.add_column("年度",   style="bold", justify="center")
+        yr_tbl.add_column("年度",        style="bold", justify="center")
         yr_tbl.add_column("已實現損益",  justify="right")
         yr_tbl.add_column("未實現損益",  justify="right")
         yr_tbl.add_column("年度合計",    justify="right")
         yr_tbl.add_column("年報酬率",    justify="right")
+        yr_tbl.add_column("0050",        justify="right")
+        yr_tbl.add_column("Alpha",       justify="right")
         yr_tbl.add_column("累計資金",    justify="right")
         yr_tbl.add_column("勝率",        justify="right")
 
@@ -1745,12 +1783,21 @@ def main():
             _wins_n   = _yr_wins.get(_y, 0)
             _wr_str   = f"{_wins_n}/{_trades_n}" if _trades_n else "—"
             _clr = "green" if _total >= 0 else "red"
+            _mkt_ret = _mkt_yr_ret.get(_y)
+            _alpha   = (_ann_ret - _mkt_ret) if _mkt_ret is not None else None
+            _mkt_str   = f"{_mkt_ret:+.1f}%" if _mkt_ret is not None else "[dim]—[/dim]"
+            _alpha_str = (
+                f"[{'green' if _alpha >= 0 else 'red'}]{_alpha:+.1f}%[/]"
+                if _alpha is not None else "[dim]—[/dim]"
+            )
             yr_tbl.add_row(
                 str(_y),
                 f"[{'green' if _real>=0 else 'red'}]{_real:+,.0f}[/]",
                 f"[{'green' if _unre>=0 else 'red' if _unre<0 else 'dim'}]{_unre:+,.0f}[/]" if _unre != 0 else "[dim]—[/dim]",
                 f"[{_clr}]{_total:+,.0f}[/{_clr}]",
                 f"[{_clr}]{_ann_ret:+.1f}%[/{_clr}]",
+                _mkt_str,
+                _alpha_str,
                 f"{_cap:,.0f}",
                 f"[dim]{_wr_str}[/dim]",
             )
@@ -1762,15 +1809,83 @@ def main():
     # ════════════════════════════════════════
     # 9. 存 CSV（持倉中 + 已實現 全部）
     # ════════════════════════════════════════
-    out_path = Path(args.output_csv)
+    import csv as _csv
+    from datetime import datetime as _dt
+
+    # ── 執行參數快照（每筆交易都帶著，方便跨回測合併分析）──
+    _run_ts   = _dt.now().strftime("%Y%m%d_%H%M%S")
+    _run_strats = "_".join(args.strategies)
+    _run_params = {
+        "run_id":               _run_ts,
+        "strategies":           _run_strats,
+        "start":                args.start,
+        "end":                  args.end,
+        "capital":              args.capital,
+        "stop_loss":            args.stop_loss,
+        "trail_stop":           args.trail_stop,
+        "trail_activation":     args.trail_activation,
+        "trail_stop_bull":      args.trail_stop_bull,
+        "trail_stop_rs_bonus":  args.trail_stop_rs_bonus,
+        "max_positions":        args.max_positions,
+        "position_pct":         args.position_pct,
+        "stocks":               args.stocks,
+        "min_rs":               args.min_rs,
+        "market_max_20d_gain":  args.market_max_20d_gain,
+        "market_max_10d_gain":  args.market_max_10d_gain,
+        "market_atr_max":       args.market_atr_max,
+        "min_atr_pct":          args.min_atr_pct,
+        "min_ema_dev":          args.min_ema_dev,
+        "dev_low_thr":          args.dev_low_thr,
+        "dev_high_thr":         args.dev_high_thr,
+        "dev_low_pct":          args.dev_low_pct,
+        "dev_high_mult":        args.dev_high_mult,
+        "time_stop_days":       args.time_stop_days,
+        "breadth_min":          args.breadth_min,
+        "slippage":             args.slippage,
+    }
+
+    # ── 自動時間戳路徑（--output-csv 預設值時才自動命名）──
+    _runs_dir = Path("backtest_runs")
+    _runs_dir.mkdir(exist_ok=True)
+    if args.output_csv == "backtest_result.csv":
+        out_path = _runs_dir / f"{_run_ts}_{_run_strats}.csv"
+    else:
+        out_path = Path(args.output_csv)
+
     if not taken_df.empty:
         csv_df = taken_df.copy()
         csv_df.insert(0, "status", csv_df["result"].apply(
             lambda x: "持倉中" if x == "回測結束" else "已實現"))
+        for _k, _v in _run_params.items():
+            csv_df[_k] = _v
         csv_df.to_csv(out_path, index=False, encoding="utf-8-sig")
     else:
-        s["trades"].to_csv(out_path, index=False, encoding="utf-8-sig")
-    console.print(f"\n[dim]完整明細（持倉中 + 已實現）已存至 {out_path}[/dim]")
+        csv_df = s["trades"].copy()
+        for _k, _v in _run_params.items():
+            csv_df[_k] = _v
+        csv_df.to_csv(out_path, index=False, encoding="utf-8-sig")
+    console.print(f"\n[dim]完整明細已存至 {out_path}[/dim]")
+
+    # ── runs_index.csv：每次回測追加一行摘要 ──
+    _index_path = _runs_dir / "runs_index.csv"
+    _win_n  = int((realized_df["pnl_pct"] > 0).sum()) if not realized_df.empty else 0
+    _tot_n  = len(realized_df)
+    _index_row = {
+        **_run_params,
+        "trades":        _tot_n,
+        "win_rate":      round(_win_n / _tot_n * 100, 1) if _tot_n else 0,
+        "total_pnl":     round(psim["total_pnl"], 0),
+        "total_return":  round(psim["total_return_pct"], 2),
+        "max_drawdown":  round(psim["max_drawdown_pct"], 2),
+        "csv_file":      out_path.name,
+    }
+    _write_header = not _index_path.exists()
+    with open(_index_path, "a", newline="", encoding="utf-8-sig") as _f:
+        _w = _csv.DictWriter(_f, fieldnames=list(_index_row.keys()))
+        if _write_header:
+            _w.writeheader()
+        _w.writerow(_index_row)
+    console.print(f"[dim]回測摘要已記錄至 {_index_path}[/dim]")
 
     # ════════════════════════════════════════
     # 10. 跳過的高報酬機會（--show-skipped）

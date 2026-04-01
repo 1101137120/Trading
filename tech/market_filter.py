@@ -56,6 +56,17 @@ class MarketFilter:
         ma60 = close.rolling(60).mean().iloc[-1]
         return bool(ma20 > ma60)
 
+    def market_atr_pct(self) -> float | None:
+        """計算 0050 近 10 日 ATR%（平均日振幅／收盤價），用於震盪程度警示。"""
+        df = self.feed.get_kbars(self.proxy_code, lookback_days=15, use_cache=True)
+        if df is None or len(df) < 10:
+            return None
+        if "High" not in df.columns or "Low" not in df.columns:
+            return None
+        atr_pct = ((df["High"].astype(float) - df["Low"].astype(float)) /
+                   df["Close"].astype(float)).iloc[-10:].mean()
+        return float(atr_pct)
+
     def allow_long(self) -> bool:
         if not self.enabled:
             return True

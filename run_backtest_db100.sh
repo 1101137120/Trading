@@ -5,18 +5,17 @@
   --capital             1000000 \
   --strategies          ema_trend \
   --stop-loss           8 \
-  --trail-stop          0.08 \
-  --trail-stop-bull     0.18 \
+  --trail-stop          0.15 \
+  --trail-stop-bull     0.22 \
   --trail-stop-rs-bonus 0.05 \
-  --trail-activation    0.03 \
+  --trail-activation    0.02 \
   --max-positions       20 \
   --position-pct        0.30 \
   --stocks              80 \
   --max-price           2000 \
   --min-rs              0.05 \
   --market-filter \
-  --early-exit-days     10 \
-  --early-exit-lag      0.03 \
+  --early-exit-days     0 \
   --market-ma           20 \
   --time-stop-days      20 \
   --time-stop-min-pct   0.05 \
@@ -32,4 +31,5 @@
   --dev-high-mult       1.4 \
   --market-max-20d-gain 0.10 \
   --market-max-10d-gain 0.07 \
+  --market-atr-max      0.015 \
   --market-bull-entry
