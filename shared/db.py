@@ -28,15 +28,19 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stocks.db"
 # ──────────────────────────────────────────────
 
 @contextmanager
-def get_conn(db_path: Path = DB_PATH):
-    """DuckDB 連線 context manager，離開時自動 commit / rollback / close。"""
+def get_conn(db_path: Path = DB_PATH, read_only: bool = False):
+    """DuckDB 連線 context manager，離開時自動 commit / rollback / close。
+    read_only=True 允許多程序同時讀取（backtest 並發用）。
+    """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(db_path))
+    conn = duckdb.connect(str(db_path), read_only=read_only)
     try:
         yield conn
-        conn.commit()
+        if not read_only:
+            conn.commit()
     except Exception:
-        conn.rollback()
+        if not read_only:
+            conn.rollback()
         raise
     finally:
         conn.close()
@@ -95,6 +99,7 @@ def load_kbars(
     start: str,
     end: str,
     db_path: Path = DB_PATH,
+    read_only: bool = False,
 ) -> Optional[pd.DataFrame]:
     """
     從 DB 讀取 K 棒，格式與 fetch_kbars() 完全相同。
@@ -103,7 +108,7 @@ def load_kbars(
     """
     if not db_path.exists():
         return None
-    with get_conn(db_path) as conn:
+    with get_conn(db_path, read_only=read_only) as conn:
         df = conn.execute(
             "SELECT date AS ts, open AS Open, high AS High, "
             "       low AS Low, close AS Close, volume AS Volume "
@@ -137,11 +142,12 @@ def load_universe(
     trade_date: str,
     top_n: int,
     db_path: Path = DB_PATH,
+    read_only: bool = False,
 ) -> list[str]:
     """取得某交易日成交量前 top_n 的股票代碼（歷史宇宙快照）。"""
     if not db_path.exists():
         return []
-    with get_conn(db_path) as conn:
+    with get_conn(db_path, read_only=read_only) as conn:
         rows = conn.execute(
             "SELECT code FROM universe_snapshots "
             "WHERE date=? AND vol_rank<=? ORDER BY vol_rank",

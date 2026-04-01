@@ -316,6 +316,7 @@ def simulate_trades(
     min_rs_entry: float = 0.0,
     max_rs_entry: float = 0.0,
     market_max_20d_gain: float = 0.0,
+    market_max_10d_gain: float = 0.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
     early_exit_days: int = 0,
@@ -323,6 +324,12 @@ def simulate_trades(
     breadth_allow: dict = None,
     slippage_pct: float = 0.002,
     gap_up_threshold: float = 0.0,
+    pyramid_gain_pct: float = 0.0,      # 舊方式：漲幅達 X% 即加碼（0=停用）
+    pyramid_min_gain: float = 0.10,     # EMA 拉回方式：最小持倉獲利才開始等加碼
+    pyramid_ema_period: int = 10,       # EMA 拉回方式：使用哪條 EMA
+    pyramid_pullback_pct: float = 0.03, # EMA 拉回方式：距離 EMA 多近才觸發（3%以內）
+    pyramid_use_ema: bool = False,      # True=用 EMA 拉回；False=用漲幅門檻
+    market_bull_entry: bool = False,   # True=只在 0050 MA20>MA60 時才開倉
     skipped_out: list = None,
 ) -> list[dict]:
     """
@@ -392,6 +399,32 @@ def simulate_trades(
                     position["peak_price"] = current_price
 
                 pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
+
+                # 贏家加碼偵測
+                if not position.get("pyramid_done") and i + 1 < len(df):
+                    trigger = False
+                    if pyramid_use_ema:
+                        # EMA 拉回模式：持倉獲利 > min_gain 且收盤貼近 EMAn
+                        if pnl_pct_cur >= pyramid_min_gain:
+                            _close_so_far = df["Close"].astype(float).iloc[: i + 1]
+                            _ema_now = _close_so_far.ewm(
+                                span=pyramid_ema_period, adjust=False
+                            ).mean().iloc[-1]
+                            if _ema_now > 0:
+                                _dev = (current_price - _ema_now) / _ema_now
+                                # 拉回到 EMA 附近（0 ~ pullback_pct 上方），且未跌破 EMA
+                                if 0 <= _dev <= pyramid_pullback_pct:
+                                    trigger = True
+                    elif pyramid_gain_pct > 0:
+                        # 漲幅門檻模式（舊方式）
+                        if pnl_pct_cur >= pyramid_gain_pct:
+                            trigger = True
+
+                    if trigger:
+                        position["pyramid_done"] = True
+                        position["pyramid_date"] = df["ts"].iloc[i + 1].date()
+                        nxt_open = float(df["Open"].iloc[i + 1])
+                        position["pyramid_price"] = nxt_open * (1 + slippage_pct)
 
                 # 2. 盤中觸停損（用 Low 近似，假設在停損價成交）
                 if low_price > 0 and low_price <= position["stop"]:
@@ -466,6 +499,36 @@ def simulate_trades(
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
                     cooldown_until = row_date + timedelta(days=loss_cooldown_days)
+
+                # 贏家加碼：若加碼點已記錄，產生獨立的加碼交易
+                if (pyramid_gain_pct > 0 or pyramid_use_ema) and position.get("pyramid_done"):
+                    pyr_entry = position["pyramid_price"]
+                    pyr_date  = position["pyramid_date"]
+                    pyr_pnl   = (exit_price - pyr_entry) / pyr_entry
+                    pyr_max   = (position["peak_price"] - pyr_entry) / pyr_entry
+                    pyr_hold  = (row_date - pyr_date).days if hasattr(pyr_date, 'days') else 0
+                    try:
+                        pyr_hold = (row_date - pyr_date).days
+                    except Exception:
+                        pyr_hold = 0
+                    trades.append({
+                        "code": code,
+                        "entry_date": pyr_date,
+                        "exit_date": row_date,
+                        "entry_price": round(pyr_entry, 2),
+                        "exit_price": exit_price,
+                        "pnl_pct": round(pyr_pnl * 100, 2),
+                        "max_gain_pct": round(max(pyr_max, 0) * 100, 2),
+                        "hold_days": pyr_hold,
+                        "result": exit_reason,
+                        "strategy": position["strategy"],
+                        "confidence": position.get("confidence", 0.30),
+                        "rs_score": position.get("rs_score", 0.0),
+                        "ema_dev": position.get("ema_dev", 0.0),
+                        "day_volume": position.get("day_volume", 0),
+                        "is_pyramid": True,
+                    })
+
                 position = None
             continue  # 持倉中不找新訊號
 
@@ -484,26 +547,57 @@ def simulate_trades(
                                             "strategy": sig.strategy, **_fwd})
             continue
 
-        # ── 空倉：大盤近20日過熱過濾 ──
-        if market_max_20d_gain > 0 and _mkt_dates:
+        # ── 空倉：大盤持續上行過濾（MA20 > MA60）──
+        if market_bull_entry and not market_bull.get(row_date, False):
+            if skipped_out is not None and i + 1 < len(df):
+                df_slice = df.iloc[: i + 1].copy()
+                sig = engine.evaluate(code, df_slice)
+                if sig and sig.action == "Buy":
+                    _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                    if _ep > 0:
+                        _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                             _ep * (1 + take_profit_pct), end, slippage_pct)
+                        skipped_out.append({"code": code, "signal_date": row_date,
+                                            "skip_reason": "大盤MA20<MA60", "entry_price": round(_ep, 2),
+                                            "strategy": sig.strategy, **_fwd})
+            continue
+
+        # ── 空倉：大盤近20日/10日過熱過濾 ──
+        if (market_max_20d_gain > 0 or market_max_10d_gain > 0) and _mkt_dates:
             _mp = bisect.bisect_right(_mkt_dates, row_date) - 1
-            _mp20 = _mp - 20
-            if _mp >= 0 and _mp20 >= 0:
-                _mkt_20d_ret = (_mkt_closes[_mp] - _mkt_closes[_mp20]) / _mkt_closes[_mp20]
-                if _mkt_20d_ret > market_max_20d_gain:
-                    if skipped_out is not None and i + 1 < len(df):
-                        df_slice = df.iloc[: i + 1].copy()
-                        sig = engine.evaluate(code, df_slice)
-                        if sig and sig.action == "Buy":
-                            _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
-                            if _ep > 0:
-                                _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
-                                                     _ep * (1 + take_profit_pct), end, slippage_pct)
-                                skipped_out.append({"code": code, "signal_date": row_date,
-                                                    "skip_reason": f"大盤過熱(+{_mkt_20d_ret*100:.0f}%)",
-                                                    "entry_price": round(_ep, 2),
-                                                    "strategy": sig.strategy, **_fwd})
-                    continue
+            _mkt_20d_ret = None
+            _mkt_10d_ret = None
+            if market_max_20d_gain > 0:
+                _mp20 = _mp - 20
+                if _mp >= 0 and _mp20 >= 0:
+                    _mkt_20d_ret = (_mkt_closes[_mp] - _mkt_closes[_mp20]) / _mkt_closes[_mp20]
+            if market_max_10d_gain > 0:
+                _mp10 = _mp - 10
+                if _mp >= 0 and _mp10 >= 0:
+                    _mkt_10d_ret = (_mkt_closes[_mp] - _mkt_closes[_mp10]) / _mkt_closes[_mp10]
+            _overheat = (
+                (_mkt_20d_ret is not None and _mkt_20d_ret > market_max_20d_gain) or
+                (_mkt_10d_ret is not None and _mkt_10d_ret > market_max_10d_gain)
+            )
+            if _overheat:
+                _heat_label = []
+                if _mkt_20d_ret is not None and _mkt_20d_ret > market_max_20d_gain:
+                    _heat_label.append(f"20d+{_mkt_20d_ret*100:.0f}%")
+                if _mkt_10d_ret is not None and _mkt_10d_ret > market_max_10d_gain:
+                    _heat_label.append(f"10d+{_mkt_10d_ret*100:.0f}%")
+                if skipped_out is not None and i + 1 < len(df):
+                    df_slice = df.iloc[: i + 1].copy()
+                    sig = engine.evaluate(code, df_slice)
+                    if sig and sig.action == "Buy":
+                        _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                        if _ep > 0:
+                            _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                                 _ep * (1 + take_profit_pct), end, slippage_pct)
+                            skipped_out.append({"code": code, "signal_date": row_date,
+                                                "skip_reason": f"大盤過熱({'|'.join(_heat_label)})",
+                                                "entry_price": round(_ep, 2),
+                                                "strategy": sig.strategy, **_fwd})
+                continue
 
         # ── 空倉：市場廣度過濾 ──
         if breadth_allow is not None and not breadth_allow.get(row_date, True):
@@ -670,6 +764,7 @@ def portfolio_simulation(
     dev_high_thr: float = 0.05,
     dev_low_pct: float = 0.15,
     dev_high_mult: float = 1.4,
+    pyramid_alloc_pct: float = 0.5,
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -687,7 +782,7 @@ def portfolio_simulation(
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
-    active: list[dict] = []   # {exit_date, exit_cash, cost}
+    active: list[dict] = []   # {exit_date, exit_cash, cost, code}
     taken: list[dict] = []
     total_fees = 0.0
     total_taxes = 0.0
@@ -712,11 +807,20 @@ def portfolio_simulation(
         dd = (peak_capital - portfolio_value) / peak_capital * 100 if peak_capital > 0 else 0
         max_drawdown = max(max_drawdown, dd)
 
-        if len(active) >= max_positions:
+        is_pyramid = trade.get("is_pyramid", False)
+        active_codes = {p["code"] for p in active}
+
+        # 加碼交易：原始部位需仍在場才執行；不佔 max_positions
+        if is_pyramid:
+            if trade["code"] not in active_codes:
+                continue  # 原始部位已出場，跳過
+        elif len(active) >= max_positions:
             continue
 
         alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
                                dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult)
+        if is_pyramid:
+            alloc *= pyramid_alloc_pct  # 加碼用半倉（或自訂比例）
         price = trade["entry_price"]
         one_lot_cost = price * 1000
 
@@ -789,6 +893,7 @@ def portfolio_simulation(
             "exit_date": trade["exit_date"],
             "exit_cash": cost + gross_pnl_dollars - fee_sell - tax,
             "cost": cost,
+            "code": trade["code"],
         })
 
     # 回測結束，釋放剩餘持倉
@@ -876,6 +981,10 @@ def main():
                         help="啟用大盤過濾（0050 > MA20 才開倉），預設開啟")
     parser.add_argument("--no-market-filter", action="store_true",
                         help="停用大盤過濾")
+    parser.add_argument("--market-bull-entry", action="store_true", default=False,
+                        help="只在 0050 MA20 > MA60（持續上行趨勢）時才開倉，比 --market-filter 更嚴格")
+    parser.add_argument("--tse-only", action="store_true", default=False,
+                        help="只交易上市股（TSE），排除上櫃（OTC）")
     parser.add_argument("--breadth-filter", action="store_true", default=False,
                         help="啟用市場廣度過濾：股票池中 >EMA20 比例不足時禁止開倉")
     parser.add_argument("--breadth-min", type=float, default=0.40,
@@ -889,7 +998,21 @@ def main():
     parser.add_argument("--market-ma", type=int, default=20,
                         help="大盤過濾 MA 週期（預設 20）")
     parser.add_argument("--market-max-20d-gain", type=float, default=0.0,
-                        help="大盤近20日漲幅上限：超過此值視為市場過熱停止進場（建議 0.12=12%%；0=停用）")
+                        help="大盤近20日漲幅上限：超過此值視為市場過熱停止進場（建議 0.10=10%%；0=停用）")
+    parser.add_argument("--market-max-10d-gain", type=float, default=0.0,
+                        help="大盤近10日漲幅上限：超過此值視為急漲停止進場（建議 0.07=7%%；0=停用）")
+    parser.add_argument("--pyramid-gain", type=float, default=0.0,
+                        help="加碼門檻（漲幅模式）：持倉漲幅達此值時加碼（建議 0.30=30%%；0=停用）")
+    parser.add_argument("--pyramid-ema", action="store_true", default=False,
+                        help="加碼使用 EMA 拉回模式（貼近 EMA10 才加碼，比漲幅模式更精準）")
+    parser.add_argument("--pyramid-min-gain", type=float, default=0.10,
+                        help="EMA 拉回模式：最小持倉獲利才開始等加碼（預設 0.10=10%%）")
+    parser.add_argument("--pyramid-ema-period", type=int, default=10,
+                        help="EMA 拉回模式：使用哪條 EMA（預設 10）")
+    parser.add_argument("--pyramid-pullback", type=float, default=0.03,
+                        help="EMA 拉回模式：距 EMA 多近觸發加碼（預設 0.03=3%%以內）")
+    parser.add_argument("--pyramid-alloc", type=float, default=0.5,
+                        help="加碼倉位比例，相對於原始倉位（預設 0.5=半倉）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
                         help="個股停損後冷卻天數（預設 0=停用），建議 3~7")
     parser.add_argument("--max-hold-days", type=int, default=0,
@@ -957,6 +1080,8 @@ def main():
                         help="強制使用 API 模式，忽略本地 DB（預設：DB 存在時自動使用）")
     parser.add_argument("--show-skipped", action="store_true", default=False,
                         help="顯示被過濾掉但假設持有會高報酬的標的（大盤/廣度/RS/冷卻過濾）")
+    parser.add_argument("--output-csv", type=str, default="backtest_result.csv",
+                        help="CSV 輸出路徑（預設 backtest_result.csv）")
     args = parser.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -1002,7 +1127,11 @@ def main():
     exclude_etf   = args.exclude_etf and not args.include_etf
     use_dynamic_pool = args.dynamic_pool and not args.no_dynamic_pool
     use_db        = DB_PATH.exists() and not args.no_db
+    # TSE-only：CLI flag 優先，否則從 config screener.exchanges 讀（與實盤一致）
+    cfg_exchanges = base_cfg.get("screener", {}).get("exchanges", ["TSE", "OTC"])
+    tse_only = args.tse_only or (cfg_exchanges == ["TSE"])
     etf_note      = "（已排除 ETF）" if exclude_etf else "（含 ETF）"
+    etf_note      = etf_note + "（僅上市TSE）" if tse_only else etf_note
     universe_size = args.stocks * args.universe_mult if use_dynamic_pool else args.stocks
 
     # ════════════════════════════════════════════
@@ -1014,14 +1143,16 @@ def main():
         start_str = start.strftime("%Y-%m-%d")
         end_str   = end.strftime("%Y-%m-%d")
 
-        with _db_conn() as _conn:
+        with _db_conn(read_only=True) as _conn:
             # 取回測期間曾進前 universe_size 名的所有股票
+            tse_clause = " AND s.market='TSE'" if tse_only else ""
             rows = _conn.execute(
-                "SELECT DISTINCT u.code, s.name "
+                "SELECT DISTINCT u.code, s.name, s.market "
                 "FROM universe_snapshots u "
                 "LEFT JOIN stocks s ON u.code=s.code "
                 "WHERE u.date>=? AND u.date<=? AND u.vol_rank<=? "
-                + ("AND (s.code IS NULL OR s.code NOT LIKE '00%')" if exclude_etf else ""),
+                + ("AND (s.code IS NULL OR s.code NOT LIKE '00%')" if exclude_etf else "")
+                + tse_clause,
                 (start_str, end_str, universe_size),
             ).fetchall()
 
@@ -1041,14 +1172,19 @@ def main():
                 ]
 
             # 取歷史動態池（universe_snapshots 中 rank <= stocks 的每日快照）
+            tse_pool_clause = (
+                " AND code IN (SELECT code FROM stocks WHERE market='TSE')"
+                if tse_only else ""
+            )
             pool_rows = _conn.execute(
                 "SELECT date, code FROM universe_snapshots "
                 "WHERE date>=? AND date<=? AND vol_rank<=? "
-                + ("AND code NOT LIKE '00%'" if exclude_etf else ""),
+                + ("AND code NOT LIKE '00%'" if exclude_etf else "")
+                + tse_pool_clause,
                 (start_str, end_str, args.stocks),
             ).fetchall()
 
-        pool = [{"code": r[0], "name": r[1] or ""} for r in rows]
+        pool = [{"code": r[0], "name": r[1] or "", "market": r[2] or ""} for r in rows]
 
         # 建立動態池（直接從 DB 快照，不需重算）
         dynamic_pool_db: dict[date, set] = {}
@@ -1095,6 +1231,7 @@ def main():
                 "0050",
                 (start - __import__("datetime").timedelta(days=args.market_ma + 90)).strftime("%Y-%m-%d"),
                 end.strftime("%Y-%m-%d"),
+                read_only=True,
             )
         if market_df is None:
             market_df = fetch_kbars("0050", lookback_days=lookback_market)
@@ -1115,18 +1252,22 @@ def main():
             "00631L",
             (start - __import__("datetime").timedelta(days=30)).strftime("%Y-%m-%d"),
             end.strftime("%Y-%m-%d"),
+            read_only=True,
         )
     if bench2x_df is None:
         bench2x_df = fetch_kbars("00631L", lookback_days=lookback_bench)
     if bench2x_df is None or bench2x_df.empty:
         console.print("[dim]00631L K 棒不足，正2 基準略過[/dim]")
         bench2x_df = None
+    else:
+        bench2x_df = adjust_splits(bench2x_df)
 
     loss_cooldown = args.loss_cooldown
 
     # ── 第一輪：載入所有 K 棒（DB 優先，缺的才打 API）──
     all_kbars: dict[str, pd.DataFrame] = {}
     stock_meta: dict[str, str] = {}
+    stock_market: dict[str, str] = {}
     failed = 0
     failed_items: list[tuple[str, str]] = []
     lookback_needed = (end - start).days + 90  # 多拉 90 天供 EMA60 warmup
@@ -1145,7 +1286,7 @@ def main():
             # 1. 嘗試從 DB 讀
             if use_db:
                 db_start = (start - __import__("datetime").timedelta(days=lookback_needed)).strftime("%Y-%m-%d")
-                df = _db_load_kbars(code, db_start, end.strftime("%Y-%m-%d"))
+                df = _db_load_kbars(code, db_start, end.strftime("%Y-%m-%d"), read_only=True)
                 if df is not None and len(df) >= 60:
                     db_hits += 1
 
@@ -1169,6 +1310,7 @@ def main():
             df = adjust_splits(df)
             all_kbars[code] = df
             stock_meta[code] = str(name).strip()
+            stock_market[code] = str(stock.get("market", "")).strip()
             if not use_db:
                 time.sleep(0.15)
 
@@ -1228,6 +1370,7 @@ def main():
                 min_rs_entry=args.min_rs,
                 max_rs_entry=args.max_rs,
                 market_max_20d_gain=args.market_max_20d_gain,
+                market_max_10d_gain=args.market_max_10d_gain,
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
                 early_exit_days=args.early_exit_days,
@@ -1235,10 +1378,17 @@ def main():
                 breadth_allow=breadth_map,
                 slippage_pct=args.slippage,
                 gap_up_threshold=args.gap_up_threshold,
+                pyramid_gain_pct=args.pyramid_gain,
+                pyramid_min_gain=args.pyramid_min_gain,
+                pyramid_ema_period=args.pyramid_ema_period,
+                pyramid_pullback_pct=args.pyramid_pullback,
+                pyramid_use_ema=args.pyramid_ema,
+                market_bull_entry=args.market_bull_entry,
                 skipped_out=all_skipped_signals,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
+                t["market"] = stock_market.get(code, "")
             all_trades.extend(trades)
 
     console.print(f"[dim]下載失敗或資料不足: {failed} 檔[/dim]\n")
@@ -1273,6 +1423,7 @@ def main():
         dev_high_thr=args.dev_high_thr,
         dev_low_pct=args.dev_low_pct,
         dev_high_mult=args.dev_high_mult,
+        pyramid_alloc_pct=args.pyramid_alloc,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -1288,7 +1439,7 @@ def main():
     bench = None
     bench2x = None
     if market_df is not None:
-        bench = calc_benchmark(market_df, start, end, args.capital, args.fee_rate, args.min_fee)
+        bench = calc_benchmark(adjust_splits(market_df), start, end, args.capital, args.fee_rate, args.min_fee)
     if bench2x_df is not None:
         bench2x = calc_benchmark(bench2x_df, start, end, args.capital, args.fee_rate, args.min_fee)
 
@@ -1446,6 +1597,7 @@ def main():
         h_tbl = Table(show_header=True, box=None, padding=(0, 1))
         h_tbl.add_column("代碼",    style="cyan")
         h_tbl.add_column("名稱")
+        h_tbl.add_column("市場",    style="dim")
         h_tbl.add_column("買入日",  style="dim")
         h_tbl.add_column("持有天",  justify="right")
         h_tbl.add_column("張數",    justify="right")
@@ -1458,8 +1610,10 @@ def main():
         for _, r in holding_df.sort_values("pnl_pct", ascending=False).iterrows():
             clr = "green" if r["pnl_pct"] > 0 else "red"
             dev = r.get("ema_dev", float("nan"))
+            mkt = r.get("market", stock_market.get(str(r["code"]), ""))
             h_tbl.add_row(
                 str(r["code"]), str(r.get("name", "")),
+                str(mkt),
                 str(r["entry_date"]), f"{r['hold_days']}天",
                 f"{int(r['lots'])}{'股' if r.get('odd_lot') else '張'}",
                 f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
@@ -1481,6 +1635,7 @@ def main():
             t = Table(title=title, show_header=True, box=None, padding=(0, 1))
             t.add_column("代碼",    style="cyan")
             t.add_column("名稱")
+            t.add_column("市場",    style="dim")
             t.add_column("買入日",  style="dim")
             t.add_column("賣出日",  style="dim")
             t.add_column("持有",    justify="right")
@@ -1497,8 +1652,10 @@ def main():
                 clr = "green" if r["net_pnl_dollars"] > 0 else "red"
                 dev = r.get("ema_dev", float("nan"))
                 mg = r.get("max_gain_pct", float("nan"))
+                mkt = r.get("market", stock_market.get(str(r["code"]), ""))
                 t.add_row(
                     str(r["code"]), str(r.get("name", "")),
+                    str(mkt),
                     str(r["entry_date"]), str(r["exit_date"]),
                     f"{r['hold_days']}天", f"{int(r['lots'])}{'股' if r.get('odd_lot') else '張'}",
                     f"{r['entry_price']:.2f}", f"{r['exit_price']:.2f}",
@@ -1515,9 +1672,97 @@ def main():
         console.print(_realized_table("▼ 最差 10 筆", r_sorted.tail(10).iloc[::-1]))
 
     # ════════════════════════════════════════
-    # 7. 存 CSV（持倉中 + 已實現 全部）
+    # 7. 年度績效表（已實現 + 未實現 mark-to-market）
     # ════════════════════════════════════════
-    out_path = Path("backtest_result.csv")
+    if not taken_df.empty:
+        import duckdb as _duckdb
+        console.rule("[bold]年度績效[/bold]")
+
+        # 取得 0050 年底收盤（用來計算未實現部位的年底市值）
+        _yr_close: dict[int, float] = {}
+        try:
+            _con2 = _duckdb.connect("data/stocks.db", read_only=True)
+            _mkt_yr = _con2.execute(
+                "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
+            ).df()
+            _con2.close()
+            _mkt_yr["date"] = pd.to_datetime(_mkt_yr["date"])
+            for _yr in range(2017, 2030):
+                _yr_data = _mkt_yr[_mkt_yr["date"].dt.year == _yr]
+                if not _yr_data.empty:
+                    _yr_close[_yr] = float(_yr_data.iloc[-1]["close"])
+        except Exception:
+            pass
+
+        # 建每一筆交易的「年度貢獻」
+        # 已實現：按 exit_date 所在年度
+        # 未實現：按 entry_date 到 exit_date（回測截止）每年末 mark-to-market
+        _yr_realized: dict[int, float] = {}
+        _yr_unrealized: dict[int, float] = {}
+        _yr_trades: dict[int, int] = {}
+        _yr_wins: dict[int, int] = {}
+
+        _rd = realized_df.copy()
+        _rd["exit_date"] = pd.to_datetime(_rd["exit_date"])
+        for _, _r in _rd.iterrows():
+            _y = _r["exit_date"].year
+            _yr_realized[_y] = _yr_realized.get(_y, 0) + _r["net_pnl_dollars"]
+            _yr_trades[_y]    = _yr_trades.get(_y, 0) + 1
+            if _r["pnl_pct"] > 0:
+                _yr_wins[_y] = _yr_wins.get(_y, 0) + 1
+
+        # 未實現部位：每年末用當年末 0050 來估算（我們沒有個股年末價，用持倉 exit_price 代替截止日價格）
+        # 對持倉中部位：持有期間跨過每個年末，計入該年末的未實現損益
+        _hd = holding_df.copy()
+        _hd["entry_date"] = pd.to_datetime(_hd["entry_date"])
+        _hd["exit_date"]  = pd.to_datetime(_hd["exit_date"])
+        for _, _r in _hd.iterrows():
+            # 只在最後一年（exit_date 年）計入未實現
+            _y = _r["exit_date"].year
+            _yr_unrealized[_y] = _yr_unrealized.get(_y, 0) + _r["net_pnl_dollars"]
+
+        # 累計資金（從初始資金）
+        _all_years = sorted(set(list(_yr_realized.keys()) + list(_yr_unrealized.keys())))
+        _cap = psim["initial_capital"]
+        _prev_cap = _cap
+
+        yr_tbl = Table(show_header=True, box=None, padding=(0, 2))
+        yr_tbl.add_column("年度",   style="bold", justify="center")
+        yr_tbl.add_column("已實現損益",  justify="right")
+        yr_tbl.add_column("未實現損益",  justify="right")
+        yr_tbl.add_column("年度合計",    justify="right")
+        yr_tbl.add_column("年報酬率",    justify="right")
+        yr_tbl.add_column("累計資金",    justify="right")
+        yr_tbl.add_column("勝率",        justify="right")
+
+        for _y in _all_years:
+            _real = _yr_realized.get(_y, 0)
+            _unre = _yr_unrealized.get(_y, 0)
+            _total = _real + _unre
+            _ann_ret = _total / _prev_cap * 100 if _prev_cap > 0 else 0
+            _cap += _total
+            _trades_n = _yr_trades.get(_y, 0)
+            _wins_n   = _yr_wins.get(_y, 0)
+            _wr_str   = f"{_wins_n}/{_trades_n}" if _trades_n else "—"
+            _clr = "green" if _total >= 0 else "red"
+            yr_tbl.add_row(
+                str(_y),
+                f"[{'green' if _real>=0 else 'red'}]{_real:+,.0f}[/]",
+                f"[{'green' if _unre>=0 else 'red' if _unre<0 else 'dim'}]{_unre:+,.0f}[/]" if _unre != 0 else "[dim]—[/dim]",
+                f"[{_clr}]{_total:+,.0f}[/{_clr}]",
+                f"[{_clr}]{_ann_ret:+.1f}%[/{_clr}]",
+                f"{_cap:,.0f}",
+                f"[dim]{_wr_str}[/dim]",
+            )
+            _prev_cap = _cap
+
+        console.print(yr_tbl)
+        console.print("[dim]  ※ 未實現損益為回測截止日市值，跨年持倉計入出場年度[/dim]")
+
+    # ════════════════════════════════════════
+    # 9. 存 CSV（持倉中 + 已實現 全部）
+    # ════════════════════════════════════════
+    out_path = Path(args.output_csv)
     if not taken_df.empty:
         csv_df = taken_df.copy()
         csv_df.insert(0, "status", csv_df["result"].apply(
@@ -1528,7 +1773,7 @@ def main():
     console.print(f"\n[dim]完整明細（持倉中 + 已實現）已存至 {out_path}[/dim]")
 
     # ════════════════════════════════════════
-    # 8. 跳過的高報酬機會（--show-skipped）
+    # 10. 跳過的高報酬機會（--show-skipped）
     # ════════════════════════════════════════
     if args.show_skipped and all_skipped_signals is not None:
         # 倉位已滿的跳過：all_trades 中未進入 taken 的部分
@@ -1553,6 +1798,7 @@ def main():
                 sk_tbl = Table(show_header=True, box=None, padding=(0, 1))
                 sk_tbl.add_column("代碼",       style="cyan")
                 sk_tbl.add_column("名稱")
+                sk_tbl.add_column("市場",       style="dim")
                 sk_tbl.add_column("訊號日",     style="dim")
                 sk_tbl.add_column("跳過原因",   style="yellow")
                 sk_tbl.add_column("假設進場",   justify="right")
@@ -1566,8 +1812,10 @@ def main():
                     pnl  = m.get("pnl_pct", 0)
                     mg   = m.get("max_gain_pct")
                     name = stock_meta.get(m["code"], m.get("name", ""))
+                    mkt  = m.get("market", stock_market.get(str(m["code"]), ""))
                     sk_tbl.add_row(
                         str(m["code"]), str(name),
+                        str(mkt),
                         str(m.get("signal_date", m.get("entry_date", ""))),
                         str(m["skip_reason"]),
                         f"{m.get('entry_price', 0):.2f}",
@@ -1586,7 +1834,7 @@ def main():
                 console.print("[dim]所有跳過的訊號假設持有均無法獲利[/dim]")
 
     # ════════════════════════════════════════
-    # 9. 回測 log（append）
+    # 11. 回測 log（append）
     # ════════════════════════════════════════
     if not args.no_log:
         from datetime import datetime as _dt
@@ -1612,7 +1860,7 @@ def main():
             f"| 停損 | {args.stop_loss}% |",
             f"| 追蹤停利 | {trail_info} |",
             f"| 廣度過濾 | {breadth_info} |",
-            f"| 大盤過濾 | MA{args.market_ma} |",
+            f"| 大盤過濾 | MA{args.market_ma}{'＋MA20>MA60' if args.market_bull_entry else ''} |",
             f"| min-rs | {args.min_rs} |",
             f"| 時間停損 | {args.time_stop_days}天 / 最低{args.time_stop_min_pct*100:.0f}% |",
             f"| 每筆倉位 | {args.position_pct*100:.0f}%，最多{max_pos}筆 |",

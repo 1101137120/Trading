@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差
 .venv/bin/python backtest.py --show-skipped \
-  --start               2022-01-01 \
+  --start               2009-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
   --stop-loss           8 \
-  --trail-stop          0.10 \
+  --trail-stop          0.08 \
   --trail-stop-bull     0.18 \
   --trail-stop-rs-bonus 0.05 \
-  --trail-activation    0.08 \
+  --trail-activation    0.03 \
   --max-positions       20 \
   --position-pct        0.30 \
   --stocks              80 \
@@ -30,4 +30,6 @@
   --dev-high-thr        0.05 \
   --dev-low-pct         0.15 \
   --dev-high-mult       1.4 \
-  --market-max-20d-gain 0.10
+  --market-max-20d-gain 0.10 \
+  --market-max-10d-gain 0.07 \
+  --market-bull-entry
