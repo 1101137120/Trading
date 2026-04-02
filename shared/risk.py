@@ -72,8 +72,11 @@ class RiskManager:
 
         if position.should_stop_loss:
             return "stop_loss"
-        if position.should_take_profit:
-            return "take_profit"
+        # 追蹤停利啟用時停用固定停利（對齊回測行為）
+        trail_cfg = self.cfg.get("trailing_stop", {})
+        if not trail_cfg.get("trail_pct", 0):
+            if position.should_take_profit:
+                return "take_profit"
         return None
 
     def check_time_stop(self, position) -> bool:

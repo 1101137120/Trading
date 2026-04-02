@@ -325,7 +325,9 @@ def simulate_trades(
     breadth_allow: dict = None,
     slippage_pct: float = 0.002,
     gap_up_threshold: float = 0.0,
-    pyramid_gain_pct: float = 0.0,      # 舊方式：漲幅達 X% 即加碼（0=停用）
+    pyramid_gain_pct: float = 0.0,      # 第一次加碼漲幅門檻（0=停用）
+    pyramid_gain2_pct: float = 0.0,    # 第二次加碼漲幅門檻（0=停用；建議 0.40）
+    pyramid_rs_min: float = 0.0,       # 第二次加碼需 RS > 此值才執行（0=不檢查）
     pyramid_min_gain: float = 0.10,     # EMA 拉回方式：最小持倉獲利才開始等加碼
     pyramid_ema_period: int = 10,       # EMA 拉回方式：使用哪條 EMA
     pyramid_pullback_pct: float = 0.03, # EMA 拉回方式：距離 EMA 多近才觸發（3%以內）
@@ -411,31 +413,65 @@ def simulate_trades(
 
                 pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
 
-                # 贏家加碼偵測
-                if not position.get("pyramid_done") and i + 1 < len(df):
+                # 贏家加碼偵測（最多兩次）
+                _pyr_level = position.get("pyramid_level", 0)
+                if _pyr_level < 2 and i + 1 < len(df):
                     trigger = False
-                    if pyramid_use_ema:
-                        # EMA 拉回模式：持倉獲利 > min_gain 且收盤貼近 EMAn
-                        if pnl_pct_cur >= pyramid_min_gain:
-                            _close_so_far = df["Close"].astype(float).iloc[: i + 1]
-                            _ema_now = _close_so_far.ewm(
-                                span=pyramid_ema_period, adjust=False
-                            ).mean().iloc[-1]
-                            if _ema_now > 0:
-                                _dev = (current_price - _ema_now) / _ema_now
-                                # 拉回到 EMA 附近（0 ~ pullback_pct 上方），且未跌破 EMA
-                                if 0 <= _dev <= pyramid_pullback_pct:
-                                    trigger = True
-                    elif pyramid_gain_pct > 0:
-                        # 漲幅門檻模式（舊方式）
-                        if pnl_pct_cur >= pyramid_gain_pct:
+                    is_second = (_pyr_level == 1)
+
+                    if not is_second:
+                        # 第一次加碼
+                        if pyramid_use_ema:
+                            if pnl_pct_cur >= pyramid_min_gain:
+                                _close_so_far = df["Close"].astype(float).iloc[: i + 1]
+                                _ema_now = _close_so_far.ewm(
+                                    span=pyramid_ema_period, adjust=False
+                                ).mean().iloc[-1]
+                                if _ema_now > 0:
+                                    _dev = (current_price - _ema_now) / _ema_now
+                                    if 0 <= _dev <= pyramid_pullback_pct:
+                                        trigger = True
+                        elif pyramid_gain_pct > 0:
+                            if pnl_pct_cur >= pyramid_gain_pct:
+                                trigger = True
+                    else:
+                        # 第二次加碼：漲幅門檻 + RS 確認
+                        if pyramid_gain2_pct > 0 and pnl_pct_cur >= pyramid_gain2_pct:
                             trigger = True
+                            if pyramid_rs_min > 0 and _mkt_dates:
+                                # 計算個股近20日 RS vs 0050
+                                _lookback = 20
+                                _stock_closes = df["Close"].astype(float)
+                                if i >= _lookback:
+                                    _stk_ret = float(
+                                        (_stock_closes.iloc[i] - _stock_closes.iloc[i - _lookback])
+                                        / _stock_closes.iloc[i - _lookback]
+                                    ) if _stock_closes.iloc[i - _lookback] > 0 else 0.0
+                                    # 找對應 0050 近20個交易日報酬
+                                    _rd = row_date
+                                    _rd_idx = next(
+                                        (k for k, d in enumerate(_mkt_dates) if d >= _rd),
+                                        len(_mkt_dates) - 1
+                                    )
+                                    if _rd_idx >= _lookback and _mkt_closes[_rd_idx - _lookback] > 0:
+                                        _mkt_ret_now = (
+                                            _mkt_closes[_rd_idx] - _mkt_closes[_rd_idx - _lookback]
+                                        ) / _mkt_closes[_rd_idx - _lookback]
+                                    else:
+                                        _mkt_ret_now = 0.0
+                                    _rs_now = _stk_ret - _mkt_ret_now
+                                    if _rs_now < pyramid_rs_min:
+                                        trigger = False  # RS 不足，跳過第二次加碼
 
                     if trigger:
-                        position["pyramid_done"] = True
-                        position["pyramid_date"] = df["ts"].iloc[i + 1].date()
+                        position["pyramid_level"] = _pyr_level + 1
+                        _key = "pyramid" if _pyr_level == 0 else "pyramid2"
+                        position[f"{_key}_date"]  = df["ts"].iloc[i + 1].date()
                         nxt_open = float(df["Open"].iloc[i + 1])
-                        position["pyramid_price"] = nxt_open * (1 + slippage_pct)
+                        position[f"{_key}_price"] = nxt_open * (1 + slippage_pct)
+                # 向後相容：舊欄位
+                if position.get("pyramid_done") and not position.get("pyramid_level"):
+                    position["pyramid_level"] = 1
 
                 # 2. 盤中觸停損（用 Low 近似，假設在停損價成交）
                 if low_price > 0 and low_price <= position["stop"]:
@@ -512,12 +548,14 @@ def simulate_trades(
                     cooldown_until = row_date + timedelta(days=loss_cooldown_days)
 
                 # 贏家加碼：若加碼點已記錄，產生獨立的加碼交易
-                if (pyramid_gain_pct > 0 or pyramid_use_ema) and position.get("pyramid_done"):
-                    pyr_entry = position["pyramid_price"]
-                    pyr_date  = position["pyramid_date"]
+                _pyr_enabled = pyramid_gain_pct > 0 or pyramid_use_ema or pyramid_gain2_pct > 0
+                for _pkey in ("pyramid", "pyramid2"):
+                    if not (_pyr_enabled and position.get(f"{_pkey}_date")):
+                        continue
+                    pyr_entry = position[f"{_pkey}_price"]
+                    pyr_date  = position[f"{_pkey}_date"]
                     pyr_pnl   = (exit_price - pyr_entry) / pyr_entry
                     pyr_max   = (position["peak_price"] - pyr_entry) / pyr_entry
-                    pyr_hold  = (row_date - pyr_date).days if hasattr(pyr_date, 'days') else 0
                     try:
                         pyr_hold = (row_date - pyr_date).days
                     except Exception:
@@ -538,6 +576,7 @@ def simulate_trades(
                         "ema_dev": position.get("ema_dev", 0.0),
                         "day_volume": position.get("day_volume", 0),
                         "is_pyramid": True,
+                        "pyramid_level": 1 if _pkey == "pyramid" else 2,
                     })
 
                 position = None
@@ -792,6 +831,7 @@ def portfolio_simulation(
     dev_low_pct: float = 0.15,
     dev_high_mult: float = 1.4,
     pyramid_alloc_pct: float = 0.5,
+    market_daily_ret: dict | None = None,   # 0050 日報酬，用於閒置資金輪動
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -799,6 +839,7 @@ def portfolio_simulation(
     - 每筆倉位由 EMA20 乖離率動態決定（<low_thr縮倉/中間標準/>high_thr加碼）
     - 同時持倉不超過 max_positions
     - 1 張 = 1000 股；若預算不足 1 張則自動改用零股（與實盤一致）
+    - 閒置資金（現金部分）視為停泊於 0050，每日依 market_daily_ret 累積收益
     """
     # 同日多筆訊號：信心高（→ RS 高）的優先進場
     trades_sorted = sorted(all_trades,
@@ -815,8 +856,29 @@ def portfolio_simulation(
     total_taxes = 0.0
     total_open_cost = 0.0   # 所有持倉的買入成本合計
 
+    # 0050 輪動追蹤
+    _mkt_keys: list[str] = sorted(market_daily_ret.keys()) if market_daily_ret else []
+    _yr_0050_gain: dict[int, float] = {}
+    _total_0050_gain = 0.0
+    _prev_entry_date = None
+
     for trade in trades_sorted:
         entry_date = trade["entry_date"]
+
+        # 閒置資金停泊 0050：累積從上次事件到本次進場的日報酬（在釋放持倉前，以保守估算閒置）
+        if _mkt_keys and _prev_entry_date is not None and entry_date > _prev_entry_date:
+            _from_str = _prev_entry_date.strftime("%Y-%m-%d")
+            _to_str   = entry_date.strftime("%Y-%m-%d")
+            _i0 = bisect.bisect_right(_mkt_keys, _from_str)
+            _j0 = bisect.bisect_left(_mkt_keys, _to_str)
+            for _ki in range(_i0, _j0):
+                _ds  = _mkt_keys[_ki]
+                _ret = market_daily_ret[_ds]
+                _g   = capital * _ret
+                capital          += _g
+                _total_0050_gain += _g
+                _yr_key = int(_ds[:4])
+                _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
 
         # 釋放已平倉的持倉
         still_active = []
@@ -922,6 +984,23 @@ def portfolio_simulation(
             "cost": cost,
             "code": trade["code"],
         })
+        _prev_entry_date = entry_date
+
+    # 最後一筆進場到最後出場：繼續累積 0050 閒置收益
+    if _mkt_keys and _prev_entry_date is not None and active:
+        _end_date = max(pos["exit_date"] for pos in active)
+        _from_str = _prev_entry_date.strftime("%Y-%m-%d")
+        _to_str   = _end_date.strftime("%Y-%m-%d")
+        _i0 = bisect.bisect_right(_mkt_keys, _from_str)
+        _j0 = bisect.bisect_right(_mkt_keys, _to_str)  # 含末日
+        for _ki in range(_i0, _j0):
+            _ds  = _mkt_keys[_ki]
+            _ret = market_daily_ret[_ds]
+            _g   = capital * _ret
+            capital          += _g
+            _total_0050_gain += _g
+            _yr_key = int(_ds[:4])
+            _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
 
     # 回測結束，釋放剩餘持倉
     for pos in active:
@@ -938,11 +1017,14 @@ def portfolio_simulation(
         "initial_capital": initial_capital,
         "final_capital": round(capital, 0),
         "total_return_pct": round(total_return_pct, 2),
+        "total_pnl": round(capital - initial_capital, 0),
         "max_drawdown_pct": round(max_drawdown, 2),
         "skipped": len(all_trades) - len(taken),
         "total_fees": round(total_fees, 0),
         "total_taxes": round(total_taxes, 0),
         "total_fee_tax": round(total_fees + total_taxes, 0),
+        "total_0050_gain": round(_total_0050_gain, 0),
+        "yr_0050_gain": _yr_0050_gain,
     }
 
 
@@ -1032,7 +1114,11 @@ def main():
                         help="大盤震盪過濾：0050近10日ATR%%超過此值時停止進場（建議 0.015=1.5%%；0=停用）"
                              "。捕捉0050雖上漲但劇烈震盪的市況，避免個股被洗出。")
     parser.add_argument("--pyramid-gain", type=float, default=0.0,
-                        help="加碼門檻（漲幅模式）：持倉漲幅達此值時加碼（建議 0.30=30%%；0=停用）")
+                        help="第一次加碼門檻：持倉漲幅達此值時加碼（建議 0.20=20%%；0=停用）")
+    parser.add_argument("--pyramid-gain2", type=float, default=0.0,
+                        help="第二次加碼門檻：持倉漲幅達此值且 RS 確認時再加碼（建議 0.40=40%%；0=停用）")
+    parser.add_argument("--pyramid-rs-min", type=float, default=0.0,
+                        help="第二次加碼 RS 門檻：個股近20日相對大盤報酬需 > 此值（建議 0.05；0=不檢查）")
     parser.add_argument("--pyramid-ema", action="store_true", default=False,
                         help="加碼使用 EMA 拉回模式（貼近 EMA10 才加碼，比漲幅模式更精準）")
     parser.add_argument("--pyramid-min-gain", type=float, default=0.10,
@@ -1410,6 +1496,8 @@ def main():
                 slippage_pct=args.slippage,
                 gap_up_threshold=args.gap_up_threshold,
                 pyramid_gain_pct=args.pyramid_gain,
+                pyramid_gain2_pct=args.pyramid_gain2,
+                pyramid_rs_min=args.pyramid_rs_min,
                 pyramid_min_gain=args.pyramid_min_gain,
                 pyramid_ema_period=args.pyramid_ema_period,
                 pyramid_pullback_pct=args.pyramid_pullback,
@@ -1439,6 +1527,33 @@ def main():
 
     s = summarize(all_trades)
 
+    # ── 0050 日報酬（供閒置資金輪動 & 年度報酬比較）──
+    _mkt_daily_ret: dict[str, float] = {}
+    try:
+        if use_db:
+            import duckdb as _ddb_pre
+            _con_pre = _ddb_pre.connect("data/stocks.db", read_only=True)
+            _mkt_pre = _con_pre.execute(
+                "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
+            ).df()
+            _con_pre.close()
+            _mkt_pre_c = _mkt_pre["close"].values.astype(float)
+            _mkt_pre_d = _mkt_pre["date"].values
+            for _ii in range(1, len(_mkt_pre_d)):
+                if _mkt_pre_c[_ii - 1] > 0:
+                    _mkt_daily_ret[str(_mkt_pre_d[_ii])[:10]] = float(
+                        _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
+                    )
+        elif market_df is not None and "ts" in market_df.columns:
+            _mdf = market_df.sort_values("ts")
+            _mdf_c = _mdf["Close"].values.astype(float)
+            _mdf_d = _mdf["ts"].dt.strftime("%Y-%m-%d").values
+            for _ii in range(1, len(_mdf_d)):
+                if _mdf_c[_ii - 1] > 0:
+                    _mkt_daily_ret[_mdf_d[_ii]] = float(_mdf_c[_ii] / _mdf_c[_ii - 1] - 1)
+    except Exception:
+        pass
+
     # ── 資金模擬 ──
     psim = portfolio_simulation(
         all_trades,
@@ -1455,6 +1570,7 @@ def main():
         dev_low_pct=args.dev_low_pct,
         dev_high_mult=args.dev_high_mult,
         pyramid_alloc_pct=args.pyramid_alloc,
+        market_daily_ret=_mkt_daily_ret if _mkt_daily_ret else None,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -1494,6 +1610,11 @@ def main():
     ov.add_row("持倉中（未實現）",
                f"[{'green' if holding_total>=0 else 'red'}]{holding_total:+,.0f} 元[/]"
                f"  [dim]({len(holding_df)} 筆)[/dim]")
+    _s_0050 = psim.get("total_0050_gain", 0)
+    if _s_0050 != 0:
+        ov.add_row("停泊0050貢獻",
+                   f"[{'green' if _s_0050>=0 else 'red'}]{_s_0050:+,.0f} 元[/]"
+                   f"  [dim](閒置資金×0050日報酬，已含於最終資金)[/dim]")
     ov.add_row("總手續費+稅",   f"{psim['total_fee_tax']:>14,.0f} 元")
     ov.add_row("執行/跳過",
                f"{len(taken_df)} 筆執行  [dim]{psim['skipped']} 筆跳過[/dim]")
@@ -1709,9 +1830,8 @@ def main():
         import duckdb as _duckdb
         console.rule("[bold]年度績效[/bold]")
 
-        # 取得 0050 年底收盤（用來計算未實現部位的年底市值）
-        _yr_close: dict[int, float] = {}
-        _mkt_yr_ret: dict[int, float] = {}   # 0050 年度報酬率（%）
+        # 取得 0050 年度報酬率（年初→年末收盤）
+        _mkt_yr_ret: dict[int, float] = {}
         try:
             _con2 = _duckdb.connect("data/stocks.db", read_only=True)
             _mkt_yr = _con2.execute(
@@ -1722,13 +1842,15 @@ def main():
             for _yr in range(2007, 2030):
                 _yr_data = _mkt_yr[_mkt_yr["date"].dt.year == _yr].sort_values("date")
                 if not _yr_data.empty:
-                    _yr_close[_yr] = float(_yr_data.iloc[-1]["close"])
                     _first = float(_yr_data.iloc[0]["close"])
                     _last  = float(_yr_data.iloc[-1]["close"])
                     if _first > 0:
                         _mkt_yr_ret[_yr] = (_last / _first - 1) * 100
         except Exception:
             pass
+
+        # 閒置資金 0050 收益來自 portfolio_simulation（已計入 final_capital）
+        _yr_idle_0050 = psim.get("yr_0050_gain", {})
 
         # 建每一筆交易的「年度貢獻」
         # 已實現：按 exit_date 所在年度
@@ -1747,25 +1869,26 @@ def main():
             if _r["pnl_pct"] > 0:
                 _yr_wins[_y] = _yr_wins.get(_y, 0) + 1
 
-        # 未實現部位：每年末用當年末 0050 來估算（我們沒有個股年末價，用持倉 exit_price 代替截止日價格）
-        # 對持倉中部位：持有期間跨過每個年末，計入該年末的未實現損益
+        # 未實現部位：持有期間跨過每個年末，計入該年末的未實現損益
         _hd = holding_df.copy()
         _hd["entry_date"] = pd.to_datetime(_hd["entry_date"])
         _hd["exit_date"]  = pd.to_datetime(_hd["exit_date"])
         for _, _r in _hd.iterrows():
-            # 只在最後一年（exit_date 年）計入未實現
             _y = _r["exit_date"].year
             _yr_unrealized[_y] = _yr_unrealized.get(_y, 0) + _r["net_pnl_dollars"]
 
-        # 累計資金（從初始資金）
-        _all_years = sorted(set(list(_yr_realized.keys()) + list(_yr_unrealized.keys())))
+        # 累計資金（含 0050 停泊收益，與 portfolio_simulation 一致）
+        _all_years = sorted(set(
+            list(_yr_realized.keys()) + list(_yr_unrealized.keys()) + list(_yr_idle_0050.keys())
+        ))
         _cap = psim["initial_capital"]
         _prev_cap = _cap
 
         yr_tbl = Table(show_header=True, box=None, padding=(0, 2))
         yr_tbl.add_column("年度",        style="bold", justify="center")
-        yr_tbl.add_column("已實現損益",  justify="right")
-        yr_tbl.add_column("未實現損益",  justify="right")
+        yr_tbl.add_column("個股損益",    justify="right")
+        yr_tbl.add_column("未實現",      justify="right")
+        yr_tbl.add_column("停泊0050",    justify="right")
         yr_tbl.add_column("年度合計",    justify="right")
         yr_tbl.add_column("年報酬率",    justify="right")
         yr_tbl.add_column("0050",        justify="right")
@@ -1774,26 +1897,32 @@ def main():
         yr_tbl.add_column("勝率",        justify="right")
 
         for _y in _all_years:
-            _real = _yr_realized.get(_y, 0)
-            _unre = _yr_unrealized.get(_y, 0)
-            _total = _real + _unre
+            _real  = _yr_realized.get(_y, 0)
+            _unre  = _yr_unrealized.get(_y, 0)
+            _idle  = _yr_idle_0050.get(_y, 0)
+            _total = _real + _unre + _idle   # 含 0050 停泊收益
             _ann_ret = _total / _prev_cap * 100 if _prev_cap > 0 else 0
-            _cap += _total
+            _cap    += _total   # 含 0050 停泊（與 portfolio_simulation 一致）
             _trades_n = _yr_trades.get(_y, 0)
             _wins_n   = _yr_wins.get(_y, 0)
             _wr_str   = f"{_wins_n}/{_trades_n}" if _trades_n else "—"
-            _clr = "green" if _total >= 0 else "red"
-            _mkt_ret = _mkt_yr_ret.get(_y)
-            _alpha   = (_ann_ret - _mkt_ret) if _mkt_ret is not None else None
-            _mkt_str   = f"{_mkt_ret:+.1f}%" if _mkt_ret is not None else "[dim]—[/dim]"
+            _clr      = "green" if _total >= 0 else "red"
+            _mkt_ret  = _mkt_yr_ret.get(_y)
+            _alpha    = (_ann_ret - _mkt_ret) if _mkt_ret is not None else None
+            _mkt_str  = f"{_mkt_ret:+.1f}%" if _mkt_ret is not None else "[dim]—[/dim]"
             _alpha_str = (
                 f"[{'green' if _alpha >= 0 else 'red'}]{_alpha:+.1f}%[/]"
                 if _alpha is not None else "[dim]—[/dim]"
+            )
+            _idle_str = (
+                f"[{'green' if _idle >= 0 else 'red'}]{_idle:+,.0f}[/]"
+                if _idle != 0 else "[dim]—[/dim]"
             )
             yr_tbl.add_row(
                 str(_y),
                 f"[{'green' if _real>=0 else 'red'}]{_real:+,.0f}[/]",
                 f"[{'green' if _unre>=0 else 'red' if _unre<0 else 'dim'}]{_unre:+,.0f}[/]" if _unre != 0 else "[dim]—[/dim]",
+                _idle_str,
                 f"[{_clr}]{_total:+,.0f}[/{_clr}]",
                 f"[{_clr}]{_ann_ret:+.1f}%[/{_clr}]",
                 _mkt_str,
@@ -1804,7 +1933,15 @@ def main():
             _prev_cap = _cap
 
         console.print(yr_tbl)
-        console.print("[dim]  ※ 未實現損益為回測截止日市值，跨年持倉計入出場年度[/dim]")
+        console.print("[dim]  ※ 未實現損益為回測截止日市值；停泊0050為閒置資金每日複利，已計入最終資金[/dim]")
+        _total_idle = sum(_yr_idle_0050.values())
+        if _total_idle != 0:
+            _idle_clr = "green" if _total_idle >= 0 else "red"
+            console.print(
+                f"  [dim]閒置停泊0050累計貢獻：[/dim]"
+                f"[{_idle_clr}]{_total_idle:+,.0f}[/{_idle_clr}] 元  "
+                f"[dim]（已含於最終資金與年報酬率）[/dim]"
+            )
 
     # ════════════════════════════════════════
     # 9. 存 CSV（持倉中 + 已實現 全部）
@@ -1842,6 +1979,10 @@ def main():
         "time_stop_days":       args.time_stop_days,
         "breadth_min":          args.breadth_min,
         "slippage":             args.slippage,
+        "pyramid_gain":         args.pyramid_gain,
+        "pyramid_gain2":        args.pyramid_gain2,
+        "pyramid_rs_min":       args.pyramid_rs_min,
+        "pyramid_alloc":        args.pyramid_alloc,
     }
 
     # ── 自動時間戳路徑（--output-csv 預設值時才自動命名）──
