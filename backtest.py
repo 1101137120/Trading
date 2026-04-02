@@ -40,6 +40,22 @@ def is_etf_code(code: str) -> bool:
     return str(code).startswith("00")
 
 
+def _vol_slippage(base: float, vol_lots: float) -> float:
+    """
+    按當日成交量（張）調整滑價：流動性越低、實際買賣價差越大。
+      < 300  張/日 → base × 2.5（上限 1%）
+      300–1500 張/日 → base × 1.5
+      > 1500 張/日  → base（標準）
+    """
+    if vol_lots <= 0:
+        return base * 2.0
+    if vol_lots < 300:
+        return min(base * 2.5, 0.010)
+    if vol_lots < 1500:
+        return base * 1.5
+    return base
+
+
 def adjust_splits(df: pd.DataFrame, threshold: float = 0.25) -> pd.DataFrame:
     """
     偵測 K 棒中因除權/股票分割造成的單日大幅跳空（>threshold），
@@ -351,6 +367,7 @@ def simulate_trades(
     fee_rate: float = 0.001425,
     tax_stock_rate: float = 0.003,
     tax_etf_rate: float = 0.001,
+    stock_dividends: "dict | None" = None,   # {ex_date: cash_div_per_share (NT/股)}
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -372,6 +389,7 @@ def simulate_trades(
     position = None
     cooldown_until: date = None  # 個股冷卻到期日
     _tx_rate = tax_etf_rate if is_etf_code(code) else tax_stock_rate  # 賣出稅率
+    _divs: dict = stock_dividends or {}                                # {date: NT/股}
 
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
@@ -419,6 +437,18 @@ def simulate_trades(
 
         # ── 持倉中：Gap停損 → 盤中停損 → 追蹤/固定停利 → 時間/到期 ──
         if position:
+            # ── 除息調整（須在停損檢查前執行，避免除息跌幅誤觸停損）──
+            _div_today = _divs.get(row_date, 0.0)
+            if _div_today > 0:
+                position["accumulated_div"] = position.get("accumulated_div", 0.0) + _div_today
+                position["stop"]       -= _div_today   # 停損線隨除息下移
+                position["target"]     -= _div_today   # 停利目標同步下移
+                position["peak_price"] -= _div_today   # 追蹤停利高點同步下移（等效調整）
+
+            # ── 當日流動性滑價（出場用）──
+            _day_vol = float(df["Volume"].iloc[i])
+            _eff_exit_slip = _vol_slippage(slippage_pct, _day_vol)
+
             open_price = float(df["Open"].iloc[i])
             low_price  = float(df["Low"].iloc[i])
             exit_reason = None
@@ -426,7 +456,7 @@ def simulate_trades(
 
             # 1. Gap stop：開盤已跳空穿停損線 → 以開盤成交（最壞情況）
             if open_price > 0 and open_price <= position["stop"]:
-                exit_price  = open_price * (1 - slippage_pct)
+                exit_price  = open_price * (1 - _eff_exit_slip)
                 exit_reason = "停損(跳空)"
             else:
                 # 更新最高價（追蹤停利用）
@@ -497,7 +527,7 @@ def simulate_trades(
 
                 # 2. 盤中觸停損（用 Low 近似，假設在停損價成交）
                 if low_price > 0 and low_price <= position["stop"]:
-                    exit_price  = position["stop"] * (1 - slippage_pct)
+                    exit_price  = position["stop"] * (1 - _eff_exit_slip)
                     exit_reason = "停損"
                 elif trail_stop_pct > 0:
                     # 追蹤停利模式：漲幅達 trail_activation_pct 後才啟動
@@ -513,18 +543,18 @@ def simulate_trades(
                             eff_trail += trail_stop_rs_bonus
                         trail_floor = position["peak_price"] * (1 - eff_trail)
                         if current_price <= trail_floor:
-                            exit_price  = current_price * (1 - slippage_pct)
+                            exit_price  = current_price * (1 - _eff_exit_slip)
                             exit_reason = "追蹤停利"
                 elif current_price >= position["target"]:
                     # 固定停利（僅在未使用追蹤停利時有效）
-                    exit_price  = current_price * (1 - slippage_pct)
+                    exit_price  = current_price * (1 - _eff_exit_slip)
                     exit_reason = "停利"
 
             hold = (row_date - position["entry_date"]).days
             if exit_reason is None:
                 pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
                 if max_hold_days > 0 and hold >= max_hold_days:
-                    exit_price  = current_price * (1 - slippage_pct)
+                    exit_price  = current_price * (1 - _eff_exit_slip)
                     exit_reason = "到期出場"
                 elif (early_exit_days > 0 and hold >= early_exit_days
                       and pnl_pct_cur < 0 and _mkt_dates):
@@ -535,21 +565,24 @@ def simulate_trades(
                         if _mp >= 0:
                             mkt_ret = (_mkt_closes[_mp] - mkt_entry) / mkt_entry
                             if pnl_pct_cur - mkt_ret < -early_exit_lag:
-                                exit_price  = current_price * (1 - slippage_pct)
+                                exit_price  = current_price * (1 - _eff_exit_slip)
                                 exit_reason = "時間停損(跑輸大盤)"
                 elif (time_stop_days > 0 and hold >= time_stop_days
                       and pnl_pct_cur < time_stop_min_pct):
                     # 持倉超過 N 天但漲幅未達門檻 → 佔位不賺，強制出場
-                    exit_price  = current_price * (1 - slippage_pct)
+                    exit_price  = current_price * (1 - _eff_exit_slip)
                     exit_reason = "時間停損"
                 elif row_date == end or i == len(df) - 1:
-                    exit_price  = current_price * (1 - slippage_pct)
+                    exit_price  = current_price * (1 - _eff_exit_slip)
                     exit_reason = "回測結束"
 
             if exit_reason:
-                _ep = position["entry_price"]
+                _ep  = position["entry_price"]
+                _acc_div = position.get("accumulated_div", 0.0)
+                # 配息納入有效出場價（配息收現金，不扣交易稅費）
+                _eff_exit = exit_price + _acc_div
                 _net_entry = _ep * (1 + fee_rate)
-                _net_exit  = exit_price * (1 - fee_rate - _tx_rate)
+                _net_exit  = _eff_exit * (1 - fee_rate - _tx_rate)
                 pnl_pct = (_net_exit - _net_entry) / _net_entry
                 max_gain_pct = (position["peak_price"] - _ep) / _ep
                 trades.append({
@@ -558,6 +591,7 @@ def simulate_trades(
                     "exit_date": row_date,
                     "entry_price": position["entry_price"],
                     "exit_price": exit_price,
+                    "accumulated_div": round(_acc_div, 4),
                     "pnl_pct": round(pnl_pct * 100, 2),
                     "max_gain_pct": round(max_gain_pct * 100, 2),
                     "hold_days": hold,
@@ -580,7 +614,7 @@ def simulate_trades(
                     pyr_entry = position[f"{_pkey}_price"]
                     pyr_date  = position[f"{_pkey}_date"]
                     _pyr_net_entry = pyr_entry * (1 + fee_rate)
-                    _pyr_net_exit  = exit_price * (1 - fee_rate - _tx_rate)
+                    _pyr_net_exit  = _eff_exit * (1 - fee_rate - _tx_rate)
                     pyr_pnl   = (_pyr_net_exit - _pyr_net_entry) / _pyr_net_entry
                     pyr_max   = (position["peak_price"] - pyr_entry) / pyr_entry
                     try:
@@ -593,6 +627,7 @@ def simulate_trades(
                         "exit_date": row_date,
                         "entry_price": round(pyr_entry, 2),
                         "exit_price": exit_price,
+                        "accumulated_div": round(_acc_div, 4),
                         "pnl_pct": round(pyr_pnl * 100, 2),
                         "max_gain_pct": round(max(pyr_max, 0) * 100, 2),
                         "hold_days": pyr_hold,
@@ -742,7 +777,8 @@ def simulate_trades(
             if next_open <= 0:
                 continue
 
-            entry_price = next_open * (1 + slippage_pct)
+            _eff_entry_slip = _vol_slippage(slippage_pct, next_vol)
+            entry_price = next_open * (1 + _eff_entry_slip)
             stop   = entry_price * (1 - stop_loss_pct)
             target = entry_price * (1 + take_profit_pct)
 
@@ -821,6 +857,7 @@ def simulate_trades(
                 "rs_score": rs_score,
                 "ema_dev": ema_dev_at_entry,
                 "mkt_close_at_entry": mkt_close_at_entry,
+                "accumulated_div": 0.0,   # 持倉期間累計配息（NT/股）
             }
 
     return trades
@@ -865,6 +902,7 @@ def portfolio_simulation(
     market_above_ma: dict | None = None,     # {date_str: bool}，True = 0050>MA20，可停泊
     bull_max_positions: int = 0,             # 牛市（MA20>MA60）時允許更多持倉（0=停用）
     market_bull_dates: dict | None = None,   # {date_str: bool}，True = MA20>MA60
+    odd_lot_penalty_pct: float = 0.003,      # 零股額外執行成本（買賣各 0.3%）
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1021,16 +1059,29 @@ def portfolio_simulation(
         if qty <= 0:
             continue
 
+        # 零股額外執行成本（買賣各 odd_lot_penalty_pct）
+        odd_lot_buy_pen  = cost * odd_lot_penalty_pct if is_odd_lot else 0.0
+        odd_lot_sell_pen = 0.0
+
         gross_pnl_dollars = qty * unit_size * (trade["exit_price"] - price)
         sell_amount = qty * trade["exit_price"] * unit_size
         fee_sell = max(sell_amount * fee_rate, min_fee)
         tax_rate = tax_etf_rate if is_etf_code(trade["code"]) else tax_stock_rate
         tax = sell_amount * tax_rate
-        net_pnl_dollars = gross_pnl_dollars - fee_buy - fee_sell - tax
+        if is_odd_lot:
+            odd_lot_sell_pen = sell_amount * odd_lot_penalty_pct
 
-        capital -= (cost + fee_buy)
+        # 配息現金（持倉期間收到的現金股利）
+        div_cash = qty * unit_size * trade.get("accumulated_div", 0.0)
+
+        net_pnl_dollars = (gross_pnl_dollars + div_cash
+                           - fee_buy - odd_lot_buy_pen
+                           - fee_sell - odd_lot_sell_pen
+                           - tax)
+
+        capital -= (cost + fee_buy + odd_lot_buy_pen)
         total_open_cost += cost          # 開倉：持倉成本增加
-        total_fees += fee_buy + fee_sell
+        total_fees += fee_buy + fee_sell + odd_lot_buy_pen + odd_lot_sell_pen
         total_taxes += tax
 
         # lots 欄位：整張時為張數，零股時為股數（顯示用）
@@ -1042,17 +1093,18 @@ def portfolio_simulation(
             "odd_lot": is_odd_lot,
             "cost": round(cost, 0),
             "alloc_pct": round(alloc / capital * 100, 1) if capital > 0 else 0,
-            "fee_buy": round(fee_buy, 0),
-            "fee_sell": round(fee_sell, 0),
+            "fee_buy": round(fee_buy + odd_lot_buy_pen, 0),
+            "fee_sell": round(fee_sell + odd_lot_sell_pen, 0),
             "tax": round(tax, 0),
-            "fee_tax_total": round(fee_buy + fee_sell + tax, 0),
-            "gross_pnl_dollars": round(gross_pnl_dollars, 0),
-            "pnl_dollars": round(net_pnl_dollars, 0),  # 相容舊欄位：改為淨損益
+            "fee_tax_total": round(fee_buy + odd_lot_buy_pen + fee_sell + odd_lot_sell_pen + tax, 0),
+            "div_cash": round(div_cash, 0),
+            "gross_pnl_dollars": round(gross_pnl_dollars + div_cash, 0),
+            "pnl_dollars": round(net_pnl_dollars, 0),
             "net_pnl_dollars": round(net_pnl_dollars, 0),
         })
         active.append({
             "exit_date": trade["exit_date"],
-            "exit_cash": cost + gross_pnl_dollars - fee_sell - tax,
+            "exit_cash": cost + gross_pnl_dollars + div_cash - fee_sell - odd_lot_sell_pen - tax,
             "cost": cost,
             "code": trade["code"],
         })
@@ -1425,6 +1477,12 @@ def main():
                         help="股票賣出證交稅率，預設 0.003")
     parser.add_argument("--tax-etf-rate", type=float, default=0.001,
                         help="ETF 賣出稅率，預設 0.001")
+    parser.add_argument("--odd-lot-penalty", type=float, default=0.003,
+                        help="零股額外執行成本（買賣各此比例），預設 0.003 = 0.3%%；0=停用")
+    parser.add_argument("--no-dividend-adjust", action="store_true", default=False,
+                        help="停用配息調整（預設：若 DB 有配息資料則自動啟用）")
+    parser.add_argument("--fetch-dividends", action="store_true", default=False,
+                        help="從 yfinance 抓取歷史配息資料並存入 DB（一次性預建，完成後退出）")
     parser.add_argument("--no-db", action="store_true",
                         help="強制使用 API 模式，忽略本地 DB（預設：DB 存在時自動使用）")
     parser.add_argument("--show-skipped", action="store_true", default=False,
@@ -1435,6 +1493,24 @@ def main():
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end   = datetime.strptime(args.end,   "%Y-%m-%d").date()
+
+    # ── --fetch-dividends：一次性抓取配息資料後退出 ──
+    if args.fetch_dividends:
+        from shared.dividend_cache import build_dividends_db
+        DB_PATH_DIV = "data/stocks.db"
+        import duckdb as _ddb_div
+        _con_div = _ddb_div.connect(DB_PATH_DIV, read_only=True)
+        _stock_rows = _con_div.execute("SELECT code, market FROM stocks").fetchall()
+        _con_div.close()
+        _all_codes  = [r[0] for r in _stock_rows]
+        _all_markets = {r[0]: r[1] for r in _stock_rows}
+        console.print(f"[cyan]開始抓取 {len(_all_codes)} 支股票配息資料（從 yfinance）...[/cyan]")
+        n = build_dividends_db(
+            DB_PATH_DIV, _all_codes, _all_markets,
+            start_year=start.year, end_year=end.year,
+        )
+        console.print(f"[green]配息資料建置完成：{n} 筆存入 DB[/green]")
+        return
 
     # ── 載入設定 ──
     try:
@@ -1698,6 +1774,26 @@ def main():
         blocked = sum(1 for v in breadth_map.values() if not v)
         console.print(f"[dim]廣度過濾：門檻 {args.breadth_min*100:.0f}%，共 {blocked} 個交易日禁止開倉[/dim]")
 
+    # ── 配息資料載入（若 DB 有 dividends 表且未停用）──
+    _all_dividends: dict = {}
+    if not args.no_dividend_adjust and use_db:
+        from shared.dividend_cache import load_dividends_from_db, has_dividend_data
+        _db_path_div = "data/stocks.db"
+        if has_dividend_data(_db_path_div):
+            _all_dividends = load_dividends_from_db(
+                _db_path_div,
+                list(all_kbars.keys()),
+                start=start, end=end,
+            )
+            console.print(
+                f"[dim]配息調整：載入 {sum(len(v) for v in _all_dividends.values())} 筆"
+                f"（{len(_all_dividends)} 支有配息記錄）[/dim]"
+            )
+        else:
+            console.print(
+                "[dim]配息調整：DB 無配息資料，執行 --fetch-dividends 可預建[/dim]"
+            )
+
     # ── 第二輪：逐檔回測 ──
     all_trades: list[dict] = []
     all_skipped_signals: list[dict] = [] if args.show_skipped else None
@@ -1742,6 +1838,7 @@ def main():
                 fee_rate=args.fee_rate,
                 tax_stock_rate=args.tax_stock_rate,
                 tax_etf_rate=args.tax_etf_rate,
+                stock_dividends=_all_dividends.get(code) if _all_dividends else None,
                 pyramid_gain_pct=args.pyramid_gain,
                 pyramid_gain2_pct=args.pyramid_gain2,
                 pyramid_rs_min=args.pyramid_rs_min,
@@ -1850,6 +1947,7 @@ def main():
         market_above_ma=_mkt_above_ma if _mkt_above_ma else None,
         bull_max_positions=args.bull_max_positions,
         market_bull_dates=_mkt_bull_dates if _mkt_bull_dates else None,
+        odd_lot_penalty_pct=args.odd_lot_penalty,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
