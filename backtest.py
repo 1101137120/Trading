@@ -892,11 +892,19 @@ def portfolio_simulation(
             _j0 = bisect.bisect_left(_mkt_keys, _to_str)
             _period_cap  = capital
             _period_gain = 0.0
+            _park_buy_paid = False
             for _ki in range(_i0, _j0):
                 _ds  = _mkt_keys[_ki]
                 # 只在 0050>MA20 時才停泊（market_above_ma 未提供則無條件停泊）
                 if market_above_ma is not None and not market_above_ma.get(_ds, False):
                     continue
+                # 第一個停泊日：扣買入手續費
+                if not _park_buy_paid:
+                    _park_fee_buy = max(capital * fee_rate, min_fee)
+                    capital          -= _park_fee_buy
+                    _total_0050_gain -= _park_fee_buy
+                    total_fees       += _park_fee_buy
+                    _park_buy_paid    = True
                 _ret = market_daily_ret[_ds]
                 _g   = capital * _ret
                 capital          += _g
@@ -904,6 +912,14 @@ def portfolio_simulation(
                 _period_gain     += _g
                 _yr_key = int(_ds[:4])
                 _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
+            # 停泊結束：扣賣出手續費 + ETF 稅
+            if _park_buy_paid:
+                _park_fee_sell = max(capital * fee_rate, min_fee)
+                _park_tax      = capital * tax_etf_rate
+                capital          -= (_park_fee_sell + _park_tax)
+                _total_0050_gain -= (_park_fee_sell + _park_tax)
+                total_fees       += _park_fee_sell
+                total_taxes      += _park_tax
             if _period_gain != 0:
                 _parking_records.append({
                     "from_date": _from_str, "to_date": _to_str,
@@ -1035,10 +1051,18 @@ def portfolio_simulation(
         _j0 = bisect.bisect_right(_mkt_keys, _to_str)  # 含末日
         _period_cap  = capital
         _period_gain = 0.0
+        _park_buy_paid = False
         for _ki in range(_i0, _j0):
             _ds  = _mkt_keys[_ki]
             if market_above_ma is not None and not market_above_ma.get(_ds, False):
                 continue
+            # 第一個停泊日：扣買入手續費
+            if not _park_buy_paid:
+                _park_fee_buy = max(capital * fee_rate, min_fee)
+                capital          -= _park_fee_buy
+                _total_0050_gain -= _park_fee_buy
+                total_fees       += _park_fee_buy
+                _park_buy_paid    = True
             _ret = market_daily_ret[_ds]
             _g   = capital * _ret
             capital          += _g
@@ -1046,6 +1070,14 @@ def portfolio_simulation(
             _period_gain     += _g
             _yr_key = int(_ds[:4])
             _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
+        # 停泊結束：扣賣出手續費 + ETF 稅
+        if _park_buy_paid:
+            _park_fee_sell = max(capital * fee_rate, min_fee)
+            _park_tax      = capital * tax_etf_rate
+            capital          -= (_park_fee_sell + _park_tax)
+            _total_0050_gain -= (_park_fee_sell + _park_tax)
+            total_fees       += _park_fee_sell
+            total_taxes      += _park_tax
         if _period_gain != 0:
             _parking_records.append({
                 "from_date": _from_str, "to_date": _to_str,
