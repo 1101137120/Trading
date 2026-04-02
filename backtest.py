@@ -255,6 +255,8 @@ def _forward_scan(
     target: float,
     end: date,
     slippage_pct: float,
+    fee_rate: float = 0.001425,
+    tax_rate: float = 0.003,
 ) -> dict:
     """
     從 entry_idx+1 起向前掃描，模擬假設持倉的結果。
@@ -283,11 +285,13 @@ def _forward_scan(
         if exit_price:
             hold_days = (row_date - entry_date).days
             exit_price *= (1 - slippage_pct)
+            _net_entry = entry_price * (1 + fee_rate)
+            _net_exit  = exit_price  * (1 - fee_rate - tax_rate)
             return {
                 "exit_price": round(exit_price, 2),
                 "exit_reason": exit_reason,
                 "hold_days": hold_days,
-                "pnl_pct": round((exit_price - entry_price) / entry_price * 100, 2),
+                "pnl_pct": round((_net_exit - _net_entry) / _net_entry * 100, 2),
                 "max_gain_pct": round((peak - entry_price) / entry_price * 100, 2),
             }
     # 掃到結束
@@ -295,11 +299,13 @@ def _forward_scan(
     last_close = float(df["Close"].iloc[last_i]) * (1 - slippage_pct)
     last_date  = df["ts"].iloc[last_i].date()
     peak = max(peak, last_close)
+    _net_entry = entry_price * (1 + fee_rate)
+    _net_exit  = last_close  * (1 - fee_rate - tax_rate)
     return {
         "exit_price": round(last_close, 2),
         "exit_reason": "區間結束",
         "hold_days": (last_date - entry_date).days,
-        "pnl_pct": round((last_close - entry_price) / entry_price * 100, 2),
+        "pnl_pct": round((_net_exit - _net_entry) / _net_entry * 100, 2),
         "max_gain_pct": round((peak - entry_price) / entry_price * 100, 2),
     }
 
@@ -342,6 +348,9 @@ def simulate_trades(
     pyramid_use_ema: bool = False,      # True=用 EMA 拉回；False=用漲幅門檻
     market_bull_entry: bool = False,   # True=只在 0050 MA20>MA60 時才開倉
     skipped_out: list = None,
+    fee_rate: float = 0.001425,
+    tax_stock_rate: float = 0.003,
+    tax_etf_rate: float = 0.001,
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -362,6 +371,7 @@ def simulate_trades(
     trades = []
     position = None
     cooldown_until: date = None  # 個股冷卻到期日
+    _tx_rate = tax_etf_rate if is_etf_code(code) else tax_stock_rate  # 賣出稅率
 
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
@@ -537,8 +547,11 @@ def simulate_trades(
                     exit_reason = "回測結束"
 
             if exit_reason:
-                pnl_pct = (exit_price - position["entry_price"]) / position["entry_price"]
-                max_gain_pct = (position["peak_price"] - position["entry_price"]) / position["entry_price"]
+                _ep = position["entry_price"]
+                _net_entry = _ep * (1 + fee_rate)
+                _net_exit  = exit_price * (1 - fee_rate - _tx_rate)
+                pnl_pct = (_net_exit - _net_entry) / _net_entry
+                max_gain_pct = (position["peak_price"] - _ep) / _ep
                 trades.append({
                     "code": code,
                     "entry_date": position["entry_date"],
@@ -566,7 +579,9 @@ def simulate_trades(
                         continue
                     pyr_entry = position[f"{_pkey}_price"]
                     pyr_date  = position[f"{_pkey}_date"]
-                    pyr_pnl   = (exit_price - pyr_entry) / pyr_entry
+                    _pyr_net_entry = pyr_entry * (1 + fee_rate)
+                    _pyr_net_exit  = exit_price * (1 - fee_rate - _tx_rate)
+                    pyr_pnl   = (_pyr_net_exit - _pyr_net_entry) / _pyr_net_entry
                     pyr_max   = (position["peak_price"] - pyr_entry) / pyr_entry
                     try:
                         pyr_hold = (row_date - pyr_date).days
@@ -1724,6 +1739,9 @@ def main():
                 breadth_allow=breadth_map,
                 slippage_pct=args.slippage,
                 gap_up_threshold=args.gap_up_threshold,
+                fee_rate=args.fee_rate,
+                tax_stock_rate=args.tax_stock_rate,
+                tax_etf_rate=args.tax_etf_rate,
                 pyramid_gain_pct=args.pyramid_gain,
                 pyramid_gain2_pct=args.pyramid_gain2,
                 pyramid_rs_min=args.pyramid_rs_min,
