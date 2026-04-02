@@ -28,7 +28,7 @@ from rich.table import Table
 from shared.standalone_feed import fetch_tse_daily_all, fetch_kbars
 from shared.db import (
     DB_PATH, get_conn as _db_conn, load_kbars as _db_load_kbars,
-    get_all_stocks as _db_all_stocks,
+    bulk_load_kbars as _db_bulk_load,
 )
 from tech.strategies.engine import StrategyEngine
 
@@ -132,47 +132,55 @@ def build_breadth_map(
     all_kbars: dict[str, pd.DataFrame],
     ema_period: int = 20,
     min_ratio: float = 0.40,
+    db_codes: list[str] | None = None,
+    db_start: str | None = None,
+    db_end: str | None = None,
 ) -> dict:
     """
     逐日計算市場廣度：股票池中收盤 > EMA{ema_period} 的比例。
     比例低於 min_ratio 的交易日禁止開倉（個股環境太差）。
     回傳 {date: bool}，True = 廣度健康可進場。
+
+    db_codes/db_start/db_end 有傳時走快速路徑（一條 SQL → pivot → ewm），
+    否則從 all_kbars dict 建表（較慢）。
     """
-    from tech.strategies.indicators import ema as _ema
+    if not all_kbars:
+        return {}
 
-    all_dates = sorted({
-        row.date()
-        for df in all_kbars.values()
-        for row in df["ts"]
-    })
+    # ── 快速路徑：從 DB 直接撈 close，一次 pivot ──
+    if db_codes and db_start and db_end and DB_PATH.exists():
+        try:
+            ph = ", ".join("?" * len(db_codes))
+            with _db_conn(DB_PATH, read_only=True) as _conn:
+                raw = _conn.execute(
+                    f"SELECT date, code, close FROM daily_prices "
+                    f"WHERE code IN ({ph}) AND date>=? AND date<=? ORDER BY date",
+                    db_codes + [db_start, db_end],
+                ).df()
+            raw["date"] = pd.to_datetime(raw["date"])
+            wide = raw.pivot_table(index="date", columns="code", values="close", aggfunc="last")
+            wide = wide.sort_index().astype(float)
+            ema_wide = wide.ewm(span=ema_period, adjust=False).mean()
+            daily_above = (wide > ema_wide).sum(axis=1)
+            daily_total = ema_wide.notna().sum(axis=1)
+            ratio = (daily_above / daily_total.replace(0, float("nan"))).fillna(1.0)
+            return {ts.date(): bool(v >= min_ratio) for ts, v in ratio.items()}
+        except Exception:
+            pass  # fallback 到慢路徑
 
-    # 預先算好每檔的 EMA 與收盤 {code: {date: (close, ema_val)}}
-    lookup: dict[str, dict] = {}
-    for code, df in all_kbars.items():
-        ema_series = _ema(df["Close"].astype(float), ema_period)
-        date_map = {}
-        for ts, close_val, ema_val in zip(df["ts"], df["Close"], ema_series):
-            d = ts.date() if hasattr(ts, "date") else ts
-            date_map[d] = (float(close_val), ema_val)
-        lookup[code] = date_map
-
-    breadth_allow: dict[date, bool] = {}
-    for d in all_dates:
-        above = 0
-        total = 0
-        for date_map in lookup.values():
-            entry = date_map.get(d)
-            if entry is None:
-                continue
-            close_val, ema_val = entry
-            if ema_val is None or pd.isna(ema_val):
-                continue
-            total += 1
-            if close_val > ema_val:
-                above += 1
-        ratio = above / total if total > 0 else 1.0
-        breadth_allow[d] = ratio >= min_ratio
-    return breadth_allow
+    # ── 慢路徑（fallback）：從 all_kbars dict 建表 ──
+    combined = pd.concat(
+        [df[["ts", "Close"]].assign(code=code) for code, df in all_kbars.items()],
+        ignore_index=True,
+    )
+    combined["ts"] = pd.to_datetime(combined["ts"]).dt.normalize()
+    wide = combined.pivot_table(index="ts", columns="code", values="Close", aggfunc="last")
+    wide = wide.sort_index().astype(float)
+    ema_wide = wide.ewm(span=ema_period, adjust=False).mean()
+    daily_above = (wide > ema_wide).sum(axis=1)
+    daily_total = ema_wide.notna().sum(axis=1)
+    ratio = (daily_above / daily_total.replace(0, float("nan"))).fillna(1.0)
+    return {ts.date(): bool(v >= min_ratio) for ts, v in ratio.items()}
 
 
 def calc_benchmark(
@@ -383,6 +391,10 @@ def simulate_trades(
             _mkt_dates.append(d)
             _mkt_closes.append(float(row["Close"]))
 
+    # ── 批次預算訊號（回測加速：一次算完整條 df 的 EMA/ADX/ATR）──
+    # None = 不支援批次（退回逐日）；{} = 支援但本檔無訊號
+    _batch_signals = engine.evaluate_batch(code, df)
+
     for i in range(len(df)):
         row_date = df["ts"].iloc[i].date()
 
@@ -585,8 +597,8 @@ def simulate_trades(
         # ── 空倉：大盤過濾 ──
         if market_allow and not market_allow.get(row_date, True):
             if skipped_out is not None and i + 1 < len(df):
-                df_slice = df.iloc[: i + 1].copy()
-                sig = engine.evaluate(code, df_slice)
+                sig = (_batch_signals.get(i) if _batch_signals is not None
+                       else engine.evaluate(code, df.iloc[: i + 1].copy()))
                 if sig and sig.action == "Buy":
                     _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
                     if _ep > 0:
@@ -600,8 +612,8 @@ def simulate_trades(
         # ── 空倉：大盤持續上行過濾（MA20 > MA60）──
         if market_bull_entry and not market_bull.get(row_date, False):
             if skipped_out is not None and i + 1 < len(df):
-                df_slice = df.iloc[: i + 1].copy()
-                sig = engine.evaluate(code, df_slice)
+                sig = (_batch_signals.get(i) if _batch_signals is not None
+                       else engine.evaluate(code, df.iloc[: i + 1].copy()))
                 if sig and sig.action == "Buy":
                     _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
                     if _ep > 0:
@@ -636,8 +648,8 @@ def simulate_trades(
                 if _mkt_10d_ret is not None and _mkt_10d_ret > market_max_10d_gain:
                     _heat_label.append(f"10d+{_mkt_10d_ret*100:.0f}%")
                 if skipped_out is not None and i + 1 < len(df):
-                    df_slice = df.iloc[: i + 1].copy()
-                    sig = engine.evaluate(code, df_slice)
+                    sig = (_batch_signals.get(i) if _batch_signals is not None
+                           else engine.evaluate(code, df.iloc[: i + 1].copy()))
                     if sig and sig.action == "Buy":
                         _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
                         if _ep > 0:
@@ -652,8 +664,8 @@ def simulate_trades(
         # ── 空倉：大盤震盪過濾（ATR%）──
         if market_atr_max > 0 and market_atr.get(row_date, 0) > market_atr_max:
             if skipped_out is not None and i + 1 < len(df):
-                df_slice = df.iloc[: i + 1].copy()
-                sig = engine.evaluate(code, df_slice)
+                sig = (_batch_signals.get(i) if _batch_signals is not None
+                       else engine.evaluate(code, df.iloc[: i + 1].copy()))
                 if sig and sig.action == "Buy":
                     _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
                     if _ep > 0:
@@ -668,8 +680,8 @@ def simulate_trades(
         # ── 空倉：市場廣度過濾 ──
         if breadth_allow is not None and not breadth_allow.get(row_date, True):
             if skipped_out is not None and i + 1 < len(df):
-                df_slice = df.iloc[: i + 1].copy()
-                sig = engine.evaluate(code, df_slice)
+                sig = (_batch_signals.get(i) if _batch_signals is not None
+                       else engine.evaluate(code, df.iloc[: i + 1].copy()))
                 if sig and sig.action == "Buy":
                     _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
                     if _ep > 0:
@@ -687,8 +699,8 @@ def simulate_trades(
         # ── 空倉：個股冷卻 ──
         if cooldown_until and row_date <= cooldown_until:
             if skipped_out is not None and i + 1 < len(df):
-                df_slice = df.iloc[: i + 1].copy()
-                sig = engine.evaluate(code, df_slice)
+                sig = (_batch_signals.get(i) if _batch_signals is not None
+                       else engine.evaluate(code, df.iloc[: i + 1].copy()))
                 if sig and sig.action == "Buy":
                     _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
                     if _ep > 0:
@@ -699,9 +711,12 @@ def simulate_trades(
                                             "strategy": sig.strategy, **_fwd})
             continue
 
-        # ── 空倉：評估策略訊號 ──
-        df_slice = df.iloc[: i + 1].copy()
-        sig = engine.evaluate(code, df_slice)
+        # ── 空倉：評估策略訊號（優先用批次預算，None 代表不支援才逐日計算）──
+        if _batch_signals is not None:
+            sig = _batch_signals.get(i)   # 支援批次，直接查表（可能 None = 無訊號）
+        else:
+            df_slice = df.iloc[: i + 1].copy()
+            sig = engine.evaluate(code, df_slice)
         if sig and sig.action == "Buy":
             # 次日開盤進場（避免訊號日收盤 lookahead bias）
             if i + 1 >= len(df):
@@ -831,7 +846,8 @@ def portfolio_simulation(
     dev_low_pct: float = 0.15,
     dev_high_mult: float = 1.4,
     pyramid_alloc_pct: float = 0.5,
-    market_daily_ret: dict | None = None,   # 0050 日報酬，用於閒置資金輪動
+    market_daily_ret: dict | None = None,    # 0050 日報酬，用於閒置資金輪動
+    market_above_ma: dict | None = None,     # {date_str: bool}，True = 0050>MA20，可停泊
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -839,7 +855,7 @@ def portfolio_simulation(
     - 每筆倉位由 EMA20 乖離率動態決定（<low_thr縮倉/中間標準/>high_thr加碼）
     - 同時持倉不超過 max_positions
     - 1 張 = 1000 股；若預算不足 1 張則自動改用零股（與實盤一致）
-    - 閒置資金（現金部分）視為停泊於 0050，每日依 market_daily_ret 累積收益
+    - 閒置資金（現金部分）在 0050>MA20 時停泊 0050，否則保持現金
     """
     # 同日多筆訊號：信心高（→ RS 高）的優先進場
     trades_sorted = sorted(all_trades,
@@ -865,7 +881,7 @@ def portfolio_simulation(
     for trade in trades_sorted:
         entry_date = trade["entry_date"]
 
-        # 閒置資金停泊 0050：累積從上次事件到本次進場的日報酬（在釋放持倉前，以保守估算閒置）
+        # 閒置資金停泊 0050：0050>MA20 才停泊，否則保持現金
         if _mkt_keys and _prev_entry_date is not None and entry_date > _prev_entry_date:
             _from_str = _prev_entry_date.strftime("%Y-%m-%d")
             _to_str   = entry_date.strftime("%Y-%m-%d")
@@ -873,6 +889,9 @@ def portfolio_simulation(
             _j0 = bisect.bisect_left(_mkt_keys, _to_str)
             for _ki in range(_i0, _j0):
                 _ds  = _mkt_keys[_ki]
+                # 只在 0050>MA20 時才停泊（market_above_ma 未提供則無條件停泊）
+                if market_above_ma is not None and not market_above_ma.get(_ds, False):
+                    continue
                 _ret = market_daily_ret[_ds]
                 _g   = capital * _ret
                 capital          += _g
@@ -995,6 +1014,8 @@ def portfolio_simulation(
         _j0 = bisect.bisect_right(_mkt_keys, _to_str)  # 含末日
         for _ki in range(_i0, _j0):
             _ds  = _mkt_keys[_ki]
+            if market_above_ma is not None and not market_above_ma.get(_ds, False):
+                continue
             _ret = market_daily_ret[_ds]
             _g   = capital * _ret
             capital          += _g
@@ -1391,22 +1412,25 @@ def main():
     db_hits = 0
     api_hits = 0
 
-    with console.status("[dim]載入 K 棒...[/dim]") as status:
+    # ── DB 模式：一次批量讀取全部 K 棒（一條連線 + 一條 SQL）──
+    db_bulk: dict[str, pd.DataFrame] = {}
+    if use_db:
+        db_start = (start - __import__("datetime").timedelta(days=lookback_needed)).strftime("%Y-%m-%d")
+        all_codes = [s["code"] for s in pool]
+        console.print(f"[dim]批量讀取 {len(all_codes)} 支股票 K 棒...[/dim]")
+        db_bulk = _db_bulk_load(all_codes, db_start, end.strftime("%Y-%m-%d"))
+        db_hits = len(db_bulk)
+        console.print(f"[dim]DB 批量讀取完成：{db_hits} 支[/dim]")
+
+    with console.status("[dim]處理 K 棒...[/dim]") as status:
         for i, stock in enumerate(pool):
             code = stock["code"]
             name = stock.get("name", "")
             status.update(f"[dim]({i+1}/{len(pool)}) {code} {name}[/dim]")
 
-            df = None
+            df = db_bulk.get(code)  # 從批量結果取
 
-            # 1. 嘗試從 DB 讀
-            if use_db:
-                db_start = (start - __import__("datetime").timedelta(days=lookback_needed)).strftime("%Y-%m-%d")
-                df = _db_load_kbars(code, db_start, end.strftime("%Y-%m-%d"), read_only=True)
-                if df is not None and len(df) >= 60:
-                    db_hits += 1
-
-            # 2. DB 沒有或不夠，fallback 到 API
+            # DB 沒有或不夠，fallback 到 API
             if df is None or len(df) < 60:
                 df = None
                 for attempt in range(1, max(1, args.kbars_retries) + 1):
@@ -1431,7 +1455,7 @@ def main():
                 time.sleep(0.15)
 
     if use_db:
-        console.print(f"[dim]K 棒來源：DB {db_hits} 支 / API fallback {api_hits} 支[/dim]")
+        console.print(f"[dim]K 棒來源：DB 批量 {db_hits} 支 / API fallback {api_hits} 支[/dim]")
 
     # ── 建立動態股票池（消除存活者偏差）──
     dynamic_pool = None
@@ -1450,7 +1474,15 @@ def main():
     breadth_map = None
     if args.breadth_filter and all_kbars:
         with console.status("[dim]計算市場廣度（逐日 EMA20 廣度）...[/dim]"):
-            breadth_map = build_breadth_map(all_kbars, ema_period=20, min_ratio=args.breadth_min)
+            _breadth_codes = list(all_kbars.keys())
+            _breadth_start = (start - __import__("datetime").timedelta(days=30)).strftime("%Y-%m-%d")
+            _breadth_end   = end.strftime("%Y-%m-%d")
+            breadth_map = build_breadth_map(
+                all_kbars, ema_period=20, min_ratio=args.breadth_min,
+                db_codes=_breadth_codes if use_db else None,
+                db_start=_breadth_start if use_db else None,
+                db_end=_breadth_end if use_db else None,
+            )
         blocked = sum(1 for v in breadth_map.values() if not v)
         console.print(f"[dim]廣度過濾：門檻 {args.breadth_min*100:.0f}%，共 {blocked} 個交易日禁止開倉[/dim]")
 
@@ -1527,8 +1559,9 @@ def main():
 
     s = summarize(all_trades)
 
-    # ── 0050 日報酬（供閒置資金輪動 & 年度報酬比較）──
+    # ── 0050 日報酬 + MA20 訊號（供閒置資金輪動）──
     _mkt_daily_ret: dict[str, float] = {}
+    _mkt_above_ma: dict[str, bool] = {}   # True = 0050 > MA20，可停泊
     try:
         if use_db:
             import duckdb as _ddb_pre
@@ -1538,12 +1571,19 @@ def main():
             ).df()
             _con_pre.close()
             _mkt_pre_c = _mkt_pre["close"].values.astype(float)
-            _mkt_pre_d = _mkt_pre["date"].values
+            _mkt_pre_d = [str(d)[:10] for d in _mkt_pre["date"].values]
             for _ii in range(1, len(_mkt_pre_d)):
                 if _mkt_pre_c[_ii - 1] > 0:
-                    _mkt_daily_ret[str(_mkt_pre_d[_ii])[:10]] = float(
+                    _mkt_daily_ret[_mkt_pre_d[_ii]] = float(
                         _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
                     )
+            # MA20 訊號：rolling mean of last 20 closes
+            _ma_period = args.market_ma  # 與大盤過濾器一致
+            for _ii in range(len(_mkt_pre_d)):
+                if _ii < _ma_period:
+                    continue
+                _ma = float(_mkt_pre_c[_ii - _ma_period:_ii].mean())
+                _mkt_above_ma[_mkt_pre_d[_ii]] = bool(_mkt_pre_c[_ii] > _ma)
         elif market_df is not None and "ts" in market_df.columns:
             _mdf = market_df.sort_values("ts")
             _mdf_c = _mdf["Close"].values.astype(float)
@@ -1551,6 +1591,10 @@ def main():
             for _ii in range(1, len(_mdf_d)):
                 if _mdf_c[_ii - 1] > 0:
                     _mkt_daily_ret[_mdf_d[_ii]] = float(_mdf_c[_ii] / _mdf_c[_ii - 1] - 1)
+            _ma_period = args.market_ma
+            for _ii in range(_ma_period, len(_mdf_d)):
+                _ma = float(_mdf_c[_ii - _ma_period:_ii].mean())
+                _mkt_above_ma[_mdf_d[_ii]] = bool(_mdf_c[_ii] > _ma)
     except Exception:
         pass
 
@@ -1571,6 +1615,7 @@ def main():
         dev_high_mult=args.dev_high_mult,
         pyramid_alloc_pct=args.pyramid_alloc,
         market_daily_ret=_mkt_daily_ret if _mkt_daily_ret else None,
+        market_above_ma=_mkt_above_ma if _mkt_above_ma else None,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()

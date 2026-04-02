@@ -99,6 +99,91 @@ class EmaTrendStrategy(BaseStrategy):
             strategy=self.name,
         )
 
+    def signals_for_df(self, code: str, df: pd.DataFrame) -> dict[int, "Signal"]:
+        """
+        回測專用：一次計算整條 df 的所有指標，回傳 {row_index: Signal}。
+        比每天切 df 重算快約 100 倍。
+        """
+        if len(df) < self.ema_slow + self.adx_period + 5:
+            return {}
+        close  = df["Close"].astype(float)
+        volume = df["Volume"].astype(float)
+        high   = df["High"].astype(float) if "High" in df.columns else None
+        low    = df["Low"].astype(float)  if "Low"  in df.columns else None
+
+        ef_arr = ema(close, self.ema_fast).values
+        em_arr = ema(close, self.ema_mid).values
+        es_arr = ema(close, self.ema_slow).values
+
+        adx_arr = None
+        if high is not None and low is not None and self.adx_min > 0:
+            adx_arr = adx(high, low, close, self.adx_period).values
+
+        atr_arr = None
+        if self.min_atr_pct > 0 and high is not None and low is not None:
+            atr_arr = atr(high, low, close).values
+
+        # 量能 5 日滾動均量（iloc[-6:-1] 對應 rolling(5).mean().shift(1)）
+        vol_ma5 = volume.rolling(5).mean().shift(1).values
+        close_v = close.values
+
+        confirm_bars = 5
+        result: dict[int, Signal] = {}
+        for i in range(self.ema_slow + confirm_bars, len(df)):
+            # 多頭排列確認（最近 confirm_bars 根）
+            ok = True
+            for k in range(confirm_bars):
+                j = i - k
+                if not (ef_arr[j] > em_arr[j] > es_arr[j]):
+                    ok = False
+                    break
+            if not ok:
+                continue
+            price  = close_v[i]
+            em_now = em_arr[i]
+            ef_now = ef_arr[i]
+            es_now = es_arr[i]
+            if price <= em_now:
+                continue
+            # ADX
+            adx_val = None
+            if adx_arr is not None:
+                adx_val = adx_arr[i]
+                if pd.isna(adx_val) or adx_val < self.adx_min:
+                    continue
+            # ATR%
+            if atr_arr is not None:
+                av = atr_arr[i]
+                if price > 0 and not pd.isna(av) and (av / price) * 100 < self.min_atr_pct:
+                    continue
+            # 乖離率
+            if em_now > 0:
+                dev = (price - em_now) / em_now
+                if self.min_ema_dev > 0 and dev < self.min_ema_dev:
+                    continue
+                if self.max_ema_dev > 0 and dev > self.max_ema_dev:
+                    continue
+            # 量能
+            avg_v = vol_ma5[i]
+            vol_ratio = volume.values[i] / avg_v if (avg_v and avg_v > 0) else 1.0
+            if self.vol_confirm and vol_ratio < 0.7:
+                continue
+            # 信心評分
+            spread = (ef_now - es_now) / es_now if es_now > 0 else 0
+            spread_score = min(spread * 10, 0.50)
+            adx_score    = min(adx_val / 100, 0.35) if adx_val is not None and not pd.isna(adx_val) else 0.15
+            vol_score    = min(max(vol_ratio - 1.0, 0) * 0.15, 0.15)
+            confidence   = round(min(spread_score + adx_score + vol_score, 1.0), 2)
+            result[i] = Signal(
+                code=code, action="Buy", price=price,
+                confidence=max(confidence, 0.30),
+                reason=(f"EMA多頭排列 EMA{self.ema_fast}={ef_now:.2f}>"
+                        f"EMA{self.ema_mid}={em_now:.2f}>"
+                        f"EMA{self.ema_slow}={es_now:.2f}"),
+                strategy=self.name,
+            )
+        return result
+
     def diagnose(self, code: str, df: pd.DataFrame) -> str:
         if not self._validate_df(df, self.ema_slow + 5):
             return f"資料不足(需>{self.ema_slow}筆)"

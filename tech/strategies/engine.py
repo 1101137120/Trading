@@ -40,6 +40,18 @@ class StrategyEngine:
             else:
                 logger.warning(f"未知策略: {name}")
 
+    def evaluate_batch(self, code: str, df: pd.DataFrame) -> "dict[int, Signal] | None":
+        """
+        回測專用：一次計算整條 df 的訊號，回傳 {row_index: Signal}。
+        - 支援批次：回傳 dict（可能為空 dict，代表本檔無訊號）
+        - 不支援批次：回傳 None，呼叫方退回逐日 evaluate
+        """
+        if len(self.strategies) == 1:
+            s = self.strategies[0]
+            if hasattr(s, "signals_for_df"):
+                return s.signals_for_df(code, df)
+        return None   # 多策略或不支援 → None，呼叫方退回逐日 evaluate
+
     def evaluate(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         buy_signals: list[Signal] = []
         sell_signals: list[Signal] = []

@@ -125,6 +125,42 @@ def load_kbars(
     return df.reset_index(drop=True)
 
 
+def bulk_load_kbars(
+    codes: list[str],
+    start: str,
+    end: str,
+    db_path: Path = DB_PATH,
+) -> dict[str, pd.DataFrame]:
+    """
+    一次性讀取多支股票的 K 棒，回傳 {code: DataFrame}。
+    比逐支呼叫 load_kbars() 快得多（只開一次連線 + 一條 SQL）。
+    欄位與 load_kbars() 相同：ts, Open, High, Low, Close, Volume
+    """
+    if not db_path.exists() or not codes:
+        return {}
+    placeholders = ", ".join("?" * len(codes))
+    with get_conn(db_path, read_only=True) as conn:
+        df = conn.execute(
+            f"SELECT code, date AS ts, open AS Open, high AS High, "
+            f"       low AS Low, close AS Close, volume AS Volume "
+            f"FROM daily_prices "
+            f"WHERE code IN ({placeholders}) AND date>=? AND date<=? "
+            f"ORDER BY code, date",
+            codes + [start, end],
+        ).df()
+    if df.empty:
+        return {}
+    df["ts"] = pd.to_datetime(df["ts"])
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = df[col].astype(float)
+    result: dict[str, pd.DataFrame] = {}
+    for code, grp in df.groupby("code", sort=False):
+        grp = grp.drop(columns="code").reset_index(drop=True)
+        if len(grp) >= 10:
+            result[str(code)] = grp
+    return result
+
+
 def load_kbars_with_warmup(
     code: str,
     start: str,
