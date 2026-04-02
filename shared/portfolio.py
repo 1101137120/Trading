@@ -51,6 +51,7 @@ class Position:
     highest_price: float = 0.0     # 啟動後追蹤的最高價
     odd_lot: bool = False          # True = 零股（股），False = 整張（張）
     rs_score: float = 0.0          # 進場當時的相對強弱分數（用於移動停損加成）
+    pyramid_level: int = 0         # 已加碼次數（0=未加碼，1=第一次，2=第二次）
 
     @property
     def _lot_multiplier(self) -> int:
@@ -299,7 +300,7 @@ class Portfolio:
             logger.error(f"賣出失敗: {code}（第 {retries} 次），下週期重試")
         return escalated
 
-    def can_open_position(self, order_value: float) -> bool:
+    def can_open_position(self, order_value: float, max_positions_override: int = 0) -> bool:
         # 每日熔斷
         if self.circuit_broken:
             logger.info("每日熔斷已觸發，不開新倉")
@@ -308,8 +309,8 @@ class Portfolio:
         if self.cooldown_until and datetime.now() < self.cooldown_until:
             logger.info(f"連續虧損冷靜期，暫停至 {self.cooldown_until.strftime('%H:%M')}")
             return False
-        max_pos = self.risk_cfg["max_positions"]
-        max_pct = self.risk_cfg["max_position_pct"]
+        max_pos  = max_positions_override if max_positions_override > 0 else self.risk_cfg["max_positions"]
+        max_pct  = self.risk_cfg["max_position_pct"]
         occupied = len(self.positions) + len(self.pending_orders)
         if occupied >= max_pos:
             return False
@@ -319,16 +320,18 @@ class Portfolio:
             return False
         return True
 
-    def calculate_quantity(self, price: float) -> tuple[int, bool]:
+    def calculate_quantity(self, price: float, position_pct: float = None) -> tuple[int, bool]:
         """
         計算買入數量。
+        position_pct: 覆蓋設定的 max_position_pct（EMA乖離動態倉位用）。
         回傳 (quantity, is_odd_lot)：
           - 整張可買 ≥ 1 張時：回傳 (張數, False)
           - 整張不足 1 張時：回傳零股股數 (is_odd_lot=True)，最小 1 股
         """
         if price <= 0:
             return 0, False
-        max_val = self.total_capital * self.risk_cfg["max_position_pct"]
+        pct = position_pct if position_pct is not None else self.risk_cfg["max_position_pct"]
+        max_val = self.total_capital * pct
         max_val = min(max_val, self.available_capital, self.risk_cfg["max_order_value"])
         qty_lots = int(max_val / (price * 1000))
         if qty_lots >= 1:
@@ -347,7 +350,8 @@ class Portfolio:
                  "entry_price": p.entry_price, "entry_time": p.entry_time.isoformat(),
                  "stop_loss": p.stop_loss, "take_profit": p.take_profit,
                  "current_price": p.current_price, "odd_lot": p.odd_lot,
-                 "trailing_active": p.trailing_active, "highest_price": p.highest_price}
+                 "trailing_active": p.trailing_active, "highest_price": p.highest_price,
+                 "pyramid_level": p.pyramid_level}
                 for p in self.positions.values()
             ],
             "pending_orders": [
@@ -387,6 +391,7 @@ class Portfolio:
                     trailing_active=d.get("trailing_active", False),
                     highest_price=d.get("highest_price", 0.0),
                     odd_lot=d.get("odd_lot", False),
+                    pyramid_level=d.get("pyramid_level", 0),
                 )
                 positions[d["code"]] = pos
             pending = {}

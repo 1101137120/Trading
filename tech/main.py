@@ -388,6 +388,7 @@ class TradingSystem:
             self._check_pending_sells()
             self._check_pending_orders()
             self._check_exit_conditions_via_snapshot()
+            self._check_pyramid_addons()
             self._sync_tick_subscriptions()
 
             candidates = self.scanner.screen()
@@ -413,6 +414,16 @@ class TradingSystem:
 
             code_to_name = {c["code"]: c.get("name", "") for c in candidates}
             signals = self._evaluate_candidates(candidates)
+
+            # 大盤過熱過濾：漲幅或波動率超標時不開新倉
+            is_hot, hot_reason = self.market_filter.is_overheating()
+            if signals and is_hot:
+                self.logger.info(f"大盤過熱，本週期暫停新開倉：{hot_reason}")
+                console.print(f"[bold yellow]⚠ 大盤過熱，暫停新倉：{hot_reason}[/bold yellow]")
+                for s in signals:
+                    self.logger.info(f"[訊號-過熱略過] {s.code} 信心={s.confidence:.2f}")
+                signals = []
+
             if signals and not self.market_filter.allow_long():
                 self.logger.info("大盤趨勢偏空，本週期不開新倉")
                 stbl = Table(title="買入訊號（大盤偏空，僅供參考）", show_header=True)
@@ -591,6 +602,119 @@ class TradingSystem:
     def _sync_tick_subscriptions(self):
         self.broker.subscribe_ticks(list(self.portfolio.positions.keys()))
 
+    def _check_pyramid_addons(self):
+        """
+        贏家加碼偵測：持倉獲利達門檻時自動加碼（最多兩次）。
+        設定鍵（pyramid 區塊）：
+          gain_pct:   第一次加碼漲幅門檻（0=停用，建議 0.20）
+          gain2_pct:  第二次加碼漲幅門檻（0=停用，建議 0.40）
+          rs_min:     第二次加碼需個股 RS > 此值（0=不檢查）
+          alloc_pct:  加碼倉位比例，佔原始倉位成本（建議 0.50）
+        加碼不佔 max_positions，直接以可用資金執行。
+        """
+        pyr_cfg = self.config.get("pyramid", {})
+        gain1    = pyr_cfg.get("gain_pct",  0.0)
+        gain2    = pyr_cfg.get("gain2_pct", 0.0)
+        rs_min   = pyr_cfg.get("rs_min",    0.0)
+        alloc    = pyr_cfg.get("alloc_pct", 0.5)
+
+        if not (gain1 or gain2):
+            return
+
+        mkt_ret = self._get_market_return_20d() if rs_min > 0 else 0.0
+
+        for code, pos in list(self.portfolio.positions.items()):
+            level    = pos.pyramid_level
+            pnl_pct  = pos.pnl_pct
+            if level >= 2:
+                continue
+            # 若此股已有掛單中，跳過避免重複
+            if code in self.portfolio.pending_orders:
+                continue
+            is_second = (level == 1)
+            trigger   = False
+
+            if not is_second:
+                # 第一次加碼：獲利達 gain1
+                if gain1 > 0 and pnl_pct >= gain1:
+                    trigger = True
+                    self.logger.info(
+                        f"[加碼偵測] {code} 獲利 {pnl_pct:.1%} >= 第一次門檻 {gain1:.1%}"
+                    )
+            else:
+                # 第二次加碼：獲利達 gain2 + 選擇性 RS 確認
+                if gain2 > 0 and pnl_pct >= gain2:
+                    trigger = True
+                    if rs_min > 0:
+                        df_rs = self.feed.get_kbars(code, lookback_days=30)
+                        if df_rs is not None and len(df_rs) >= 21:
+                            _close = df_rs["Close"].astype(float)
+                            _rs = float(
+                                (_close.iloc[-1] - _close.iloc[-21]) / _close.iloc[-21]
+                            ) - mkt_ret
+                            if _rs < rs_min:
+                                self.logger.info(
+                                    f"[加碼取消] {code} RS {_rs:+.3f} < {rs_min}，"
+                                    f"第二次加碼略過"
+                                )
+                                trigger = False
+                            else:
+                                self.logger.info(
+                                    f"[加碼偵測] {code} 獲利 {pnl_pct:.1%} RS {_rs:+.3f} "
+                                    f">= 第二次門檻 {gain2:.1%}"
+                                )
+
+            if not trigger:
+                continue
+
+            price = pos.current_price
+            if price <= 0:
+                continue
+
+            # 加碼量：原始倉位成本 × alloc_pct，不超過可用資金
+            orig_cost = pos.entry_price * pos.quantity * pos._lot_multiplier
+            budget    = min(orig_cost * alloc, self.portfolio.available_capital)
+            if pos.odd_lot:
+                add_qty = int(budget / price)
+            else:
+                add_qty = int(budget / (price * 1000))
+
+            if add_qty <= 0:
+                self.logger.info(
+                    f"[加碼跳過] {code} 可用資金不足（預算 {budget:.0f}）"
+                )
+                continue
+            if not pos.odd_lot and not self.risk.is_valid_order(price, add_qty):
+                self.logger.info(f"[加碼跳過] {code} 委託金額不符最低限制")
+                continue
+
+            unit  = "股" if pos.odd_lot else "張"
+            level_str = "第一次" if not is_second else "第二次"
+            self.logger.info(
+                f"[加碼下單] {code} ×{add_qty}{unit} @ {price:.2f} | "
+                f"{level_str}加碼 獲利={pnl_pct:.1%} 預算={budget:.0f}"
+            )
+
+            trade = None
+            if not self.dry_run:
+                if pos.odd_lot:
+                    trade = self.broker.place_odd_lot_order(code, "Buy", price, add_qty)
+                else:
+                    trade = self.broker.place_limit_order(code, "Buy", price, add_qty)
+                if trade is None:
+                    self.logger.error(f"[加碼失敗] {code} 下單回傳 None")
+                    self.notifier.notify(f"⚠️ 加碼下單失敗 {code}")
+                    continue
+
+            # 更新加碼次數並存檔
+            pos.pyramid_level += 1
+            self.portfolio.save_to_file()
+
+            self.notifier.notify(
+                f"📈 加碼委託 {code} ×{add_qty}{unit} @ {price:.2f}\n"
+                f"{level_str}加碼 | 獲利={pnl_pct:.1%} | 預算={budget:,.0f}"
+            )
+
     def _get_market_return_20d(self) -> float:
         """計算 0050 近 20 日報酬，用於 RS 過濾"""
         df = self.feed.get_kbars("0050", lookback_days=30)
@@ -743,11 +867,44 @@ class TradingSystem:
                 if snap and self._is_gap_up_blocked(code, snap, df_gap):
                     continue
 
-            qty, is_odd_lot = self.portfolio.calculate_quantity(price)
+            # EMA 乖離動態倉位：乖離率低縮倉、高放大
+            pos_pct = None
+            _risk_cfg = self.config.get("risk", {})
+            _dev_low_thr  = _risk_cfg.get("dev_low_thr", 0.0)
+            _dev_high_thr = _risk_cfg.get("dev_high_thr", 0.0)
+            if _dev_low_thr or _dev_high_thr:
+                _df_dev = self.feed.get_kbars(code, lookback_days=30)
+                if _df_dev is not None and len(_df_dev) >= 20:
+                    _ema20 = float(_df_dev["Close"].astype(float).ewm(span=20, adjust=False).mean().iloc[-1])
+                    if _ema20 > 0:
+                        _dev = (price - _ema20) / _ema20
+                        _base_pct = _risk_cfg.get("max_position_pct", 0.15)
+                        if _dev_low_thr > 0 and _dev < _dev_low_thr:
+                            pos_pct = _base_pct * _risk_cfg.get("dev_low_pct", 1.0)
+                            self.logger.info(
+                                f"{code} EMA20乖離率 {_dev:.2%} < {_dev_low_thr:.2%}，"
+                                f"縮倉 {_base_pct:.2%}→{pos_pct:.2%}"
+                            )
+                        elif _dev_high_thr > 0 and _dev > _dev_high_thr:
+                            pos_pct = min(_base_pct * _risk_cfg.get("dev_high_mult", 1.0), 0.50)
+                            self.logger.info(
+                                f"{code} EMA20乖離率 {_dev:.2%} > {_dev_high_thr:.2%}，"
+                                f"放大倉位 {_base_pct:.2%}→{pos_pct:.2%}"
+                            )
+
+            qty, is_odd_lot = self.portfolio.calculate_quantity(price, position_pct=pos_pct)
             if qty <= 0:
                 continue
             order_value = price * qty * (1 if is_odd_lot else 1000)
-            if not self.portfolio.can_open_position(order_value):
+            # 牛市放寬持倉上限（MA20>MA60 時允許更多同時持倉）
+            _bull_max = self.config.get("risk", {}).get("bull_max_positions", 0)
+            _is_bull  = self._is_bull_market  # 每個週期已計算
+            _max_pos_override = _bull_max if (_bull_max > 0 and _is_bull) else 0
+            if _max_pos_override:
+                self.logger.info(
+                    f"牛市模式：持倉上限 {self.config['risk']['max_positions']}→{_max_pos_override}"
+                )
+            if not self.portfolio.can_open_position(order_value, max_positions_override=_max_pos_override):
                 continue
             if not is_odd_lot and not self.risk.is_valid_order(price, qty):
                 continue

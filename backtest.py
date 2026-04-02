@@ -848,6 +848,8 @@ def portfolio_simulation(
     pyramid_alloc_pct: float = 0.5,
     market_daily_ret: dict | None = None,    # 0050 日報酬，用於閒置資金輪動
     market_above_ma: dict | None = None,     # {date_str: bool}，True = 0050>MA20，可停泊
+    bull_max_positions: int = 0,             # 牛市（MA20>MA60）時允許更多持倉（0=停用）
+    market_bull_dates: dict | None = None,   # {date_str: bool}，True = MA20>MA60
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -877,6 +879,7 @@ def portfolio_simulation(
     _yr_0050_gain: dict[int, float] = {}
     _total_0050_gain = 0.0
     _prev_entry_date = None
+    _parking_records: list[dict] = []   # 每段閒置停泊期間記錄
 
     for trade in trades_sorted:
         entry_date = trade["entry_date"]
@@ -887,6 +890,8 @@ def portfolio_simulation(
             _to_str   = entry_date.strftime("%Y-%m-%d")
             _i0 = bisect.bisect_right(_mkt_keys, _from_str)
             _j0 = bisect.bisect_left(_mkt_keys, _to_str)
+            _period_cap  = capital
+            _period_gain = 0.0
             for _ki in range(_i0, _j0):
                 _ds  = _mkt_keys[_ki]
                 # 只在 0050>MA20 時才停泊（market_above_ma 未提供則無條件停泊）
@@ -896,8 +901,18 @@ def portfolio_simulation(
                 _g   = capital * _ret
                 capital          += _g
                 _total_0050_gain += _g
+                _period_gain     += _g
                 _yr_key = int(_ds[:4])
                 _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
+            if _period_gain != 0:
+                _parking_records.append({
+                    "from_date": _from_str, "to_date": _to_str,
+                    "capital": _period_cap, "gain": _period_gain,
+                })
+
+        # ✅ 修正：在這裡直接更新時間，確保時間線正常推進，不受後續 continue 影響   
+        if _prev_entry_date is None or entry_date > _prev_entry_date:
+            _prev_entry_date = entry_date
 
         # 釋放已平倉的持倉
         still_active = []
@@ -922,8 +937,15 @@ def portfolio_simulation(
         if is_pyramid:
             if trade["code"] not in active_codes:
                 continue  # 原始部位已出場，跳過
-        elif len(active) >= max_positions:
-            continue
+        else:
+            _entry_ds = str(trade.get("entry_date", ""))[:10]
+            _is_bull   = (market_bull_dates.get(_entry_ds, False)
+                          if market_bull_dates else False)
+            _eff_max   = (bull_max_positions
+                          if (bull_max_positions > 0 and _is_bull)
+                          else max_positions)
+            if len(active) >= _eff_max:
+                continue
 
         alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
                                dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult)
@@ -1003,7 +1025,6 @@ def portfolio_simulation(
             "cost": cost,
             "code": trade["code"],
         })
-        _prev_entry_date = entry_date
 
     # 最後一筆進場到最後出場：繼續累積 0050 閒置收益
     if _mkt_keys and _prev_entry_date is not None and active:
@@ -1012,6 +1033,8 @@ def portfolio_simulation(
         _to_str   = _end_date.strftime("%Y-%m-%d")
         _i0 = bisect.bisect_right(_mkt_keys, _from_str)
         _j0 = bisect.bisect_right(_mkt_keys, _to_str)  # 含末日
+        _period_cap  = capital
+        _period_gain = 0.0
         for _ki in range(_i0, _j0):
             _ds  = _mkt_keys[_ki]
             if market_above_ma is not None and not market_above_ma.get(_ds, False):
@@ -1020,8 +1043,14 @@ def portfolio_simulation(
             _g   = capital * _ret
             capital          += _g
             _total_0050_gain += _g
+            _period_gain     += _g
             _yr_key = int(_ds[:4])
             _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
+        if _period_gain != 0:
+            _parking_records.append({
+                "from_date": _from_str, "to_date": _to_str,
+                "capital": _period_cap, "gain": _period_gain,
+            })
 
     # 回測結束，釋放剩餘持倉
     for pos in active:
@@ -1046,6 +1075,7 @@ def portfolio_simulation(
         "total_fee_tax": round(total_fees + total_taxes, 0),
         "total_0050_gain": round(_total_0050_gain, 0),
         "yr_0050_gain": _yr_0050_gain,
+        "parking_records": _parking_records,
     }
 
 
@@ -1074,6 +1104,139 @@ def summarize(all_trades: list[dict]) -> dict:
         "by_strategy": by_strat,
         "trades": df,
     }
+
+
+# ──────────────────────────────────────────────
+# Equity Curve 重建
+# ──────────────────────────────────────────────
+
+def build_equity_curve(
+    taken_df: pd.DataFrame,
+    all_kbars: "dict[str, pd.DataFrame]",
+    initial_capital: float,
+    start_str: str,
+    end_str: str,
+    market_daily_ret: "dict[str, float] | None" = None,
+    market_above_ma: "dict[str, bool] | None" = None,
+) -> pd.DataFrame:
+    """
+    從交易紀錄 + 日 K 棒重建每日資產淨值曲線。
+    回傳 DataFrame：date(str), equity(float), drawdown_pct(float)
+
+    現金流向與 portfolio_simulation 一致：
+      入場：capital -= (cost + fee_buy)
+      出場：capital += cost + net_pnl + fee_buy  (= cost + gross_pnl - fee_sell - tax)
+      0050：每日對 capital (idle cash) 複利
+    """
+    # ── 價格查詢表 {code: {date_str: close}} ──
+    price_lut: dict[str, dict[str, float]] = {}
+    for _c, _df in all_kbars.items():
+        price_lut[_c] = dict(zip(
+            _df["ts"].dt.strftime("%Y-%m-%d"),
+            _df["Close"].values.astype(float),
+        ))
+
+    # ── 交易日序列（回測區間內） ──
+    all_dates = sorted({
+        d for _df in all_kbars.values()
+        for d in _df["ts"].dt.strftime("%Y-%m-%d")
+        if start_str <= d <= end_str
+    })
+    if not all_dates:
+        return pd.DataFrame(columns=["date", "equity", "drawdown_pct"])
+
+    # ── 建事件映射（用 trade index 做唯一識別，避免 code+lots 配對錯誤）──
+    tdf = taken_df.reset_index(drop=True).copy()
+    tdf["entry_date"] = pd.to_datetime(tdf["entry_date"]).dt.strftime("%Y-%m-%d")
+    tdf["exit_date"]  = pd.to_datetime(tdf["exit_date"]).dt.strftime("%Y-%m-%d")
+
+    _cash_out: dict[int, float] = {}
+    _cash_in:  dict[int, float] = {}
+    _meta:     dict[int, dict]  = {}
+    buy_ev:    dict[str, list[int]] = {}
+    sell_ev:   dict[str, list[int]] = {}
+
+    for _ti, _r in tdf.iterrows():
+        _cost    = float(_r["cost"])
+        _fee_buy = float(_r.get("fee_buy", 0))
+        _net_pnl = float(_r["net_pnl_dollars"])
+        _cash_out[_ti] = _cost + _fee_buy
+        _cash_in[_ti]  = _cost + _net_pnl + _fee_buy
+        _meta[_ti] = {
+            "code": str(_r["code"]),
+            "lots": int(_r["lots"]),
+            "odd":  bool(_r.get("odd_lot", False)),
+            "ep":   float(_r["entry_price"]),
+        }
+        buy_ev.setdefault(str(_r["entry_date"]), []).append(_ti)
+        # exit_date 不在 all_dates（例如非交易日）→ 改到 all_dates 最後一天
+        _xd = str(_r["exit_date"])
+        sell_ev.setdefault(_xd, []).append(_ti)
+
+    # ── 逐日重建 ──
+    capital     = initial_capital
+    open_trades: dict[int, dict] = {}   # trade_idx → meta
+    rows: list[dict] = []
+    peak = initial_capital
+
+    # 若 sell_ev 有日期不在 all_dates（非交易日），移到最後一天
+    _all_dates_set = set(all_dates)
+    _last_date     = all_dates[-1]
+    for _xd, _idxs in list(sell_ev.items()):
+        if _xd not in _all_dates_set:
+            sell_ev.setdefault(_last_date, []).extend(_idxs)
+            del sell_ev[_xd]
+
+    for _d in all_dates:
+        # 先出場（收回現金，用 trade index 精確移除）
+        for _ti in sell_ev.get(_d, []):
+            capital += _cash_in[_ti]
+            open_trades.pop(_ti, None)
+
+        # 再入場（扣除現金）
+        for _ti in buy_ev.get(_d, []):
+            capital -= _cash_out[_ti]
+            open_trades[_ti] = _meta[_ti]
+
+        # 0050 停泊（作用在 idle cash = capital）
+        if market_daily_ret and _d in market_daily_ret:
+            if market_above_ma is None or market_above_ma.get(_d, False):
+                capital += capital * market_daily_ret[_d]
+
+        # 持倉市值
+        _pos_val = 0.0
+        for _ti, _p in open_trades.items():
+            _unit = 1 if _p["odd"] else 1000
+            _cur  = price_lut.get(_p["code"], {}).get(_d, _p["ep"])
+            _pos_val += _cur * _p["lots"] * _unit
+
+        equity = capital + _pos_val
+        peak   = max(peak, equity)
+        dd_pct = (equity - peak) / peak * 100 if peak > 0 else 0.0
+        rows.append({"date": _d, "equity": round(equity, 0), "drawdown_pct": round(dd_pct, 4)})
+
+    return pd.DataFrame(rows)
+
+
+def equity_metrics(eq_df: pd.DataFrame) -> dict:
+    """從 equity curve 計算 Sharpe ratio 和最長回撤持續期（交易日數）。"""
+    if eq_df.empty or len(eq_df) < 2:
+        return {"sharpe": None, "max_dd_days": None}
+
+    eq = eq_df.set_index("date")["equity"]
+    ret = eq.pct_change().dropna()
+
+    sharpe = float(ret.mean() / ret.std() * (252 ** 0.5)) if ret.std() > 0 else 0.0
+
+    # 最長回撤持續期（peak-to-peak，單位：交易日）
+    max_dd_days = 0
+    cur = 0
+    for is_dd in (eq_df["drawdown_pct"] < 0):
+        cur = cur + 1 if is_dd else 0
+        if cur > max_dd_days:
+            max_dd_days = cur
+
+    return {"sharpe": round(sharpe, 2), "max_dd_days": max_dd_days}
 
 
 # ──────────────────────────────────────────────
@@ -1150,6 +1313,8 @@ def main():
                         help="EMA 拉回模式：距 EMA 多近觸發加碼（預設 0.03=3%%以內）")
     parser.add_argument("--pyramid-alloc", type=float, default=0.5,
                         help="加碼倉位比例，相對於原始倉位（預設 0.5=半倉）")
+    parser.add_argument("--bull-max-positions", type=int, default=0,
+                        help="牛市（0050 MA20>MA60）時允許的最大持倉數（0=與 max-positions 相同）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
                         help="個股停損後冷卻天數（預設 0=停用），建議 3~7")
     parser.add_argument("--max-hold-days", type=int, default=0,
@@ -1562,6 +1727,7 @@ def main():
     # ── 0050 日報酬 + MA20 訊號（供閒置資金輪動）──
     _mkt_daily_ret: dict[str, float] = {}
     _mkt_above_ma: dict[str, bool] = {}   # True = 0050 > MA20，可停泊
+    _mkt_bull_dates: dict[str, bool] = {}  # True = 0050 MA20 > MA60（牛市）
     try:
         if use_db:
             import duckdb as _ddb_pre
@@ -1570,31 +1736,47 @@ def main():
                 "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
             ).df()
             _con_pre.close()
-            _mkt_pre_c = _mkt_pre["close"].values.astype(float)
             _mkt_pre_d = [str(d)[:10] for d in _mkt_pre["date"].values]
+            # 原始收盤價（未調整）供停泊交易記錄顯示用
+            _mkt_raw_c = _mkt_pre["close"].values.astype(float)
+            _mkt_raw_lut: dict[str, float] = dict(zip(_mkt_pre_d, _mkt_raw_c))
+            # adjust_splits 消除除權造成的單日暴跌（如 2009-01-02 -43%）
+            _mkt_adj_df = adjust_splits(
+                pd.DataFrame({"Close": _mkt_raw_c.copy()}),
+                threshold=0.10,
+            )
+            _mkt_pre_c = _mkt_adj_df["Close"].values.astype(float)
             for _ii in range(1, len(_mkt_pre_d)):
                 if _mkt_pre_c[_ii - 1] > 0:
                     _mkt_daily_ret[_mkt_pre_d[_ii]] = float(
                         _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
                     )
-            # MA20 訊號：rolling mean of last 20 closes
+            # MA20 / MA60 訊號（用調整後價格）
             _ma_period = args.market_ma  # 與大盤過濾器一致
             for _ii in range(len(_mkt_pre_d)):
                 if _ii < _ma_period:
                     continue
                 _ma = float(_mkt_pre_c[_ii - _ma_period:_ii].mean())
                 _mkt_above_ma[_mkt_pre_d[_ii]] = bool(_mkt_pre_c[_ii] > _ma)
+                if _ii >= 60:
+                    _ma60v = float(_mkt_pre_c[_ii - 60:_ii].mean())
+                    _mkt_bull_dates[_mkt_pre_d[_ii]] = bool(_ma > _ma60v)
         elif market_df is not None and "ts" in market_df.columns:
             _mdf = market_df.sort_values("ts")
-            _mdf_c = _mdf["Close"].values.astype(float)
+            _mdf_adj = adjust_splits(
+                _mdf[["Close"]].reset_index(drop=True), threshold=0.10
+            )
+            _mdf_c = _mdf_adj["Close"].values.astype(float)
             _mdf_d = _mdf["ts"].dt.strftime("%Y-%m-%d").values
             for _ii in range(1, len(_mdf_d)):
                 if _mdf_c[_ii - 1] > 0:
                     _mkt_daily_ret[_mdf_d[_ii]] = float(_mdf_c[_ii] / _mdf_c[_ii - 1] - 1)
             _ma_period = args.market_ma
-            for _ii in range(_ma_period, len(_mdf_d)):
+            for _ii in range(max(_ma_period, 60), len(_mdf_d)):
                 _ma = float(_mdf_c[_ii - _ma_period:_ii].mean())
                 _mkt_above_ma[_mdf_d[_ii]] = bool(_mdf_c[_ii] > _ma)
+                _ma60v = float(_mdf_c[_ii - 60:_ii].mean())
+                _mkt_bull_dates[_mdf_d[_ii]] = bool(_ma > _ma60v)
     except Exception:
         pass
 
@@ -1616,6 +1798,8 @@ def main():
         pyramid_alloc_pct=args.pyramid_alloc,
         market_daily_ret=_mkt_daily_ret if _mkt_daily_ret else None,
         market_above_ma=_mkt_above_ma if _mkt_above_ma else None,
+        bull_max_positions=args.bull_max_positions,
+        market_bull_dates=_mkt_bull_dates if _mkt_bull_dates else None,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -1626,6 +1810,15 @@ def main():
     realized_total = realized_df["net_pnl_dollars"].sum() if not realized_df.empty else 0
     holding_total  = holding_df["net_pnl_dollars"].sum()  if not holding_df.empty  else 0
     win_rate_r = (len(realized_wins) / len(realized_df) * 100) if len(realized_df) > 0 else 0
+
+    # ── Equity Curve ──
+    _eq_df = build_equity_curve(
+        taken_df, all_kbars, args.capital,
+        args.start, args.end,
+        market_daily_ret=_mkt_daily_ret if _mkt_daily_ret else None,
+        market_above_ma=_mkt_above_ma if _mkt_above_ma else None,
+    )
+    _eq_metrics = equity_metrics(_eq_df)
 
     # ── 基準：0050 / 00631L正2 ──
     bench = None
@@ -1639,6 +1832,11 @@ def main():
     # 1. 績效總覽
     # ════════════════════════════════════════
     cap_clr = "green" if psim["total_return_pct"] >= 0 else "red"
+    _bt_years = (end - start).days / 365.25
+    _cagr = (
+        (psim["final_capital"] / psim["initial_capital"]) ** (1 / _bt_years) - 1
+        if _bt_years > 0 and psim["initial_capital"] > 0 else 0
+    )
     console.rule("[bold]績效總覽[/bold]")
     ov = Table(show_header=False, box=None, padding=(0, 2))
     ov.add_column("項目", style="dim", min_width=16)
@@ -1648,7 +1846,15 @@ def main():
     ov.add_row("最終資金",      f"[{cap_clr}]{psim['final_capital']:>14,.0f} 元[/{cap_clr}]")
     ov.add_row("[bold]實際報酬[/bold]",
                f"[bold {cap_clr}]{psim['total_return_pct']:+.2f}%[/bold {cap_clr}]")
+    ov.add_row("年化報酬(CAGR)",
+               f"[bold {cap_clr}]{_cagr*100:+.2f}%[/bold {cap_clr}]")
     ov.add_row("最大回撤",      f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]")
+    if _eq_metrics["sharpe"] is not None:
+        _sh = _eq_metrics["sharpe"]
+        _sh_clr = "green" if _sh >= 1 else ("yellow" if _sh >= 0.5 else "red")
+        ov.add_row("Sharpe Ratio",  f"[{_sh_clr}]{_sh:.2f}[/{_sh_clr}]")
+    if _eq_metrics["max_dd_days"] is not None:
+        ov.add_row("最長回撤持續", f"{_eq_metrics['max_dd_days']} 交易日")
     ov.add_row("已實現損益",
                f"[{'green' if realized_total>=0 else 'red'}]{realized_total:+,.0f} 元[/]"
                f"  [dim]({len(realized_df)} 筆已出場)[/dim]")
@@ -1898,21 +2104,55 @@ def main():
         _yr_idle_0050 = psim.get("yr_0050_gain", {})
 
         # 建每一筆交易的「年度貢獻」
-        # 已實現：按 exit_date 所在年度
+        # 已實現：按年末實際價格拆分跨年損益（避免把多年波段全塞進平倉年）
         # 未實現：按 entry_date 到 exit_date（回測截止）每年末 mark-to-market
         _yr_realized: dict[int, float] = {}
         _yr_unrealized: dict[int, float] = {}
         _yr_trades: dict[int, int] = {}
         _yr_wins: dict[int, int] = {}
 
+        # 預建年末價格查詢表 {code: {year: last_close}}
+        _yr_end_price: dict[str, dict[int, float]] = {}
+        for _c, _kdf in all_kbars.items():
+            _tmp = _kdf[["ts", "Close"]].copy()
+            _tmp["_yr"] = _tmp["ts"].dt.year
+            _yr_end_price[_c] = _tmp.groupby("_yr")["Close"].last().to_dict()
+
         _rd = realized_df.copy()
-        _rd["exit_date"] = pd.to_datetime(_rd["exit_date"])
+        _rd["entry_date"] = pd.to_datetime(_rd["entry_date"])
+        _rd["exit_date"]  = pd.to_datetime(_rd["exit_date"])
         for _, _r in _rd.iterrows():
-            _y = _r["exit_date"].year
-            _yr_realized[_y] = _yr_realized.get(_y, 0) + _r["net_pnl_dollars"]
-            _yr_trades[_y]    = _yr_trades.get(_y, 0) + 1
+            _entry_y = _r["entry_date"].year
+            _exit_y  = _r["exit_date"].year
+            _yr_trades[_exit_y] = _yr_trades.get(_exit_y, 0) + 1
             if _r["pnl_pct"] > 0:
-                _yr_wins[_y] = _yr_wins.get(_y, 0) + 1
+                _yr_wins[_exit_y] = _yr_wins.get(_exit_y, 0) + 1
+
+            if _entry_y == _exit_y:
+                _yr_realized[_exit_y] = _yr_realized.get(_exit_y, 0) + _r["net_pnl_dollars"]
+            else:
+                # 跨年：用年末實際收盤拆分損益，費用全歸平倉年
+                _code     = _r["code"]
+                _ep       = float(_r["entry_price"])
+                _xp       = float(_r["exit_price"])
+                _total_mv = _xp - _ep
+                _net_pnl  = float(_r["net_pnl_dollars"])
+                _gross_pnl = float(_r.get("gross_pnl_dollars", _net_pnl))
+                _fee_tax  = _gross_pnl - _net_pnl  # 費用（負值）
+                _prices   = _yr_end_price.get(_code, {})
+                _prev_p   = _ep
+                _allocated = 0.0
+                for _yr in range(_entry_y, _exit_y):
+                    _yp = _prices.get(_yr)
+                    if _yp is None or _total_mv == 0:
+                        continue
+                    _frac = (_yp - _prev_p) / _total_mv
+                    _alloc = _gross_pnl * _frac
+                    _yr_realized[_yr] = _yr_realized.get(_yr, 0) + _alloc
+                    _allocated += _alloc
+                    _prev_p = _yp
+                # 最後一年：剩餘 gross + 全部費用
+                _yr_realized[_exit_y] = _yr_realized.get(_exit_y, 0) + (_gross_pnl - _allocated) + _fee_tax
 
         # 未實現部位：持有期間跨過每個年末，計入該年末的未實現損益
         _hd = holding_df.copy()
@@ -1929,6 +2169,22 @@ def main():
         _cap = psim["initial_capital"]
         _prev_cap = _cap
 
+        # 每年交易日數 & 有買入訊號的天數
+        _yr_all_days: dict[int, int] = {}
+        _yr_signal_days: dict[int, int] = {}
+        for _df_tmp in all_kbars.values():
+            for _ts in _df_tmp["ts"]:
+                _y_tmp = _ts.year
+                if args.start <= _ts.strftime("%Y-%m-%d") <= args.end:
+                    _yr_all_days[_y_tmp] = _yr_all_days.get(_y_tmp, 0) + 1
+            break  # 用任一支股票的日期即可（交易日相同）
+        if not taken_df.empty:
+            _entry_dates_by_yr: dict[int, set] = {}
+            for _ed in pd.to_datetime(taken_df["entry_date"]):
+                _entry_dates_by_yr.setdefault(_ed.year, set()).add(_ed.strftime("%Y-%m-%d"))
+            for _y_tmp, _s in _entry_dates_by_yr.items():
+                _yr_signal_days[_y_tmp] = len(_s)
+
         yr_tbl = Table(show_header=True, box=None, padding=(0, 2))
         yr_tbl.add_column("年度",        style="bold", justify="center")
         yr_tbl.add_column("個股損益",    justify="right")
@@ -1940,6 +2196,7 @@ def main():
         yr_tbl.add_column("Alpha",       justify="right")
         yr_tbl.add_column("累計資金",    justify="right")
         yr_tbl.add_column("勝率",        justify="right")
+        yr_tbl.add_column("閒置天",      justify="right")
 
         for _y in _all_years:
             _real  = _yr_realized.get(_y, 0)
@@ -1963,6 +2220,9 @@ def main():
                 f"[{'green' if _idle >= 0 else 'red'}]{_idle:+,.0f}[/]"
                 if _idle != 0 else "[dim]—[/dim]"
             )
+            _all_d  = _yr_all_days.get(_y, 0)
+            _sig_d  = _yr_signal_days.get(_y, 0)
+            _idle_d = _all_d - _sig_d if _all_d else 0
             yr_tbl.add_row(
                 str(_y),
                 f"[{'green' if _real>=0 else 'red'}]{_real:+,.0f}[/]",
@@ -1974,6 +2234,7 @@ def main():
                 _alpha_str,
                 f"{_cap:,.0f}",
                 f"[dim]{_wr_str}[/dim]",
+                f"[dim]{_idle_d}/{_all_d}[/dim]",
             )
             _prev_cap = _cap
 
@@ -2038,10 +2299,54 @@ def main():
     else:
         out_path = Path(args.output_csv)
 
+    # ── 生成 0050 停泊交易記錄 ──
+    _parking_rows: list[dict] = []
+    for _pr in psim.get("parking_records", []):
+        _ep = _mkt_raw_lut.get(_pr["from_date"]) if "_mkt_raw_lut" in dir() else None
+        _xp = _mkt_raw_lut.get(_pr["to_date"])   if "_mkt_raw_lut" in dir() else None
+        if not _ep or not _xp or _ep <= 0:
+            continue
+        _idle  = max(_pr["capital"], 0)
+        _lots  = max(1, int(_idle / _ep / 1000))
+        _fbuy  = round(_lots * _ep * 1000 * 0.001425, 0)
+        _fsell = round(_lots * _xp * 1000 * 0.001425, 0)
+        _tax   = round(_lots * _xp * 1000 * 0.001, 0)   # ETF 稅率 0.1%
+        _ftot  = _fbuy + _fsell + _tax
+        _gross   = round(_pr["gain"], 0)                 # 模擬累積收益（稅前）
+        _net_pnl = round(_gross - _ftot, 0)             # 扣手續費+稅後淨利
+        _hold  = (datetime.strptime(_pr["to_date"], "%Y-%m-%d") -
+                  datetime.strptime(_pr["from_date"], "%Y-%m-%d")).days
+        _parking_rows.append({
+            "status": "已實現",
+            "code": "0050", "name": "元大台灣50", "market": "ETF",
+            "entry_date": _pr["from_date"], "exit_date": _pr["to_date"],
+            "entry_price": round(_ep, 2), "exit_price": round(_xp, 2),
+            "pnl_pct": round((_xp - _ep) / _ep * 100, 2),
+            "max_gain_pct": round((_xp - _ep) / _ep * 100, 2),
+            "hold_days": _hold, "result": "停泊",
+            "strategy": "0050停泊", "confidence": 1.0, "rs_score": 0,
+            "ema_dev": 0, "day_volume": 0,
+            "lots": _lots, "odd_lot": False,
+            "cost": round(_idle, 0), "alloc_pct": 100.0,
+            "fee_buy": _fbuy, "fee_sell": _fsell, "tax": _tax,
+            "fee_tax_total": _ftot,
+            "gross_pnl_dollars": _gross,
+            "pnl_dollars": _net_pnl,
+            "net_pnl_dollars": _net_pnl,
+        })
+
     if not taken_df.empty:
         csv_df = taken_df.copy()
         csv_df.insert(0, "status", csv_df["result"].apply(
             lambda x: "持倉中" if x == "回測結束" else "已實現"))
+        if _parking_rows:
+            _park_df = pd.DataFrame(_parking_rows)
+            # 補齊 taken_df 有但 parking 沒有的欄位
+            for _col in csv_df.columns:
+                if _col not in _park_df.columns:
+                    _park_df[_col] = ""
+            csv_df = pd.concat([csv_df, _park_df[csv_df.columns]], ignore_index=True)
+            csv_df["code"] = csv_df["code"].astype(str)  # 防止 "0050" 被轉成整數 50
         for _k, _v in _run_params.items():
             csv_df[_k] = _v
         csv_df.to_csv(out_path, index=False, encoding="utf-8-sig")
@@ -2051,6 +2356,12 @@ def main():
             csv_df[_k] = _v
         csv_df.to_csv(out_path, index=False, encoding="utf-8-sig")
     console.print(f"\n[dim]完整明細已存至 {out_path}[/dim]")
+
+    # ── Equity Curve CSV ──
+    if not _eq_df.empty:
+        _eq_path = out_path.with_name(out_path.stem + "_equity.csv")
+        _eq_df.to_csv(_eq_path, index=False, encoding="utf-8-sig")
+        console.print(f"[dim]資產曲線已存至 {_eq_path}[/dim]")
 
     # ── runs_index.csv：每次回測追加一行摘要 ──
     _index_path = _runs_dir / "runs_index.csv"
@@ -2171,6 +2482,9 @@ def main():
             f"| 項目 | 值 |",
             f"|------|---|",
             f"| 報酬 | {psim['total_return_pct']:+.2f}% |",
+            f"| CAGR | {_cagr*100:+.2f}% |",
+            f"| Sharpe | {_eq_metrics['sharpe'] if _eq_metrics['sharpe'] is not None else '—'} |",
+            f"| 最長回撤持續 | {_eq_metrics['max_dd_days']} 交易日 |" if _eq_metrics['max_dd_days'] is not None else "",
             f"| 最大回撤 | -{psim['max_drawdown_pct']:.2f}% |",
             f"| 最終資金 | {psim['final_capital']:,.0f} 元 |",
             f"| 已實現損益 | {realized_total:+,.0f} 元（{len(realized_df)}筆）|",
