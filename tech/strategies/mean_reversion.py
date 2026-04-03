@@ -53,3 +53,29 @@ class MeanReversionStrategy(BaseStrategy):
             )
 
         return None
+
+    def signals_for_df(self, code: str, df: pd.DataFrame) -> "dict[int, Signal]":
+        min_rows = self.bb_period + 5
+        if len(df) < min_rows:
+            return {}
+        close   = df["Close"].astype(float)
+        mid_arr = close.rolling(self.bb_period).mean().values
+        std_arr = close.rolling(self.bb_period).std().values
+        rsi_arr = _rsi(close, self.rsi_period).values
+        close_v = close.values
+
+        result: dict[int, Signal] = {}
+        for i in range(min_rows, len(df)):
+            price   = close_v[i]
+            rsi_now = rsi_arr[i]
+            lower   = mid_arr[i] - self.bb_std * std_arr[i]
+            upper   = mid_arr[i] + self.bb_std * std_arr[i]
+            if price <= lower * 1.01 and rsi_now < self.rsi_low:
+                confidence = (self.rsi_low - rsi_now) / self.rsi_low
+                result[i] = Signal(
+                    code=code, action="Buy", price=price,
+                    confidence=round(confidence, 2),
+                    reason=f"價格觸布林下軌 RSI={rsi_now:.1f}",
+                    strategy=self.name,
+                )
+        return result

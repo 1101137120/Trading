@@ -59,6 +59,47 @@ class BreakoutStrategy(BaseStrategy):
 
         return None
 
+    def signals_for_df(self, code: str, df: pd.DataFrame) -> "dict[int, Signal]":
+        min_rows = self.lookback + 5
+        if len(df) < min_rows:
+            return {}
+        close  = df["Close"].astype(float)
+        volume = df["Volume"].astype(float)
+        high   = df["High"].astype(float)
+        low    = df["Low"].astype(float)
+
+        # shift(1) 排除當根避免前視偏差
+        prev_high_arr = high.shift(1).rolling(self.lookback).max().values
+        prev_low_arr  = low.shift(1).rolling(self.lookback).min().values
+        avg_vol_arr   = volume.shift(1).rolling(self.lookback).mean().values
+        close_v  = close.values
+        high_v   = high.values
+        low_v    = low.values
+        vol_v    = volume.values
+
+        result: dict[int, Signal] = {}
+        for i in range(min_rows, len(df)):
+            price    = close_v[i]
+            avg_vol  = avg_vol_arr[i]
+            ph       = prev_high_arr[i]
+            pl       = prev_low_arr[i]
+            if avg_vol <= 0 or pd.isna(ph) or pd.isna(pl):
+                continue
+            vol_today = vol_v[i]
+            dh, dl    = high_v[i], low_v[i]
+            upper_half = price > (dh + dl) / 2 if dh > dl else True
+            if (vol_today > avg_vol * self.vol_multiplier
+                    and price > ph * (1 + self.price_breakout_pct)
+                    and upper_half):
+                confidence = min(vol_today / (avg_vol * self.vol_multiplier) - 1.0, 1.0)
+                result[i] = Signal(
+                    code=code, action="Buy", price=price,
+                    confidence=round(confidence, 2),
+                    reason=f"量價突破: 今量={vol_today:.0f} 價={price}突破前高={ph:.2f}",
+                    strategy=self.name,
+                )
+        return result
+
     def diagnose(self, code: str, df: pd.DataFrame) -> str:
         if not self._validate_df(df, self.lookback + 5):
             return f"資料不足(需>{self.lookback}筆)"

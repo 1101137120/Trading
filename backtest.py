@@ -151,11 +151,13 @@ def build_breadth_map(
     db_codes: list[str] | None = None,
     db_start: str | None = None,
     db_end: str | None = None,
+    return_ratio: bool = False,
 ) -> dict:
     """
     逐日計算市場廣度：股票池中收盤 > EMA{ema_period} 的比例。
     比例低於 min_ratio 的交易日禁止開倉（個股環境太差）。
     回傳 {date: bool}，True = 廣度健康可進場。
+    若 return_ratio=True，回傳 {date: float}（原始廣度比例值）。
 
     db_codes/db_start/db_end 有傳時走快速路徑（一條 SQL → pivot → ewm），
     否則從 all_kbars dict 建表（較慢）。
@@ -180,6 +182,8 @@ def build_breadth_map(
             daily_above = (wide > ema_wide).sum(axis=1)
             daily_total = ema_wide.notna().sum(axis=1)
             ratio = (daily_above / daily_total.replace(0, float("nan"))).fillna(1.0)
+            if return_ratio:
+                return {ts.date(): round(float(v), 4) for ts, v in ratio.items()}
             return {ts.date(): bool(v >= min_ratio) for ts, v in ratio.items()}
         except Exception:
             pass  # fallback 到慢路徑
@@ -196,6 +200,8 @@ def build_breadth_map(
     daily_above = (wide > ema_wide).sum(axis=1)
     daily_total = ema_wide.notna().sum(axis=1)
     ratio = (daily_above / daily_total.replace(0, float("nan"))).fillna(1.0)
+    if return_ratio:
+        return {ts.date(): round(float(v), 4) for ts, v in ratio.items()}
     return {ts.date(): bool(v >= min_ratio) for ts, v in ratio.items()}
 
 
@@ -353,6 +359,7 @@ def simulate_trades(
     early_exit_days: int = 0,
     early_exit_lag: float = 0.03,
     breadth_allow: dict = None,
+    breadth_ratio: dict = None,
     slippage_pct: float = 0.002,
     gap_up_threshold: float = 0.0,
     pyramid_gain_pct: float = 0.0,      # 第一次加碼漲幅門檻（0=停用）
@@ -462,8 +469,16 @@ def simulate_trades(
                 # 更新最高價（追蹤停利用）
                 if current_price > position["peak_price"]:
                     position["peak_price"] = current_price
+                    position["peak_idx"]   = i
+                    position["peak_date"]  = row_date
 
                 pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
+
+                # 追蹤停利啟動偵測（記錄首次達到啟動門檻的 index）
+                if (position["trail_activated_idx"] == -1
+                        and trail_stop_pct > 0
+                        and pnl_pct_cur >= trail_activation_pct):
+                    position["trail_activated_idx"] = i
 
                 # 贏家加碼偵測（最多兩次）
                 _pyr_level = position.get("pyramid_level", 0)
@@ -585,6 +600,39 @@ def simulate_trades(
                 _net_exit  = _eff_exit * (1 - fee_rate - _tx_rate)
                 pnl_pct = (_net_exit - _net_entry) / _net_entry
                 max_gain_pct = (position["peak_price"] - _ep) / _ep
+
+                # ── 出場時 EMA20 乖離率（與進場計算方式相同）──
+                _exit_close_ser = df["Close"].astype(float).iloc[:i + 1]
+                _exit_ema20 = _exit_close_ser.ewm(span=20, adjust=False).mean().iloc[-1]
+                _ema_dev_at_exit = round(
+                    (current_price - _exit_ema20) / _exit_ema20, 4
+                ) if _exit_ema20 > 0 else 0.0
+
+                # ── 峰值相關欄位 ──
+                _peak_date     = position.get("peak_date", row_date)
+                _entry_idx     = position.get("entry_idx", i)
+                _peak_idx      = position.get("peak_idx", i)
+                _days_to_peak  = max(0, _peak_idx - _entry_idx)
+
+                # ── 追蹤停利啟動天數 ──
+                _trail_act_idx = position.get("trail_activated_idx", -1)
+                if trail_stop_pct <= 0:
+                    # 未啟用追蹤停利
+                    _days_to_trail_act = 0
+                elif _trail_act_idx == -1:
+                    # 啟用但持倉期間從未觸發啟動門檻
+                    _days_to_trail_act = -1
+                else:
+                    _days_to_trail_act = max(0, _trail_act_idx - _entry_idx)
+
+                # ── Day-10 / Day-20 未實現損益（進場後第10/20個交易日的收盤，扣費前）──
+                _d10_pnl = round(
+                    (float(df["Close"].iloc[_entry_idx + 10]) - _ep) / _ep * 100, 2
+                ) if _entry_idx + 10 < i else round(pnl_pct * 100, 2)
+                _d20_pnl = round(
+                    (float(df["Close"].iloc[_entry_idx + 20]) - _ep) / _ep * 100, 2
+                ) if _entry_idx + 20 < i else round(pnl_pct * 100, 2)
+
                 trades.append({
                     "code": code,
                     "entry_date": position["entry_date"],
@@ -594,6 +642,14 @@ def simulate_trades(
                     "accumulated_div": round(_acc_div, 4),
                     "pnl_pct": round(pnl_pct * 100, 2),
                     "max_gain_pct": round(max_gain_pct * 100, 2),
+                    "peak_date": _peak_date,
+                    "days_to_peak": _days_to_peak,
+                    "days_to_trail_activation": _days_to_trail_act,
+                    "pnl_at_day10": _d10_pnl,
+                    "pnl_at_day20": _d20_pnl,
+                    "ema_dev_at_exit": _ema_dev_at_exit,
+                    "market_breadth_at_entry": position.get("market_breadth_at_entry", ""),
+                    "market_rs_at_entry": position.get("market_rs_at_entry", ""),
                     "hold_days": hold,
                     "result": exit_reason,
                     "strategy": position["strategy"],
@@ -630,6 +686,14 @@ def simulate_trades(
                         "accumulated_div": round(_acc_div, 4),
                         "pnl_pct": round(pyr_pnl * 100, 2),
                         "max_gain_pct": round(max(pyr_max, 0) * 100, 2),
+                        "peak_date": _peak_date,
+                        "days_to_peak": "",
+                        "days_to_trail_activation": "",
+                        "pnl_at_day10": "",
+                        "pnl_at_day20": "",
+                        "ema_dev_at_exit": _ema_dev_at_exit,
+                        "market_breadth_at_entry": position.get("market_breadth_at_entry", ""),
+                        "market_rs_at_entry": position.get("market_rs_at_entry", ""),
                         "hold_days": pyr_hold,
                         "result": exit_reason,
                         "strategy": position["strategy"],
@@ -845,10 +909,28 @@ def simulate_trades(
             _ema20_now = _close_ser.ewm(span=20, adjust=False).mean().iloc[-1]
             ema_dev_at_entry = ((current_price - _ema20_now) / _ema20_now) if _ema20_now > 0 else 0.0
 
+            # 市場廣度原始比例（訊號日）
+            _mkt_breadth_entry = breadth_ratio.get(row_date, float("nan")) if breadth_ratio else float("nan")
+
+            # 0050 近20日報酬（訊號日，與 RS 計算對應的大盤端）
+            _lookback_rs = 20
+            _mkt_rs_entry = float("nan")
+            if _mkt_dates:
+                _sig_mpos = bisect.bisect_right(_mkt_dates, row_date) - 1
+                if _sig_mpos >= _lookback_rs:
+                    _mc_now  = _mkt_closes[_sig_mpos]
+                    _mc_past = _mkt_closes[_sig_mpos - _lookback_rs]
+                    if _mc_past > 0:
+                        _mkt_rs_entry = round((_mc_now - _mc_past) / _mc_past * 100, 2)
+
             position = {
                 "entry_date": next_date,
+                "entry_idx": i + 1,          # df 中進場的 row index（次日開盤）
                 "entry_price": entry_price,
                 "peak_price": entry_price,
+                "peak_idx": i + 1,            # 目前最高價對應的 df index
+                "peak_date": next_date,       # 目前最高價對應的日期
+                "trail_activated_idx": -1,    # 追蹤停利啟動 index（-1=未啟動）
                 "stop": stop,
                 "target": target,
                 "day_volume": next_vol,
@@ -857,7 +939,9 @@ def simulate_trades(
                 "rs_score": rs_score,
                 "ema_dev": ema_dev_at_entry,
                 "mkt_close_at_entry": mkt_close_at_entry,
-                "accumulated_div": 0.0,   # 持倉期間累計配息（NT/股）
+                "accumulated_div": 0.0,       # 持倉期間累計配息（NT/股）
+                "market_breadth_at_entry": round(_mkt_breadth_entry, 4) if _mkt_breadth_entry == _mkt_breadth_entry else "",
+                "market_rs_at_entry": _mkt_rs_entry if _mkt_rs_entry == _mkt_rs_entry else "",
             }
 
     return trades
@@ -921,11 +1005,12 @@ def portfolio_simulation(
     capital = initial_capital
     peak_capital = initial_capital
     max_drawdown = 0.0
-    active: list[dict] = []   # {exit_date, exit_cash, cost, code}
+    active: list[dict] = []   # {exit_date, exit_cash, cost, code, trade_id}
     taken: list[dict] = []
     total_fees = 0.0
     total_taxes = 0.0
     total_open_cost = 0.0   # 所有持倉的買入成本合計
+    _active_trade_ids: dict[str, str] = {}  # code → trade_id of active non-pyramid trade
 
     # 0050 輪動追蹤
     _mkt_keys: list[str] = sorted(market_daily_ret.keys()) if market_daily_ret else []
@@ -989,6 +1074,10 @@ def portfolio_simulation(
             if pos["exit_date"] <= entry_date:
                 capital += pos["exit_cash"]
                 total_open_cost -= pos["cost"]
+                # 移除已平倉的 trade_id 記錄
+                _tid = pos.get("trade_id", "")
+                if _tid and _active_trade_ids.get(pos["code"]) == _tid:
+                    del _active_trade_ids[pos["code"]]
             else:
                 still_active.append(pos)
         active = still_active
@@ -1087,6 +1176,17 @@ def portfolio_simulation(
         # lots 欄位：整張時為張數，零股時為股數（顯示用）
         lots = qty
 
+        # parent_trade_id：加碼單找同股仍在場的原始母單；一般單為空字串
+        _entry_date_str = str(trade.get("entry_date", ""))[:10]
+        _trade_code = trade["code"]
+        if is_pyramid:
+            _parent_trade_id = _active_trade_ids.get(_trade_code, "")
+            _this_trade_id   = ""
+        else:
+            _parent_trade_id = ""
+            _this_trade_id   = f"{_entry_date_str}_{_trade_code}"
+            _active_trade_ids[_trade_code] = _this_trade_id
+
         taken.append({
             **trade,
             "lots": lots,
@@ -1101,12 +1201,14 @@ def portfolio_simulation(
             "gross_pnl_dollars": round(gross_pnl_dollars + div_cash, 0),
             "pnl_dollars": round(net_pnl_dollars, 0),
             "net_pnl_dollars": round(net_pnl_dollars, 0),
+            "parent_trade_id": _parent_trade_id,
         })
         active.append({
             "exit_date": trade["exit_date"],
             "exit_cash": cost + gross_pnl_dollars + div_cash - fee_sell - odd_lot_sell_pen - tax,
             "cost": cost,
             "code": trade["code"],
+            "trade_id": _this_trade_id,
         })
 
     # 最後一筆進場到最後出場：繼續累積 0050 閒置收益
@@ -1760,6 +1862,7 @@ def main():
 
     # ── 市場廣度地圖 ──
     breadth_map = None
+    breadth_ratio_map = None   # 原始廣度比例值（供 CSV 記錄用）
     if args.breadth_filter and all_kbars:
         with console.status("[dim]計算市場廣度（逐日 EMA20 廣度）...[/dim]"):
             _breadth_codes = list(all_kbars.keys())
@@ -1770,6 +1873,13 @@ def main():
                 db_codes=_breadth_codes if use_db else None,
                 db_start=_breadth_start if use_db else None,
                 db_end=_breadth_end if use_db else None,
+            )
+            breadth_ratio_map = build_breadth_map(
+                all_kbars, ema_period=20, min_ratio=args.breadth_min,
+                db_codes=_breadth_codes if use_db else None,
+                db_start=_breadth_start if use_db else None,
+                db_end=_breadth_end if use_db else None,
+                return_ratio=True,
             )
         blocked = sum(1 for v in breadth_map.values() if not v)
         console.print(f"[dim]廣度過濾：門檻 {args.breadth_min*100:.0f}%，共 {blocked} 個交易日禁止開倉[/dim]")
@@ -1833,6 +1943,7 @@ def main():
                 early_exit_days=args.early_exit_days,
                 early_exit_lag=args.early_exit_lag,
                 breadth_allow=breadth_map,
+                breadth_ratio=breadth_ratio_map,
                 slippage_pct=args.slippage,
                 gap_up_threshold=args.gap_up_threshold,
                 fee_rate=args.fee_rate,

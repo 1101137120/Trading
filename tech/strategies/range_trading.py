@@ -91,3 +91,49 @@ class RangeTradingStrategy(BaseStrategy):
                     f"區間={range_pct*100:.1f}% [{ch_l:.2f}~{ch_h:.2f}]"),
             strategy=self.name,
         )
+
+    def signals_for_df(self, code: str, df: pd.DataFrame) -> "dict[int, Signal]":
+        min_rows = self.lookback + self.adx_period + 5
+        if len(df) < min_rows:
+            return {}
+        close = df["Close"].astype(float)
+        high  = df["High"].astype(float)
+        low   = df["Low"].astype(float)
+
+        ch_high_arr = close.shift(1).rolling(self.lookback).max().values
+        ch_low_arr  = close.shift(1).rolling(self.lookback).min().values
+        adx_arr     = _adx(high, low, close, self.adx_period).values
+        rsi_arr     = _rsi(close, self.rsi_period).values
+        close_v     = close.values
+
+        result: dict[int, Signal] = {}
+        for i in range(min_rows, len(df)):
+            ch_h = ch_high_arr[i]
+            ch_l = ch_low_arr[i]
+            if pd.isna(ch_h) or pd.isna(ch_l) or ch_l <= 0:
+                continue
+            range_pct = (ch_h - ch_l) / ch_l
+            if range_pct < self.min_range_pct:
+                continue
+            adx_val = adx_arr[i]
+            if pd.isna(adx_val) or adx_val >= self.adx_max:
+                continue
+            rsi_val = rsi_arr[i]
+            if pd.isna(rsi_val) or rsi_val >= self.rsi_max:
+                continue
+            price = close_v[i]
+            if price > ch_l * (1 + self.touch_pct):
+                continue
+            if close_v[i] <= close_v[i - 1]:
+                continue
+            adx_score = (self.adx_max - adx_val) / self.adx_max
+            rsi_score = (self.rsi_max - rsi_val) / self.rsi_max
+            confidence = round(adx_score * 0.5 + rsi_score * 0.5, 2)
+            result[i] = Signal(
+                code=code, action="Buy", price=price,
+                confidence=max(confidence, 0.26),
+                reason=(f"區間下軌反彈 ADX={adx_val:.1f} RSI={rsi_val:.1f} "
+                        f"區間={range_pct*100:.1f}% [{ch_l:.2f}~{ch_h:.2f}]"),
+                strategy=self.name,
+            )
+        return result

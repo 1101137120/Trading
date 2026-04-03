@@ -68,6 +68,45 @@ class KdCrossStrategy(BaseStrategy):
             strategy=self.name,
         )
 
+    def signals_for_df(self, code: str, df: pd.DataFrame) -> "dict[int, Signal]":
+        min_rows = self.kd_period + self.rsi_period + 10
+        if len(df) < min_rows:
+            return {}
+        close = df["Close"].astype(float)
+        high  = df["High"].astype(float)
+        low   = df["Low"].astype(float)
+
+        k_ser, d_ser = kd(high, low, close, self.kd_period)
+        rsi_ser      = rsi(close, self.rsi_period)
+        ema_arr      = _ema(close, self.ema_trend).values if self.ema_trend > 0 else None
+
+        k_arr   = k_ser.values
+        d_arr   = d_ser.values
+        rsi_arr = rsi_ser.values
+        close_v = close.values
+
+        result: dict[int, Signal] = {}
+        for i in range(min_rows, len(df)):
+            if ema_arr is not None:
+                ev = ema_arr[i]
+                if pd.isna(ev) or close_v[i] < ev:
+                    continue
+            k_now, k_prev = k_arr[i], k_arr[i - 1]
+            d_now, d_prev = d_arr[i], d_arr[i - 1]
+            rsi_now       = rsi_arr[i]
+            rsi_prev      = rsi_arr[i - 1]
+            if (k_prev <= d_prev and k_now > d_now
+                    and k_now < self.k_oversold + 20
+                    and rsi_now > rsi_prev):
+                confidence = (self.k_oversold + 20 - k_now) / (self.k_oversold + 20)
+                result[i] = Signal(
+                    code=code, action="Buy", price=close_v[i],
+                    confidence=round(max(min(confidence, 1.0), 0.30), 2),
+                    reason=f"KD黃金交叉 K={k_now:.1f} D={d_now:.1f} RSI={rsi_now:.1f}",
+                    strategy=self.name,
+                )
+        return result
+
     def diagnose(self, code: str, df: pd.DataFrame) -> str:
         if not self._validate_df(df, self.kd_period + 10):
             return "資料不足"

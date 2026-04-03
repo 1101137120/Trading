@@ -61,3 +61,32 @@ class MomentumStrategy(BaseStrategy):
                          reason=f"RSI={rsi_now:.1f}超買 MACD柱轉弱", strategy=self.name)
 
         return None
+
+    def signals_for_df(self, code: str, df: pd.DataFrame) -> "dict[int, Signal]":
+        min_rows = self.macd_slow + self.macd_signal + 5
+        if len(df) < min_rows:
+            return {}
+        close = df["Close"].astype(float)
+        rsi_arr    = _rsi(close, self.rsi_period).values
+        _, _, hist = _macd(close, self.macd_fast, self.macd_slow, self.macd_signal)
+        hist_arr   = hist.values
+        close_v    = close.values
+
+        result: dict[int, Signal] = {}
+        for i in range(min_rows, len(df)):
+            rsi_now  = rsi_arr[i]
+            rsi_prev = rsi_arr[i - 1]
+            h_now    = hist_arr[i]
+            h_prev   = hist_arr[i - 1]
+            if (rsi_prev < self.rsi_oversold
+                    and rsi_now > rsi_prev
+                    and h_prev < 0
+                    and h_now > h_prev):
+                confidence = min((self.rsi_oversold - rsi_prev) / self.rsi_oversold, 1.0)
+                result[i] = Signal(
+                    code=code, action="Buy", price=close_v[i],
+                    confidence=round(confidence, 2),
+                    reason=f"RSI={rsi_now:.1f}回升 MACD柱增強",
+                    strategy=self.name,
+                )
+        return result

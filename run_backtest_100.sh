@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-.venv/bin/python backtest.py --conf-tiers "0.9:50,0.7:30,0:10" --show-skipped \
-  --start               2025-01-01 \
+.venv/bin/python backtest.py  --show-skipped \
+  --start               2009-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
   --stop-loss           8 \
   --trail-stop          0.10 \
-  --trail-stop-bull     0.18 \
+  --trail-stop-bull     0.22 \
   --trail-stop-rs-bonus 0.05 \
   --trail-activation    0.08 \
-  --max-positions       20 \
-  --position-pct        0.30 \
+  --max-positions       5 \
+  --position-pct        0.20 \
   --stocks              80 \
-  --max-price           2000 \
-  --min-rs              0.10 \
   --market-filter \
   --market-ma           20 \
   --time-stop-days      20 \
   --time-stop-min-pct   0.05 \
   --breadth-filter \
-  --breadth-min         0.55 \
-  --slippage            0.002 \
-  --max-vol-pct         0.03
+  --breadth-min         0.50 \
+  --market-max-20d-gain 0.10 \
+  --market-max-10d-gain 0.07 \
