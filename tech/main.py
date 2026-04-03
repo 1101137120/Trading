@@ -384,6 +384,11 @@ class TradingSystem:
                 self.portfolio.update_capital(bal.get("balance", 0))
 
             self._is_bull_market = self.market_filter.is_bull_trend()
+            self.logger.info(
+                f"大盤狀態: {'牛市(MA20>MA60)' if self._is_bull_market else '非牛市(MA20<=MA60)'} | "
+                f"資金: 總{self.portfolio.total_capital:,.0f} 可用{self.portfolio.available_capital:,.0f} | "
+                f"持倉: {len(self.portfolio.positions)}/{self.config.get('risk',{}).get('max_positions',5)}"
+            )
             self._drain_exit_queue()
             self._check_pending_sells()
             self._check_pending_orders()
@@ -396,6 +401,11 @@ class TradingSystem:
                 self.logger.info("沒有符合條件的標的")
                 self._print_summary()
                 return
+            self.logger.info(
+                f"篩選通過 {len(candidates)} 檔: "
+                + ", ".join(f"{c['code']}({c.get('name','')[:4]})" for c in candidates[:20])
+                + ("..." if len(candidates) > 20 else "")
+            )
 
             # 顯示 0050 ATR% 震盪警示
             _atr = self.market_filter.market_atr_pct()
@@ -435,6 +445,14 @@ class TradingSystem:
                     stbl.add_row(s.code, code_to_name.get(s.code, ""), f"{s.confidence:.2f}", (s.reason or "")[:40])
                     self.logger.info(f"[訊號-未執行] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
                 console.print(stbl)
+                signals = []
+
+            _bull_entry_only = self.config.get("market_filter", {}).get("bull_entry_only", False)
+            if signals and _bull_entry_only and not self._is_bull_market:
+                self.logger.info("大盤 MA20<MA60（非牛市），bull_entry_only 啟用，本週期不開新倉")
+                console.print("[bold yellow]⚠ 大盤 MA20<MA60，bull_entry_only 模式暫停新倉[/bold yellow]")
+                for s in signals:
+                    self.logger.info(f"[訊號-非牛市略過] {s.code} 信心={s.confidence:.2f}")
                 signals = []
 
             breadth_min = self.config.get("market_filter", {}).get("breadth_min", 0.0)
@@ -940,7 +958,13 @@ class TradingSystem:
     def _execute_sell(self, code: str, pos, reason: str):
         exit_price = pos.current_price
         unit = "股" if pos.odd_lot else "張"
-        self.logger.info(f"[SELL] {code} {pos.quantity}{unit} @ {exit_price} | {reason}")
+        pnl_pct = (exit_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
+        hold_days = (datetime.now() - pos.entry_time).days if pos.entry_time else 0
+        self.logger.info(
+            f"[SELL] {code} {pos.quantity}{unit} @ {exit_price} | {reason} | "
+            f"成本{pos.entry_price:.2f} 損益{pnl_pct:+.1%}({pos.pnl:+,.0f}) | "
+            f"持有{hold_days}天 | 峰值{pos.highest_price:.2f}"
+        )
 
         # 跌停警告：市價單可能無法成交
         snap = self.feed.get_snapshot(code)
@@ -1067,8 +1091,10 @@ class TradingSystem:
                 if pos.trailing_active and trail_pct:
                     trail_price = pos.highest_price * (1 - trail_pct)
                     exit_str = f"[yellow]移{trail_price:.2f}[/yellow]"
+                    exit_log = f"移停{trail_price:.2f}(峰{pos.highest_price:.2f})"
                 else:
                     exit_str = f"[dim]停{pos.stop_loss:.2f}[/dim]"
+                    exit_log = f"停損{pos.stop_loss:.2f}"
                 qty_str = f"{pos.quantity}{'股' if pos.odd_lot else '張'}"
                 table.add_row(
                     code, name, qty_str,
@@ -1077,6 +1103,12 @@ class TradingSystem:
                     f"[{clr}]{pos.pnl:+,.0f}[/{clr}]",
                     f"{hold_days}天",
                     exit_str,
+                )
+                self.logger.info(
+                    f"[持倉] {code} {name} {qty_str} | "
+                    f"成本{pos.entry_price:.2f} 現價{pos.current_price:.2f} "
+                    f"損益{pnl_pct:+.1%}({pos.pnl:+,.0f}) | "
+                    f"持有{hold_days}天 | {exit_log}"
                 )
             console.print(table)
         if self.portfolio.pending_orders:
@@ -1093,7 +1125,14 @@ class TradingSystem:
                 )
             console.print(ptable)
 
-        mkt_status = "✅ 多頭" if (self.market_filter and self.market_filter.allow_long()) else "🚫 偏空"
+        _mf_ok = self.market_filter and self.market_filter.allow_long()
+        _bull_only = self.config.get("market_filter", {}).get("bull_entry_only", False)
+        if not _mf_ok:
+            mkt_status = "🚫 偏空"
+        elif _bull_only and not self._is_bull_market:
+            mkt_status = "⚠ MA20<MA60"
+        else:
+            mkt_status = "✅ 多頭"
 
         # 取 0050 / 00631L 今日漲跌%
         bench_parts = []
