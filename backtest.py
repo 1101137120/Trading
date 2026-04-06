@@ -925,6 +925,7 @@ def simulate_trades(
 
             position = {
                 "entry_date": next_date,
+                "signal_date": row_date,
                 "entry_idx": i + 1,          # df 中進場的 row index（次日開盤）
                 "entry_price": entry_price,
                 "peak_price": entry_price,
@@ -2606,6 +2607,23 @@ def main():
                     _park_df[_col] = ""
             csv_df = pd.concat([csv_df, _park_df[csv_df.columns]], ignore_index=True)
             csv_df["code"] = csv_df["code"].astype(str)  # 防止 "0050" 被轉成整數 50
+
+        # ── 計算 signal_rank：同訊號日內依 confidence 排名（1=最高）──
+        if "signal_date" in csv_df.columns and "confidence" in csv_df.columns:
+            _real = csv_df["signal_date"].notna() & (csv_df["signal_date"] != "")
+            _rank_src = csv_df.loc[_real, ["signal_date", "confidence"]].copy()
+            _rank_src["confidence"] = pd.to_numeric(_rank_src["confidence"], errors="coerce").fillna(0)
+            csv_df.loc[_real, "signal_rank"] = (
+                _rank_src.groupby("signal_date")["confidence"]
+                .rank(method="min", ascending=False)
+                .astype(int)
+            )
+            csv_df.loc[_real, "n_signals_that_day"] = (
+                _rank_src.groupby("signal_date")["confidence"]
+                .transform("count")
+                .astype(int)
+            )
+
         for _k, _v in _run_params.items():
             csv_df[_k] = _v
         csv_df.to_csv(out_path, index=False, encoding="utf-8-sig")

@@ -10,12 +10,8 @@
   --trail-activation    0.08 \
   --max-positions       5 \
   --position-pct        0.20 \
-  --stocks              80 \
+  --stocks              50 \
   --market-filter \
   --market-ma           20 \
-  --time-stop-days      20 \
-  --time-stop-min-pct   0.05 \
-  --breadth-filter \
-  --breadth-min         0.50 \
   --market-max-20d-gain 0.10 \
   --market-max-10d-gain 0.07 \
