@@ -94,7 +94,8 @@ class EmaTrendStrategy(BaseStrategy):
                 f"EMA多頭排列 "
                 f"EMA{self.ema_fast}={ef_now:.2f}>"
                 f"EMA{self.ema_mid}={em_now:.2f}>"
-                f"EMA{self.ema_slow}={es_now:.2f}"
+                f"EMA{self.ema_slow}={es_now:.2f} "
+                f"乖離{dev:.1%}"
             ),
             strategy=self.name,
         )
@@ -173,13 +174,15 @@ class EmaTrendStrategy(BaseStrategy):
             spread_score = min(spread * 10, 0.50)
             adx_score    = min(adx_val / 100, 0.35) if adx_val is not None and not pd.isna(adx_val) else 0.15
             vol_score    = min(max(vol_ratio - 1.0, 0) * 0.15, 0.15)
+            dev_val      = (close_v[i] - em_now) / em_now if em_now > 0 else 0
             confidence   = round(min(spread_score + adx_score + vol_score, 1.0), 2)
             result[i] = Signal(
                 code=code, action="Buy", price=price,
                 confidence=max(confidence, 0.30),
                 reason=(f"EMA多頭排列 EMA{self.ema_fast}={ef_now:.2f}>"
                         f"EMA{self.ema_mid}={em_now:.2f}>"
-                        f"EMA{self.ema_slow}={es_now:.2f}"),
+                        f"EMA{self.ema_slow}={es_now:.2f} "
+                        f"乖離{dev_val:.1%}"),
                 strategy=self.name,
             )
         return result
