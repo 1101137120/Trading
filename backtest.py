@@ -968,6 +968,96 @@ def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
     return capital * position_pct
 
 
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _rs_to_score(rs: float, rs_center: float = 0.05, rs_span: float = 0.25) -> float:
+    if rs_span <= 0:
+        return _clamp01(rs)
+    return _clamp01((rs - rs_center) / rs_span)
+
+
+def _ema_dev_to_score(dev: float, sweet_spot: float = 0.05, tolerance: float = 0.03) -> float:
+    if tolerance <= 0:
+        return 0.0
+    distance = abs(dev - sweet_spot)
+    return _clamp01(1.0 - distance / tolerance)
+
+
+def _sweet_spot_score(v: float, sweet_spot: float, tolerance: float, default: float = 0.5) -> float:
+    if v is None:
+        return default
+    if tolerance <= 0:
+        return default
+    distance = abs(float(v) - sweet_spot)
+    return _clamp01(1.0 - distance / tolerance)
+
+
+def _trade_rank_score(
+    trade: dict,
+    rank_mode: str = "confidence",
+    rank_w_conf: float = 0.35,
+    rank_w_rs: float = 0.45,
+    rank_w_dev: float = 0.20,
+    rank_w_rs_sweet: float = 0.0,
+    rank_w_breadth: float = 0.0,
+    rank_rs_center: float = 0.05,
+    rank_rs_span: float = 0.25,
+    rank_rs_sweet_spot: float = 0.20,
+    rank_rs_sweet_tolerance: float = 0.10,
+    rank_dev_sweet_spot: float = 0.05,
+    rank_dev_tolerance: float = 0.03,
+    rank_breadth_sweet_spot: float = 0.60,
+    rank_breadth_tolerance: float = 0.12,
+) -> float:
+    conf = _clamp01(_safe_float(trade.get("confidence", 0.0)))
+    rs_raw = _safe_float(trade.get("rs_score", 0.0))
+    dev_raw = _safe_float(trade.get("ema_dev", 0.0))
+    breadth_raw = trade.get("market_breadth_at_entry", None)
+    try:
+        breadth_raw = float(breadth_raw) if breadth_raw not in ("", None) else None
+    except (TypeError, ValueError):
+        breadth_raw = None
+    rs_score = _rs_to_score(rs_raw, rs_center=rank_rs_center, rs_span=rank_rs_span)
+    rs_sweet_score = _sweet_spot_score(
+        rs_raw, sweet_spot=rank_rs_sweet_spot, tolerance=rank_rs_sweet_tolerance, default=0.5
+    )
+    dev_score = _ema_dev_to_score(dev_raw, sweet_spot=rank_dev_sweet_spot, tolerance=rank_dev_tolerance)
+    breadth_score = _sweet_spot_score(
+        breadth_raw, sweet_spot=rank_breadth_sweet_spot, tolerance=rank_breadth_tolerance, default=0.5
+    )
+
+    mode = (rank_mode or "confidence").lower()
+    if mode == "confidence":
+        return conf
+    if mode == "rs":
+        return rs_score
+
+    w_conf = max(0.0, rank_w_conf)
+    w_rs = max(0.0, rank_w_rs)
+    w_dev = max(0.0, rank_w_dev)
+    w_rs_sweet = max(0.0, rank_w_rs_sweet)
+    w_breadth = max(0.0, rank_w_breadth)
+    total_w = w_conf + w_rs + w_dev + w_rs_sweet + w_breadth
+    if total_w <= 0:
+        return conf
+    return (
+        w_conf * conf
+        + w_rs * rs_score
+        + w_dev * dev_score
+        + w_rs_sweet * rs_sweet_score
+        + w_breadth * breadth_score
+    ) / total_w
+
+
 def portfolio_simulation(
     all_trades: list[dict],
     initial_capital: float,
@@ -988,6 +1078,20 @@ def portfolio_simulation(
     bull_max_positions: int = 0,             # 牛市（MA20>MA60）時允許更多持倉（0=停用）
     market_bull_dates: dict | None = None,   # {date_str: bool}，True = MA20>MA60
     odd_lot_penalty_pct: float = 0.003,      # 零股額外執行成本（買賣各 0.3%）
+    rank_mode: str = "confidence",
+    rank_w_conf: float = 0.35,
+    rank_w_rs: float = 0.45,
+    rank_w_dev: float = 0.20,
+    rank_w_rs_sweet: float = 0.0,
+    rank_w_breadth: float = 0.0,
+    rank_rs_center: float = 0.05,
+    rank_rs_span: float = 0.25,
+    rank_rs_sweet_spot: float = 0.20,
+    rank_rs_sweet_tolerance: float = 0.10,
+    rank_dev_sweet_spot: float = 0.05,
+    rank_dev_tolerance: float = 0.03,
+    rank_breadth_sweet_spot: float = 0.60,
+    rank_breadth_tolerance: float = 0.12,
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -997,9 +1101,29 @@ def portfolio_simulation(
     - 1 張 = 1000 股；若預算不足 1 張則自動改用零股（與實盤一致）
     - 閒置資金（現金部分）在 0050>MA20 時停泊 0050，否則保持現金
     """
-    # 同日多筆訊號：信心高（→ RS 高）的優先進場
+    # 同日多筆訊號：依 rank_mode（confidence/rs/hybrid）排序優先進場
+    _rank_mode = (rank_mode or "confidence").lower()
+    if _rank_mode not in {"confidence", "rs", "hybrid"}:
+        _rank_mode = "confidence"
     trades_sorted = sorted(all_trades,
                            key=lambda x: (x["entry_date"],
+                                          -_trade_rank_score(
+                                              x,
+                                              rank_mode=_rank_mode,
+                                              rank_w_conf=rank_w_conf,
+                                              rank_w_rs=rank_w_rs,
+                                              rank_w_dev=rank_w_dev,
+                                              rank_w_rs_sweet=rank_w_rs_sweet,
+                                              rank_w_breadth=rank_w_breadth,
+                                              rank_rs_center=rank_rs_center,
+                                              rank_rs_span=rank_rs_span,
+                                              rank_rs_sweet_spot=rank_rs_sweet_spot,
+                                              rank_rs_sweet_tolerance=rank_rs_sweet_tolerance,
+                                              rank_dev_sweet_spot=rank_dev_sweet_spot,
+                                              rank_dev_tolerance=rank_dev_tolerance,
+                                              rank_breadth_sweet_spot=rank_breadth_sweet_spot,
+                                              rank_breadth_tolerance=rank_breadth_tolerance,
+                                          ),
                                           -x.get("confidence", 0),
                                           -x.get("rs_score", 0)))
 
@@ -1188,8 +1312,27 @@ def portfolio_simulation(
             _this_trade_id   = f"{_entry_date_str}_{_trade_code}"
             _active_trade_ids[_trade_code] = _this_trade_id
 
+        rank_score = _trade_rank_score(
+            trade,
+            rank_mode=_rank_mode,
+            rank_w_conf=rank_w_conf,
+            rank_w_rs=rank_w_rs,
+            rank_w_dev=rank_w_dev,
+            rank_w_rs_sweet=rank_w_rs_sweet,
+            rank_w_breadth=rank_w_breadth,
+            rank_rs_center=rank_rs_center,
+            rank_rs_span=rank_rs_span,
+            rank_rs_sweet_spot=rank_rs_sweet_spot,
+            rank_rs_sweet_tolerance=rank_rs_sweet_tolerance,
+            rank_dev_sweet_spot=rank_dev_sweet_spot,
+            rank_dev_tolerance=rank_dev_tolerance,
+            rank_breadth_sweet_spot=rank_breadth_sweet_spot,
+            rank_breadth_tolerance=rank_breadth_tolerance,
+        )
+
         taken.append({
             **trade,
+            "rank_score": round(rank_score, 4),
             "lots": lots,
             "odd_lot": is_odd_lot,
             "cost": round(cost, 0),
@@ -1544,6 +1687,34 @@ def main():
                              "；0=停用。用於過濾跑輸大盤的弱勢股。")
     parser.add_argument("--max-rs", type=float, default=0.0,
                         help="進場 RS 上限：RS 超過此值視為趨勢末段不進場（建議 0.30~0.40）；0=停用。")
+    parser.add_argument("--rank-mode", choices=["confidence", "rs", "hybrid"], default="confidence",
+                        help="同日多筆訊號排序模式：confidence（原本）、rs（相對強弱）、hybrid（加權綜合）")
+    parser.add_argument("--rank-w-conf", type=float, default=0.35,
+                        help="hybrid 排序：confidence 權重（預設 0.35）")
+    parser.add_argument("--rank-w-rs", type=float, default=0.45,
+                        help="hybrid 排序：RS 權重（預設 0.45）")
+    parser.add_argument("--rank-w-dev", type=float, default=0.20,
+                        help="hybrid 排序：EMA 乖離甜蜜區權重（預設 0.20）")
+    parser.add_argument("--rank-w-rs-sweet", type=float, default=0.0,
+                        help="hybrid 排序：RS 甜蜜區權重（預設 0=停用）")
+    parser.add_argument("--rank-w-breadth", type=float, default=0.0,
+                        help="hybrid 排序：市場廣度甜蜜區權重（預設 0=停用）")
+    parser.add_argument("--rank-rs-center", type=float, default=0.05,
+                        help="hybrid/rs 排序：RS 正規化起點（預設 0.05）")
+    parser.add_argument("--rank-rs-span", type=float, default=0.25,
+                        help="hybrid/rs 排序：RS 正規化跨度（預設 0.25）")
+    parser.add_argument("--rank-rs-sweet-spot", type=float, default=0.20,
+                        help="hybrid 排序：RS 甜蜜區中心（預設 0.20）")
+    parser.add_argument("--rank-rs-sweet-tolerance", type=float, default=0.10,
+                        help="hybrid 排序：RS 甜蜜區容忍帶（預設 0.10）")
+    parser.add_argument("--rank-dev-sweet-spot", type=float, default=0.05,
+                        help="hybrid 排序：EMA 乖離甜蜜區中心（預設 0.05）")
+    parser.add_argument("--rank-dev-tolerance", type=float, default=0.03,
+                        help="hybrid 排序：EMA 乖離甜蜜區容忍帶（預設 0.03）")
+    parser.add_argument("--rank-breadth-sweet-spot", type=float, default=0.60,
+                        help="hybrid 排序：市場廣度甜蜜區中心（預設 0.60）")
+    parser.add_argument("--rank-breadth-tolerance", type=float, default=0.12,
+                        help="hybrid 排序：市場廣度甜蜜區容忍帶（預設 0.12）")
     parser.add_argument("--time-stop-days", type=int, default=0,
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
@@ -1649,6 +1820,14 @@ def main():
     console.print(f"策略: [cyan]{', '.join(active)}[/cyan]  |  "
                   f"停損: [red]{sl*100:.1f}%[/red]  {exit_mode}  |  "
                   f"初始資金: [bold]{args.capital:,.0f}[/bold]  每筆: {args.position_pct*100:.0f}%  最多持倉: {max_pos}")
+    if args.rank_mode == "hybrid":
+        console.print(
+            f"排序: [cyan]{args.rank_mode}[/cyan]  "
+            f"(conf={args.rank_w_conf:.2f}, rs={args.rank_w_rs:.2f}, dev={args.rank_w_dev:.2f}, "
+            f"rs_sweet={args.rank_w_rs_sweet:.2f}, breadth={args.rank_w_breadth:.2f})"
+        )
+    else:
+        console.print(f"排序: [cyan]{args.rank_mode}[/cyan]")
 
     engine = StrategyEngine(cfg)
 
@@ -2060,6 +2239,20 @@ def main():
         bull_max_positions=args.bull_max_positions,
         market_bull_dates=_mkt_bull_dates if _mkt_bull_dates else None,
         odd_lot_penalty_pct=args.odd_lot_penalty,
+        rank_mode=args.rank_mode,
+        rank_w_conf=args.rank_w_conf,
+        rank_w_rs=args.rank_w_rs,
+        rank_w_dev=args.rank_w_dev,
+        rank_w_rs_sweet=args.rank_w_rs_sweet,
+        rank_w_breadth=args.rank_w_breadth,
+        rank_rs_center=args.rank_rs_center,
+        rank_rs_span=args.rank_rs_span,
+        rank_rs_sweet_spot=args.rank_rs_sweet_spot,
+        rank_rs_sweet_tolerance=args.rank_rs_sweet_tolerance,
+        rank_dev_sweet_spot=args.rank_dev_sweet_spot,
+        rank_dev_tolerance=args.rank_dev_tolerance,
+        rank_breadth_sweet_spot=args.rank_breadth_sweet_spot,
+        rank_breadth_tolerance=args.rank_breadth_tolerance,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -2533,6 +2726,20 @@ def main():
         "position_pct":         args.position_pct,
         "stocks":               args.stocks,
         "min_rs":               args.min_rs,
+        "rank_mode":            args.rank_mode,
+        "rank_w_conf":          args.rank_w_conf,
+        "rank_w_rs":            args.rank_w_rs,
+        "rank_w_dev":           args.rank_w_dev,
+        "rank_w_rs_sweet":      args.rank_w_rs_sweet,
+        "rank_w_breadth":       args.rank_w_breadth,
+        "rank_rs_center":       args.rank_rs_center,
+        "rank_rs_span":         args.rank_rs_span,
+        "rank_rs_sweet_spot":   args.rank_rs_sweet_spot,
+        "rank_rs_sweet_tol":    args.rank_rs_sweet_tolerance,
+        "rank_dev_sweet_spot":  args.rank_dev_sweet_spot,
+        "rank_dev_tolerance":   args.rank_dev_tolerance,
+        "rank_breadth_spot":    args.rank_breadth_sweet_spot,
+        "rank_breadth_tol":     args.rank_breadth_tolerance,
         "market_max_20d_gain":  args.market_max_20d_gain,
         "market_max_10d_gain":  args.market_max_10d_gain,
         "market_atr_max":       args.market_atr_max,
@@ -2608,21 +2815,23 @@ def main():
             csv_df = pd.concat([csv_df, _park_df[csv_df.columns]], ignore_index=True)
             csv_df["code"] = csv_df["code"].astype(str)  # 防止 "0050" 被轉成整數 50
 
-        # ── 計算 signal_rank：同訊號日內依 confidence 排名（1=最高）──
+        # ── 計算 signal_rank：同訊號日內依 rank_score（若有）或 confidence 排名（1=最高）──
         if "signal_date" in csv_df.columns and "confidence" in csv_df.columns:
+            _rank_col = "rank_score" if "rank_score" in csv_df.columns else "confidence"
             _real = csv_df["signal_date"].notna() & (csv_df["signal_date"] != "")
-            _rank_src = csv_df.loc[_real, ["signal_date", "confidence"]].copy()
-            _rank_src["confidence"] = pd.to_numeric(_rank_src["confidence"], errors="coerce").fillna(0)
+            _rank_src = csv_df.loc[_real, ["signal_date", _rank_col]].copy()
+            _rank_src[_rank_col] = pd.to_numeric(_rank_src[_rank_col], errors="coerce").fillna(0)
             csv_df.loc[_real, "signal_rank"] = (
-                _rank_src.groupby("signal_date")["confidence"]
+                _rank_src.groupby("signal_date")[_rank_col]
                 .rank(method="min", ascending=False)
                 .astype(int)
             )
             csv_df.loc[_real, "n_signals_that_day"] = (
-                _rank_src.groupby("signal_date")["confidence"]
+                _rank_src.groupby("signal_date")[_rank_col]
                 .transform("count")
                 .astype(int)
             )
+            csv_df.loc[_real, "signal_rank_metric"] = _rank_col
 
         for _k, _v in _run_params.items():
             csv_df[_k] = _v

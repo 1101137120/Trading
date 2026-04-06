@@ -14,6 +14,20 @@
   --stocks              80 \
   --max-price           2000 \
   --min-rs              0.05 \
+  --rank-mode           hybrid \
+  --rank-w-conf         0.15 \
+  --rank-w-rs           0.25 \
+  --rank-w-dev          0.20 \
+  --rank-w-rs-sweet     0.30 \
+  --rank-w-breadth      0.10 \
+  --rank-rs-center      0.05 \
+  --rank-rs-span        0.25 \
+  --rank-rs-sweet-spot  0.20 \
+  --rank-rs-sweet-tolerance 0.10 \
+  --rank-dev-sweet-spot 0.05 \
+  --rank-dev-tolerance  0.03 \
+  --rank-breadth-sweet-spot 0.60 \
+  --rank-breadth-tolerance 0.12 \
   --market-filter \
   --early-exit-days     0 \
   --market-ma           20 \
@@ -36,4 +50,4 @@
   --pyramid-gain2       0.40 \
   --pyramid-rs-min      0.05 \
   --pyramid-alloc       0.50 \
-  --market-bull-entry
+  --market-bull-entry  \
