@@ -1621,6 +1621,8 @@ def main():
                         help="停用大盤過濾")
     parser.add_argument("--market-bull-entry", action="store_true", default=False,
                         help="只在 0050 MA20 > MA60（持續上行趨勢）時才開倉，比 --market-filter 更嚴格")
+    parser.add_argument("--no-idle-0050", action="store_true", default=False,
+                        help="關閉閒置資金停泊 0050（閒置資金維持現金）")
     parser.add_argument("--tse-only", action="store_true", default=False,
                         help="只交易上市股（TSE），排除上櫃（OTC）")
     parser.add_argument("--breadth-filter", action="store_true", default=False,
@@ -2163,60 +2165,61 @@ def main():
     s = summarize(all_trades)
 
     # ── 0050 日報酬 + MA20 訊號（供閒置資金輪動）──
+    # 停泊報酬使用原始收盤日報酬；訊號採 lag1 以避免 look-ahead。
     _mkt_daily_ret: dict[str, float] = {}
     _mkt_above_ma: dict[str, bool] = {}   # True = 0050 > MA20，可停泊
     _mkt_bull_dates: dict[str, bool] = {}  # True = 0050 MA20 > MA60（牛市）
-    try:
-        if use_db:
-            import duckdb as _ddb_pre
-            _con_pre = _ddb_pre.connect("data/stocks.db", read_only=True)
-            _mkt_pre = _con_pre.execute(
-                "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
-            ).df()
-            _con_pre.close()
-            _mkt_pre_d = [str(d)[:10] for d in _mkt_pre["date"].values]
-            # 原始收盤價（未調整）供停泊交易記錄顯示用
-            _mkt_raw_c = _mkt_pre["close"].values.astype(float)
-            _mkt_raw_lut: dict[str, float] = dict(zip(_mkt_pre_d, _mkt_raw_c))
-            # adjust_splits 消除除權造成的單日暴跌（如 2009-01-02 -43%）
-            _mkt_adj_df = adjust_splits(
-                pd.DataFrame({"Close": _mkt_raw_c.copy()}),
-                threshold=0.10,
-            )
-            _mkt_pre_c = _mkt_adj_df["Close"].values.astype(float)
-            for _ii in range(1, len(_mkt_pre_d)):
-                if _mkt_pre_c[_ii - 1] > 0:
-                    _mkt_daily_ret[_mkt_pre_d[_ii]] = float(
-                        _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
-                    )
-            # MA20 / MA60 訊號（用調整後價格）
-            _ma_period = args.market_ma  # 與大盤過濾器一致
-            for _ii in range(len(_mkt_pre_d)):
-                if _ii < _ma_period:
-                    continue
-                _ma = float(_mkt_pre_c[_ii - _ma_period:_ii].mean())
-                _mkt_above_ma[_mkt_pre_d[_ii]] = bool(_mkt_pre_c[_ii] > _ma)
-                if _ii >= 60:
-                    _ma60v = float(_mkt_pre_c[_ii - 60:_ii].mean())
-                    _mkt_bull_dates[_mkt_pre_d[_ii]] = bool(_ma > _ma60v)
-        elif market_df is not None and "ts" in market_df.columns:
-            _mdf = market_df.sort_values("ts")
-            _mdf_adj = adjust_splits(
-                _mdf[["Close"]].reset_index(drop=True), threshold=0.10
-            )
-            _mdf_c = _mdf_adj["Close"].values.astype(float)
-            _mdf_d = _mdf["ts"].dt.strftime("%Y-%m-%d").values
-            for _ii in range(1, len(_mdf_d)):
-                if _mdf_c[_ii - 1] > 0:
-                    _mkt_daily_ret[_mdf_d[_ii]] = float(_mdf_c[_ii] / _mdf_c[_ii - 1] - 1)
-            _ma_period = args.market_ma
-            for _ii in range(max(_ma_period, 60), len(_mdf_d)):
-                _ma = float(_mdf_c[_ii - _ma_period:_ii].mean())
-                _mkt_above_ma[_mdf_d[_ii]] = bool(_mdf_c[_ii] > _ma)
-                _ma60v = float(_mdf_c[_ii - 60:_ii].mean())
-                _mkt_bull_dates[_mdf_d[_ii]] = bool(_ma > _ma60v)
-    except Exception:
-        pass
+    if not args.no_idle_0050:
+        try:
+            if use_db:
+                import duckdb as _ddb_pre
+                _con_pre = _ddb_pre.connect("data/stocks.db", read_only=True)
+                _mkt_pre = _con_pre.execute(
+                    "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
+                ).df()
+                _con_pre.close()
+                _mkt_pre_d = [str(d)[:10] for d in _mkt_pre["date"].values]
+                # 原始收盤價（未調整）供停泊交易記錄顯示用
+                _mkt_raw_c = _mkt_pre["close"].values.astype(float)
+                _mkt_raw_lut: dict[str, float] = dict(zip(_mkt_pre_d, _mkt_raw_c))
+                _mkt_pre_c = _mkt_raw_c
+                for _ii in range(1, len(_mkt_pre_d)):
+                    if _mkt_pre_c[_ii - 1] > 0:
+                        _mkt_daily_ret[_mkt_pre_d[_ii]] = float(
+                            _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
+                        )
+                # MA20 / MA60 訊號（用原始價格）
+                _ma_period = args.market_ma  # 與大盤過濾器一致
+                for _ii in range(len(_mkt_pre_d)):
+                    if _ii < _ma_period:
+                        continue
+                    _ma = float(_mkt_pre_c[_ii - _ma_period:_ii].mean())
+                    _mkt_above_ma[_mkt_pre_d[_ii]] = bool(_mkt_pre_c[_ii] > _ma)
+                    if _ii >= 60:
+                        _ma60v = float(_mkt_pre_c[_ii - 60:_ii].mean())
+                        _mkt_bull_dates[_mkt_pre_d[_ii]] = bool(_ma > _ma60v)
+            elif market_df is not None and "ts" in market_df.columns:
+                _mdf = market_df.sort_values("ts")
+                _mdf_c = _mdf["Close"].values.astype(float)
+                _mdf_d = _mdf["ts"].dt.strftime("%Y-%m-%d").values
+                for _ii in range(1, len(_mdf_d)):
+                    if _mdf_c[_ii - 1] > 0:
+                        _mkt_daily_ret[_mdf_d[_ii]] = float(_mdf_c[_ii] / _mdf_c[_ii - 1] - 1)
+                _ma_period = args.market_ma
+                for _ii in range(max(_ma_period, 60), len(_mdf_d)):
+                    _ma = float(_mdf_c[_ii - _ma_period:_ii].mean())
+                    _mkt_above_ma[_mdf_d[_ii]] = bool(_mdf_c[_ii] > _ma)
+                    _ma60v = float(_mdf_c[_ii - 60:_ii].mean())
+                    _mkt_bull_dates[_mdf_d[_ii]] = bool(_ma > _ma60v)
+        except Exception:
+            pass
+
+    _mkt_above_ma_lag1: dict[str, bool] = {}
+    if _mkt_above_ma:
+        _prev = False
+        for _d in sorted(_mkt_above_ma.keys()):
+            _mkt_above_ma_lag1[_d] = _prev
+            _prev = bool(_mkt_above_ma.get(_d, False))
 
     # ── 資金模擬 ──
     psim = portfolio_simulation(
@@ -2235,7 +2238,7 @@ def main():
         dev_high_mult=args.dev_high_mult,
         pyramid_alloc_pct=args.pyramid_alloc,
         market_daily_ret=_mkt_daily_ret if _mkt_daily_ret else None,
-        market_above_ma=_mkt_above_ma if _mkt_above_ma else None,
+        market_above_ma=_mkt_above_ma_lag1 if _mkt_above_ma_lag1 else None,
         bull_max_positions=args.bull_max_positions,
         market_bull_dates=_mkt_bull_dates if _mkt_bull_dates else None,
         odd_lot_penalty_pct=args.odd_lot_penalty,
@@ -2269,7 +2272,7 @@ def main():
         taken_df, all_kbars, args.capital,
         args.start, args.end,
         market_daily_ret=_mkt_daily_ret if _mkt_daily_ret else None,
-        market_above_ma=_mkt_above_ma if _mkt_above_ma else None,
+        market_above_ma=_mkt_above_ma_lag1 if _mkt_above_ma_lag1 else None,
     )
     _eq_metrics = equity_metrics(_eq_df)
 

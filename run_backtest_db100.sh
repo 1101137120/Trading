@@ -15,11 +15,11 @@
   --max-price           2000 \
   --min-rs              0.05 \
   --rank-mode           hybrid \
-  --rank-w-conf         0.15 \
-  --rank-w-rs           0.25 \
-  --rank-w-dev          0.20 \
-  --rank-w-rs-sweet     0.30 \
-  --rank-w-breadth      0.10 \
+  --rank-w-conf         0.00 \
+  --rank-w-rs           0.30 \
+  --rank-w-dev          0.24 \
+  --rank-w-rs-sweet     0.35 \
+  --rank-w-breadth      0.11 \
   --rank-rs-center      0.05 \
   --rank-rs-span        0.25 \
   --rank-rs-sweet-spot  0.20 \
@@ -29,6 +29,7 @@
   --rank-breadth-sweet-spot 0.60 \
   --rank-breadth-tolerance 0.12 \
   --market-filter \
+  --no-idle-0050 \
   --early-exit-days     0 \
   --market-ma           20 \
   --time-stop-days      20 \
