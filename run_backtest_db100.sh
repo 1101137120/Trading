@@ -11,7 +11,7 @@
   --trail-activation    0.02 \
   --max-positions       5 \
   --position-pct        0.2 \
-  --stocks              80 \
+  --stocks              160 \
   --max-price           2000 \
   --min-rs              0.05 \
   --rank-mode           hybrid \

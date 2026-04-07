@@ -15,6 +15,21 @@ logger = logging.getLogger("institutional_feed")
 
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 _TIMEOUT = 20
+def _get_json(url: str, params: dict) -> dict | None:
+    """
+    單次 GET JSON。
+    - 回傳 None → 假日 / 無資料 (stat != OK) 或 rate limit（空回應）
+    - 回傳 dict → 正常資料
+    """
+    try:
+        resp = requests.get(url, params=params, headers=_HEADERS,
+                            timeout=_TIMEOUT, verify=False)
+        data = resp.json()
+        if data.get("stat", "") != "OK":
+            return None
+        return data
+    except Exception:
+        return None  # rate limit 或網路問題，交由上層處理
 
 
 def _parse_num(s) -> float | None:
@@ -57,19 +72,13 @@ def fetch_institutional_net(date_str: str) -> dict[str, dict]:
     """
     yyyymmdd = date_str.replace("-", "")
     try:
-        resp = requests.get(
-            "https://www.twse.com.tw/rwd/zh/fund/T86",
-            params={"response": "json", "date": yyyymmdd, "selectType": "ALL"},
-            headers=_HEADERS,
-            timeout=_TIMEOUT,
-            verify=False,
-        )
-        data = resp.json()
-        if data.get("stat", "") != "OK":
+        data = _get_json("https://www.twse.com.tw/rwd/zh/fund/T86",
+                         {"response": "json", "date": yyyymmdd, "selectType": "ALL"})
+        if data is None:
             return {}
 
         fields = data.get("fields", [])
-        rows   = data.get("data", [])
+        rows   = data.get("data") or []
 
         # 欄位索引（動態查找 + fallback）
         def _fi(contain: str, exclude: str = "", fallback: int = -1) -> int:
@@ -105,7 +114,7 @@ def fetch_institutional_net(date_str: str) -> dict[str, dict]:
             result[code] = {
                 "date":        date_str,
                 "code":        code,
-                "foreign_net": foreign_ex + fdlr,   # 外陸資含外資自營商
+                "foreign_net": foreign_ex + fdlr,
                 "trust_net":   trust,
                 "dealer_net":  dealer,
                 "total_net":   total,
@@ -115,6 +124,7 @@ def fetch_institutional_net(date_str: str) -> dict[str, dict]:
     except Exception as e:
         logger.warning(f"T86 {date_str} 失敗: {e}")
         return {}
+
 
 
 # ── 融資融券餘額 (MI_MARGN) ─────────────────────────────────────────────────
@@ -129,15 +139,9 @@ def fetch_margin_balance(date_str: str) -> dict[str, dict]:
     """
     yyyymmdd = date_str.replace("-", "")
     try:
-        resp = requests.get(
-            "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",
-            params={"response": "json", "date": yyyymmdd, "selectType": "ALL"},
-            headers=_HEADERS,
-            timeout=_TIMEOUT,
-            verify=False,
-        )
-        data = resp.json()
-        if data.get("stat", "") != "OK":
+        data = _get_json("https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN",
+                         {"response": "json", "date": yyyymmdd, "selectType": "ALL"})
+        if data is None:
             return {}
 
         # MI_MARGN 回傳 tables 陣列；第二張是個股彙總
@@ -190,15 +194,9 @@ def fetch_foreign_holding(date_str: str) -> dict[str, dict]:
     """
     yyyymmdd = date_str.replace("-", "")
     try:
-        resp = requests.get(
-            "https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS",
-            params={"response": "json", "date": yyyymmdd, "selectType": "ALLBUT0999"},
-            headers=_HEADERS,
-            timeout=_TIMEOUT,
-            verify=False,
-        )
-        data = resp.json()
-        if data.get("stat", "") != "OK":
+        data = _get_json("https://www.twse.com.tw/rwd/zh/fund/MI_QFIIS",
+                         {"response": "json", "date": yyyymmdd, "selectType": "ALLBUT0999"})
+        if data is None:
             return {}
 
         fields = data.get("fields", [])

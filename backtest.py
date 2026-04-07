@@ -2843,6 +2843,31 @@ def main():
             )
             csv_df.loc[_real, "signal_rank_metric"] = _rank_col
 
+        # ── 錯失標的（--show-skipped）追加進 CSV ──
+        if args.show_skipped and all_skipped_signals is not None:
+            _taken_keys = {(t["code"], t["entry_date"]) for t in psim["taken_trades"]}
+            _pos_skipped = [
+                {**t, "skip_reason": "倉位已滿", "status": "錯失"}
+                for t in all_trades
+                if (t["code"], t["entry_date"]) not in _taken_keys
+            ]
+            _sig_skipped = [{**m, "status": "錯失"} for m in all_skipped_signals]
+            _all_missed  = _sig_skipped + _pos_skipped
+            if _all_missed:
+                _missed_df = pd.DataFrame(_all_missed)
+                # 確保 skip_reason / signal_date 保留在主表
+                for _extra in ("skip_reason", "signal_date"):
+                    if _extra not in csv_df.columns:
+                        csv_df[_extra] = ""
+                # 對齊欄位（兩邊取聯集）
+                _all_cols = list(csv_df.columns) + [c for c in _missed_df.columns if c not in csv_df.columns]
+                for _col in _all_cols:
+                    if _col not in csv_df.columns:
+                        csv_df[_col] = ""
+                    if _col not in _missed_df.columns:
+                        _missed_df[_col] = ""
+                csv_df = pd.concat([csv_df[_all_cols], _missed_df[_all_cols]], ignore_index=True)
+
         for _k, _v in _run_params.items():
             csv_df[_k] = _v
         csv_df.to_csv(out_path, index=False, encoding="utf-8-sig")
