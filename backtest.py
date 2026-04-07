@@ -2169,8 +2169,7 @@ def main():
     _mkt_daily_ret: dict[str, float] = {}
     _mkt_above_ma: dict[str, bool] = {}   # True = 0050 > MA20，可停泊
     _mkt_bull_dates: dict[str, bool] = {}  # True = 0050 MA20 > MA60（牛市）
-    if not args.no_idle_0050:
-        try:
+    try:
             if use_db:
                 import duckdb as _ddb_pre
                 _con_pre = _ddb_pre.connect("data/stocks.db", read_only=True)
@@ -2182,13 +2181,18 @@ def main():
                 # 原始收盤價（未調整）供停泊交易記錄顯示用
                 _mkt_raw_c = _mkt_pre["close"].values.astype(float)
                 _mkt_raw_lut: dict[str, float] = dict(zip(_mkt_pre_d, _mkt_raw_c))
-                _mkt_pre_c = _mkt_raw_c
+                # adjust_splits 消除除權造成的單日暴跌（如 2009-01-02 -43%）
+                _mkt_adj_df = adjust_splits(
+                    pd.DataFrame({"Close": _mkt_raw_c.copy()}),
+                    threshold=0.10,
+                )
+                _mkt_pre_c = _mkt_adj_df["Close"].values.astype(float)
                 for _ii in range(1, len(_mkt_pre_d)):
                     if _mkt_pre_c[_ii - 1] > 0:
                         _mkt_daily_ret[_mkt_pre_d[_ii]] = float(
                             _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
                         )
-                # MA20 / MA60 訊號（用原始價格）
+                # MA20 / MA60 訊號（用調整後價格）
                 _ma_period = args.market_ma  # 與大盤過濾器一致
                 for _ii in range(len(_mkt_pre_d)):
                     if _ii < _ma_period:
@@ -2200,7 +2204,10 @@ def main():
                         _mkt_bull_dates[_mkt_pre_d[_ii]] = bool(_ma > _ma60v)
             elif market_df is not None and "ts" in market_df.columns:
                 _mdf = market_df.sort_values("ts")
-                _mdf_c = _mdf["Close"].values.astype(float)
+                _mdf_adj = adjust_splits(
+                    _mdf[["Close"]].reset_index(drop=True), threshold=0.10
+                )
+                _mdf_c = _mdf_adj["Close"].values.astype(float)
                 _mdf_d = _mdf["ts"].dt.strftime("%Y-%m-%d").values
                 for _ii in range(1, len(_mdf_d)):
                     if _mdf_c[_ii - 1] > 0:
@@ -2211,7 +2218,7 @@ def main():
                     _mkt_above_ma[_mdf_d[_ii]] = bool(_mdf_c[_ii] > _ma)
                     _ma60v = float(_mdf_c[_ii - 60:_ii].mean())
                     _mkt_bull_dates[_mdf_d[_ii]] = bool(_ma > _ma60v)
-        except Exception:
+    except Exception:
             pass
 
     _mkt_above_ma_lag1: dict[str, bool] = {}

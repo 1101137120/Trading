@@ -29,7 +29,6 @@
   --rank-breadth-sweet-spot 0.60 \
   --rank-breadth-tolerance 0.12 \
   --market-filter \
-  --no-idle-0050 \
   --early-exit-days     0 \
   --market-ma           20 \
   --time-stop-days      20 \
