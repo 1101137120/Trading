@@ -16,10 +16,10 @@
   --min-rs              0.05 \
   --rank-mode           hybrid \
   --rank-w-conf         0.00 \
-  --rank-w-rs           0.30 \
-  --rank-w-dev          0.24 \
-  --rank-w-rs-sweet     0.35 \
-  --rank-w-breadth      0.11 \
+  --rank-w-rs           0.26 \
+  --rank-w-dev          0.20 \
+  --rank-w-rs-sweet     0.29 \
+  --rank-w-breadth      0.10 \
   --rank-rs-center      0.05 \
   --rank-rs-span        0.25 \
   --rank-rs-sweet-spot  0.20 \
@@ -51,3 +51,6 @@
   --pyramid-rs-min      0.05 \
   --pyramid-alloc       0.50 \
   --market-bull-entry  \
+  --chip-filter \
+  --chip-margin-max     4.0 \
+  --rank-w-chip         0.15 \
