@@ -833,11 +833,22 @@ class TradingSystem:
             # 外資/投信取近5日累計
             n = min(5, len(idf))
             tail = idf.tail(n)
+            # 連續買超天數（從最新一天往前數，遇到賣超即停）
+            def _streak(col: str) -> int:
+                days = 0
+                for v in reversed(tail[col].tolist()):
+                    if v > 0:
+                        days += 1
+                    else:
+                        break
+                return days
             return {
                 "foreign_net":        float(tail["foreign_net"].sum()),
                 "trust_net":          float(tail["trust_net"].sum()),
                 "margin_short_ratio": float(last["margin_short_ratio"]) if "margin_short_ratio" in last and last["margin_short_ratio"] else None,
                 "holding_pct":        float(last["holding_pct"])        if "holding_pct"        in last and last["holding_pct"]        else None,
+                "foreign_streak":     _streak("foreign_net"),
+                "trust_streak":       _streak("trust_net"),
             }
 
         evaluated = skipped_pos = skipped_limit = skipped_rs = 0
@@ -885,6 +896,8 @@ class TradingSystem:
                 sig.trust_net          = chip.get("trust_net")
                 sig.margin_short_ratio = chip.get("margin_short_ratio")
                 sig.holding_pct        = chip.get("holding_pct")
+                sig.foreign_streak     = chip.get("foreign_streak", 0)
+                sig.trust_streak       = chip.get("trust_streak", 0)
                 signals.append(sig)
 
         # rank_score 排序（conf 30% + rs 40% + ema_dev 15% + chip 15%）
@@ -892,15 +905,25 @@ class TradingSystem:
             score = 0.5  # 無資料給中性
             if s.foreign_net is None:
                 return score
+            # 外資買賣超量
             if s.foreign_net > 500:    score += 0.30
             elif s.foreign_net > 100:  score += 0.15
             elif s.foreign_net > 0:    score += 0.05
             elif s.foreign_net < -200: score -= 0.30
             elif s.foreign_net < 0:    score -= 0.10
+            # 投信買賣超量
             if s.trust_net is not None:
                 if s.trust_net > 100:  score += 0.20
                 elif s.trust_net > 0:  score += 0.10
                 elif s.trust_net < 0:  score -= 0.05
+            # 連續買超加分（外資）
+            if s.foreign_streak >= 4:  score += 0.20
+            elif s.foreign_streak >= 3: score += 0.12
+            elif s.foreign_streak >= 2: score += 0.05
+            # 連續買超加分（投信，力道更集中給更高加分）
+            if s.trust_streak >= 4:    score += 0.15
+            elif s.trust_streak >= 3:  score += 0.08
+            elif s.trust_streak >= 2:  score += 0.03
             return max(0.0, min(1.0, score))
 
         def _rank(s):
@@ -923,9 +946,15 @@ class TradingSystem:
             ai_note = f"[AI {analysis.sentiment} {analysis.score:+.1f}] {analysis.summary}" if analysis.has_news else "[無近期新聞]"
             _chip_parts = []
             if s.foreign_net is not None:
-                _chip_parts.append(f"外資5日={s.foreign_net:+.0f}張")
+                _fstr = f"外資5日={s.foreign_net:+.0f}張"
+                if s.foreign_streak >= 2:
+                    _fstr += f"(連{s.foreign_streak}日)"
+                _chip_parts.append(_fstr)
             if s.trust_net is not None:
-                _chip_parts.append(f"投信5日={s.trust_net:+.0f}張")
+                _tstr = f"投信5日={s.trust_net:+.0f}張"
+                if s.trust_streak >= 2:
+                    _tstr += f"(連{s.trust_streak}日)"
+                _chip_parts.append(_tstr)
             if s.margin_short_ratio is not None:
                 _chip_parts.append(f"資券比={s.margin_short_ratio:.2f}")
             if s.holding_pct is not None:
@@ -1152,12 +1181,19 @@ class TradingSystem:
             self.portfolio.add_pending(po)
             mode = "[模擬] " if self.dry_run else ""
             lot_note = "零股" if is_odd_lot else "整張"
+            _fs = f"(連{signal.foreign_streak}日)" if signal.foreign_streak >= 2 else ""
+            _ts = f"(連{signal.trust_streak}日)" if signal.trust_streak >= 2 else ""
+            _chip_line = (
+                f"\n💹 外資:{signal.foreign_net:+.0f}張{_fs} | 投信:{signal.trust_net:+.0f}張{_ts}"
+                if (signal.foreign_net is not None and signal.trust_net is not None) else ""
+            )
             self.notifier.notify(
                 f"📈 <b>{mode}開倉委託</b> {code} {self._code_to_name.get(code,'')}\n"
                 "━━━━━━━━━━━━━━━\n"
                 f"💰 價格: {price:.2f} | 數量: {qty}{unit}({lot_note})\n"
                 f"🛑 停損: {stop_loss:.2f} ({self.config['risk'].get('stop_loss_pct',0.08):.0%}) | 移停啟動: +{self.config['risk'].get('trailing_stop',{}).get('activation_pct',0.02):.0%}\n"
-                f"📊 RS={signal.rs_score:+.3f} | EMA乖離={signal.ema_dev:.2%} | 信心={signal.confidence:.2f}\n"
+                f"📊 RS={signal.rs_score:+.3f} | EMA乖離={signal.ema_dev:.2%} | 信心={signal.confidence:.2f}"
+                f"{_chip_line}\n"
                 f"🏛 {signal.reason}",
                 parse_mode="HTML"
             )
