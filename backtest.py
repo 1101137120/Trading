@@ -375,6 +375,9 @@ def simulate_trades(
     tax_stock_rate: float = 0.003,
     tax_etf_rate: float = 0.001,
     stock_dividends: "dict | None" = None,   # {ex_date: cash_div_per_share (NT/股)}
+    chip_df: "pd.DataFrame | None" = None,  # 該股的法人/融資日頻資料（bulk_load_institutional 結果）
+    chip_filter: bool = False,               # True=啟用法人雙賣/資券比過高過濾
+    chip_margin_max: float = 4.0,           # 資券比上限（0=停用）
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -397,6 +400,52 @@ def simulate_trades(
     cooldown_until: date = None  # 個股冷卻到期日
     _tx_rate = tax_etf_rate if is_etf_code(code) else tax_stock_rate  # 賣出稅率
     _divs: dict = stock_dividends or {}                                # {date: NT/股}
+
+    # ── 籌碼：預建 date -> row 查詢表 ──
+    _chip_by_date: dict = {}
+    if chip_df is not None and not chip_df.empty:
+        _cdf = chip_df.copy()
+        if "date" in _cdf.columns:
+            for _, _row in _cdf.iterrows():
+                _d = _row["date"]
+                if hasattr(_d, "date"):
+                    _d = _d.date()
+                _chip_by_date[_d] = _row.to_dict()
+
+    def _get_chip_on_date(d) -> dict:
+        """取 d 當日或之前最近一筆籌碼資料（最多往前找 7 日）"""
+        if not _chip_by_date:
+            return {}
+        available = [k for k in _chip_by_date if k <= d]
+        if not available:
+            return {}
+        last_d = max(available)
+        if (d - last_d).days > 7:
+            return {}
+        row = _chip_by_date[last_d]
+        # 連續買超天數：取最近5個有資料的日期
+        sorted_dates = sorted(k for k in _chip_by_date if k <= d)
+        tail_dates = sorted_dates[-5:]
+        f_streak = 0
+        for _td in reversed(tail_dates):
+            if (_chip_by_date[_td].get("foreign_net") or 0) > 0:
+                f_streak += 1
+            else:
+                break
+        t_streak = 0
+        for _td in reversed(tail_dates):
+            if (_chip_by_date[_td].get("trust_net") or 0) > 0:
+                t_streak += 1
+            else:
+                break
+        return {
+            "foreign_net":        row.get("foreign_net"),
+            "trust_net":          row.get("trust_net"),
+            "margin_short_ratio": row.get("margin_short_ratio"),
+            "holding_pct":        row.get("holding_pct"),
+            "foreign_streak":     f_streak,
+            "trust_streak":       t_streak,
+        }
 
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
@@ -657,6 +706,13 @@ def simulate_trades(
                     "rs_score": position.get("rs_score", 0.0),
                     "ema_dev": position.get("ema_dev", 0.0),
                     "day_volume": position.get("day_volume", 0),
+                    "foreign_net":        position.get("foreign_net"),
+                    "trust_net":          position.get("trust_net"),
+                    "foreign_streak":     position.get("foreign_streak", 0),
+                    "trust_streak":       position.get("trust_streak", 0),
+                    "margin_short_ratio": position.get("margin_short_ratio"),
+                    "holding_pct":        position.get("holding_pct"),
+                    "chip_score":         position.get("chip_score"),
                 })
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
@@ -900,6 +956,26 @@ def simulate_trades(
                                         "strategy": sig.strategy, **_fwd})
                 continue
 
+            # 籌碼過濾：法人雙賣 / 資券比過高
+            _chip = _get_chip_on_date(row_date)
+            if chip_filter:
+                _f_net = _chip.get("foreign_net")
+                _t_net = _chip.get("trust_net")
+                _mr    = _chip.get("margin_short_ratio")
+                _skip_chip_reason = None
+                if _f_net is not None and _t_net is not None and _f_net < 0 and _t_net < 0:
+                    _skip_chip_reason = f"法人雙賣(外資{_f_net:+.0f} 投信{_t_net:+.0f})"
+                elif _mr is not None and chip_margin_max > 0 and _mr > chip_margin_max:
+                    _skip_chip_reason = f"資券比過高({_mr:.1f}>{chip_margin_max})"
+                if _skip_chip_reason:
+                    if skipped_out is not None:
+                        _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
+                        skipped_out.append({"code": code, "signal_date": row_date,
+                                            "skip_reason": _skip_chip_reason,
+                                            "entry_price": round(entry_price, 2),
+                                            "strategy": sig.strategy, **_fwd})
+                    continue
+
             # 記錄進場當天大盤收盤（用於動態時間停損的相對表現比較）
             _mpos = bisect.bisect_right(_mkt_dates, next_date) - 1
             mkt_close_at_entry = _mkt_closes[_mpos] if (_mkt_closes and _mpos >= 0) else None
@@ -943,6 +1019,13 @@ def simulate_trades(
                 "accumulated_div": 0.0,       # 持倉期間累計配息（NT/股）
                 "market_breadth_at_entry": round(_mkt_breadth_entry, 4) if _mkt_breadth_entry == _mkt_breadth_entry else "",
                 "market_rs_at_entry": _mkt_rs_entry if _mkt_rs_entry == _mkt_rs_entry else "",
+                "foreign_net":        _chip.get("foreign_net"),
+                "trust_net":          _chip.get("trust_net"),
+                "foreign_streak":     _chip.get("foreign_streak", 0),
+                "trust_streak":       _chip.get("trust_streak", 0),
+                "margin_short_ratio": _chip.get("margin_short_ratio"),
+                "holding_pct":        _chip.get("holding_pct"),
+                "chip_score":         _calc_chip_score(_chip),
             }
 
     return trades
@@ -1001,6 +1084,31 @@ def _sweet_spot_score(v: float, sweet_spot: float, tolerance: float, default: fl
     return _clamp01(1.0 - distance / tolerance)
 
 
+def _calc_chip_score(chip: dict) -> float:
+    """計算籌碼綜合分數（0-1），無資料給 0.5 中性"""
+    foreign_net = chip.get("foreign_net")
+    if foreign_net is None:
+        return 0.5
+    score = 0.5
+    if foreign_net > 500:    score += 0.30
+    elif foreign_net > 100:  score += 0.15
+    elif foreign_net > 0:    score += 0.05
+    elif foreign_net < -200: score -= 0.30
+    elif foreign_net < 0:    score -= 0.10
+    trust_net = chip.get("trust_net")
+    if trust_net is not None:
+        if trust_net > 100:  score += 0.20
+        elif trust_net > 0:  score += 0.10
+        elif trust_net < 0:  score -= 0.05
+    if chip.get("foreign_streak", 0) >= 4:  score += 0.20
+    elif chip.get("foreign_streak", 0) >= 3: score += 0.12
+    elif chip.get("foreign_streak", 0) >= 2: score += 0.05
+    if chip.get("trust_streak", 0) >= 4:    score += 0.15
+    elif chip.get("trust_streak", 0) >= 3:  score += 0.08
+    elif chip.get("trust_streak", 0) >= 2:  score += 0.03
+    return max(0.0, min(1.0, score))
+
+
 def _trade_rank_score(
     trade: dict,
     rank_mode: str = "confidence",
@@ -1009,6 +1117,7 @@ def _trade_rank_score(
     rank_w_dev: float = 0.20,
     rank_w_rs_sweet: float = 0.0,
     rank_w_breadth: float = 0.0,
+    rank_w_chip: float = 0.0,
     rank_rs_center: float = 0.05,
     rank_rs_span: float = 0.25,
     rank_rs_sweet_spot: float = 0.20,
@@ -1034,6 +1143,7 @@ def _trade_rank_score(
     breadth_score = _sweet_spot_score(
         breadth_raw, sweet_spot=rank_breadth_sweet_spot, tolerance=rank_breadth_tolerance, default=0.5
     )
+    chip_score_val = _safe_float(trade.get("chip_score", 0.5))
 
     mode = (rank_mode or "confidence").lower()
     if mode == "confidence":
@@ -1046,7 +1156,8 @@ def _trade_rank_score(
     w_dev = max(0.0, rank_w_dev)
     w_rs_sweet = max(0.0, rank_w_rs_sweet)
     w_breadth = max(0.0, rank_w_breadth)
-    total_w = w_conf + w_rs + w_dev + w_rs_sweet + w_breadth
+    w_chip = max(0.0, rank_w_chip)
+    total_w = w_conf + w_rs + w_dev + w_rs_sweet + w_breadth + w_chip
     if total_w <= 0:
         return conf
     return (
@@ -1055,6 +1166,7 @@ def _trade_rank_score(
         + w_dev * dev_score
         + w_rs_sweet * rs_sweet_score
         + w_breadth * breadth_score
+        + w_chip * chip_score_val
     ) / total_w
 
 
@@ -1084,6 +1196,7 @@ def portfolio_simulation(
     rank_w_dev: float = 0.20,
     rank_w_rs_sweet: float = 0.0,
     rank_w_breadth: float = 0.0,
+    rank_w_chip: float = 0.0,
     rank_rs_center: float = 0.05,
     rank_rs_span: float = 0.25,
     rank_rs_sweet_spot: float = 0.20,
@@ -1115,6 +1228,7 @@ def portfolio_simulation(
                                               rank_w_dev=rank_w_dev,
                                               rank_w_rs_sweet=rank_w_rs_sweet,
                                               rank_w_breadth=rank_w_breadth,
+                                              rank_w_chip=rank_w_chip,
                                               rank_rs_center=rank_rs_center,
                                               rank_rs_span=rank_rs_span,
                                               rank_rs_sweet_spot=rank_rs_sweet_spot,
@@ -1701,6 +1815,12 @@ def main():
                         help="hybrid 排序：RS 甜蜜區權重（預設 0=停用）")
     parser.add_argument("--rank-w-breadth", type=float, default=0.0,
                         help="hybrid 排序：市場廣度甜蜜區權重（預設 0=停用）")
+    parser.add_argument("--chip-filter", action="store_true", default=False,
+                        help="啟用籌碼過濾：法人雙賣或資券比過高時跳過進場")
+    parser.add_argument("--chip-margin-max", type=float, default=4.0,
+                        help="資券比上限，超過視為融資泡沫（0=停用，預設 4.0）")
+    parser.add_argument("--rank-w-chip", type=float, default=0.0,
+                        help="rank_score 籌碼因子權重（預設 0=停用）")
     parser.add_argument("--rank-rs-center", type=float, default=0.05,
                         help="hybrid/rs 排序：RS 正規化起點（預設 0.05）")
     parser.add_argument("--rank-rs-span", type=float, default=0.25,
@@ -2086,6 +2206,17 @@ def main():
                 "[dim]配息調整：DB 無配息資料，執行 --fetch-dividends 可預建[/dim]"
             )
 
+    # ── 籌碼資料批次載入（法人/融資/外資，供籌碼過濾與 rank 使用）──
+    _all_chip_data: dict = {}
+    if (args.chip_filter or args.rank_w_chip > 0) and use_db:
+        from shared.db import bulk_load_institutional as _bulk_inst
+        _inst_start = start.strftime("%Y-%m-%d")
+        _inst_end   = end.strftime("%Y-%m-%d")
+        _inst_codes = list(all_kbars.keys())
+        console.print(f"[dim]籌碼資料：載入 {len(_inst_codes)} 檔 {_inst_start}~{_inst_end}...[/dim]")
+        _all_chip_data = _bulk_inst(_inst_codes, _inst_start, _inst_end)
+        console.print(f"[dim]籌碼資料：{len(_all_chip_data)} 檔有資料[/dim]")
+
     # ── 第二輪：逐檔回測 ──
     all_trades: list[dict] = []
     all_skipped_signals: list[dict] = [] if args.show_skipped else None
@@ -2141,6 +2272,9 @@ def main():
                 pyramid_use_ema=args.pyramid_ema,
                 market_bull_entry=args.market_bull_entry,
                 skipped_out=all_skipped_signals,
+                chip_df=_all_chip_data.get(code) if _all_chip_data else None,
+                chip_filter=args.chip_filter,
+                chip_margin_max=args.chip_margin_max,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -2255,6 +2389,7 @@ def main():
         rank_w_dev=args.rank_w_dev,
         rank_w_rs_sweet=args.rank_w_rs_sweet,
         rank_w_breadth=args.rank_w_breadth,
+        rank_w_chip=args.rank_w_chip,
         rank_rs_center=args.rank_rs_center,
         rank_rs_span=args.rank_rs_span,
         rank_rs_sweet_spot=args.rank_rs_sweet_spot,
@@ -2766,6 +2901,9 @@ def main():
         "pyramid_gain2":        args.pyramid_gain2,
         "pyramid_rs_min":       args.pyramid_rs_min,
         "pyramid_alloc":        args.pyramid_alloc,
+        "rank_w_chip":          args.rank_w_chip,
+        "chip_filter":          args.chip_filter,
+        "chip_margin_max":      args.chip_margin_max,
     }
 
     # ── 自動時間戳路徑（--output-csv 預設值時才自動命名）──
