@@ -1192,6 +1192,9 @@ def portfolio_simulation(
     market_above_ma: dict | None = None,     # {date_str: bool}，True = 0050>MA20，可停泊
     bull_max_positions: int = 0,             # 牛市（MA20>MA60）時允許更多持倉（0=停用）
     market_bull_dates: dict | None = None,   # {date_str: bool}，True = MA20>MA60
+    market_dd_threshold: float = 0.0,        # 0050 回撤超過此值時縮倉（0=停用）
+    market_dd_max_positions: int = 2,        # 大盤深度回撤時最大持倉數
+    market_dd_by_date: dict | None = None,   # {date_str: drawdown_pct}，預算的 0050 rolling DD
     odd_lot_penalty_pct: float = 0.003,      # 零股額外執行成本（買賣各 0.3%）
     rank_mode: str = "confidence",
     rank_w_conf: float = 0.35,
@@ -1344,6 +1347,11 @@ def portfolio_simulation(
             _eff_max   = (bull_max_positions
                           if (bull_max_positions > 0 and _is_bull)
                           else max_positions)
+            # 大盤深度回撤縮倉：0050 從高點跌逾 threshold 時，持倉上限收緊
+            if (market_dd_threshold > 0 and market_dd_by_date is not None):
+                _mkt_dd = market_dd_by_date.get(_entry_ds, 0.0)
+                if _mkt_dd >= market_dd_threshold:
+                    _eff_max = min(_eff_max, market_dd_max_positions)
             if len(active) >= _eff_max:
                 continue
 
@@ -1738,6 +1746,10 @@ def main():
                         help="停用大盤過濾")
     parser.add_argument("--market-bull-entry", action="store_true", default=False,
                         help="只在 0050 MA20 > MA60（持續上行趨勢）時才開倉，比 --market-filter 更嚴格")
+    parser.add_argument("--market-dd-threshold", type=float, default=0.0,
+                        help="0050 從歷史高點回撤超過此比例時縮倉（0=停用，建議 0.15）")
+    parser.add_argument("--market-dd-max-positions", type=int, default=2,
+                        help="大盤深度回撤時允許的最大持倉數（預設 2）")
     parser.add_argument("--no-idle-0050", action="store_true", default=False,
                         help="關閉閒置資金停泊 0050（閒置資金維持現金）")
     parser.add_argument("--tse-only", action="store_true", default=False,
@@ -2096,6 +2108,24 @@ def main():
 
     loss_cooldown = args.loss_cooldown
 
+    # ── 0050 Rolling Drawdown（大盤回撤縮倉用）──
+    _market_dd_by_date: dict | None = None
+    if args.market_dd_threshold > 0 and market_df is not None:
+        _mdd_peak = 0.0
+        _mdd_tmp: dict = {}
+        for _, _mrow in market_df.sort_values("ts").iterrows():
+            _c = float(_mrow["Close"])
+            if _c > _mdd_peak:
+                _mdd_peak = _c
+            _dd = (_mdd_peak - _c) / _mdd_peak if _mdd_peak > 0 else 0.0
+            _mdd_tmp[str(_mrow["ts"])[:10]] = round(_dd, 4)
+        _market_dd_by_date = _mdd_tmp
+        _dd_days = sum(1 for v in _mdd_tmp.values() if v >= args.market_dd_threshold)
+        console.print(
+            f"[dim]大盤回撤縮倉：門檻 {args.market_dd_threshold:.0%}，"
+            f"影響 {_dd_days} 個交易日（縮至 {args.market_dd_max_positions} 檔）[/dim]"
+        )
+
     # ── 第一輪：載入所有 K 棒（DB 優先，缺的才打 API）──
     all_kbars: dict[str, pd.DataFrame] = {}
     stock_meta: dict[str, str] = {}
@@ -2385,6 +2415,9 @@ def main():
         market_above_ma=_mkt_above_ma_lag1 if _mkt_above_ma_lag1 else None,
         bull_max_positions=args.bull_max_positions,
         market_bull_dates=_mkt_bull_dates if _mkt_bull_dates else None,
+        market_dd_threshold=args.market_dd_threshold,
+        market_dd_max_positions=args.market_dd_max_positions,
+        market_dd_by_date=_market_dd_by_date,
         odd_lot_penalty_pct=args.odd_lot_penalty,
         rank_mode=args.rank_mode,
         rank_w_conf=args.rank_w_conf,
@@ -2907,6 +2940,8 @@ def main():
         "rank_w_chip":          args.rank_w_chip,
         "chip_filter":          args.chip_filter,
         "chip_margin_max":      args.chip_margin_max,
+        "market_dd_threshold":  args.market_dd_threshold,
+        "market_dd_max_pos":    args.market_dd_max_positions,
     }
 
     # ── 自動時間戳路徑（--output-csv 預設值時才自動命名）──

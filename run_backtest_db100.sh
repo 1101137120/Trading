@@ -11,7 +11,7 @@
   --trail-activation    0.02 \
   --max-positions       5 \
   --position-pct        0.2 \
-  --stocks              160 \
+  --stocks              80 \
   --max-price           2000 \
   --min-rs              0.05 \
   --rank-mode           hybrid \
@@ -51,6 +51,8 @@
   --pyramid-rs-min      0.05 \
   --pyramid-alloc       0.50 \
   --market-bull-entry  \
+  --market-dd-threshold    0.15 \
+  --market-dd-max-positions 2 \
   --chip-filter \
   --chip-margin-max     4.0 \
   --rank-w-chip         0.15 \
