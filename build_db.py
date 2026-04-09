@@ -279,7 +279,7 @@ def _fetch_institutional(update_only: bool):
     ) as progress:
         task = progress.add_task("法人/融資/外資", total=len(dates))
 
-        for d_str in dates:
+        for idx, d_str in enumerate(dates):
             progress.update(task, advance=1, description=f"[dim]{d_str}[/dim]")
 
             inst   = fetch_institutional_net(d_str)
@@ -288,7 +288,7 @@ def _fetch_institutional(update_only: bool):
 
             if not inst and not margin and not fhold:
                 skip += 1
-                time.sleep(0.2)
+                time.sleep(0.5)
                 continue
 
             with get_conn() as conn:
@@ -300,7 +300,12 @@ def _fetch_institutional(update_only: bool):
                     upsert_foreign_holding(list(fhold.values()), conn)
                 conn.commit()
             ok += 1
-            time.sleep(SLEEP_BETWEEN)
+            # 每 20 天暫停 30 秒，避免 TWSE IP 封鎖
+            if (idx + 1) % 20 == 0:
+                progress.update(task, description="[yellow]防封鎖暫停 30s...[/yellow]")
+                time.sleep(30)
+            else:
+                time.sleep(1.5)
 
     console.print(f"  完成：[green]{ok}[/green] 日有資料，{skip} 日無資料（假日/休市）")
 
@@ -461,10 +466,16 @@ def main():
                         help="顯示 DB 統計後離開")
     parser.add_argument("--no-delisted",      action="store_true",
                         help="跳過已下市股票（速度快 3–5 倍，但存活者偏差未修正）")
+    parser.add_argument("--inst-only",        action="store_true",
+                        help="只更新三大法人/融資融券/外資持股，不下載 K 棒（cron 日更用）")
     args = parser.parse_args()
 
     if args.stats:
         cmd_stats()
+        return
+
+    if args.inst_only:
+        _fetch_institutional(update_only=True)
         return
 
     cmd_build(

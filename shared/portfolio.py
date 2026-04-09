@@ -300,7 +300,12 @@ class Portfolio:
             logger.error(f"賣出失敗: {code}（第 {retries} 次），下週期重試")
         return escalated
 
-    def can_open_position(self, order_value: float, max_positions_override: int = 0) -> bool:
+    def can_open_position(
+        self,
+        order_value: float,
+        max_positions_override: int = 0,
+        max_pct_override: float = 0.0,
+    ) -> bool:
         # 每日熔斷
         if self.circuit_broken:
             logger.info("每日熔斷已觸發，不開新倉")
@@ -310,7 +315,7 @@ class Portfolio:
             logger.info(f"連續虧損冷靜期，暫停至 {self.cooldown_until.strftime('%H:%M')}")
             return False
         max_pos  = max_positions_override if max_positions_override > 0 else self.risk_cfg["max_positions"]
-        max_pct  = self.risk_cfg["max_position_pct"]
+        max_pct  = max_pct_override if max_pct_override > 0 else self.risk_cfg["max_position_pct"]
         occupied = len(self.positions) + len(self.pending_orders)
         if occupied >= max_pos:
             return False
