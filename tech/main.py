@@ -887,13 +887,29 @@ class TradingSystem:
                 sig.holding_pct        = chip.get("holding_pct")
                 signals.append(sig)
 
-        # rank_score 排序（conf 35% + rs 45% + ema_dev sweet-spot 20%）
+        # rank_score 排序（conf 30% + rs 40% + ema_dev 15% + chip 15%）
+        def _chip_score(s) -> float:
+            score = 0.5  # 無資料給中性
+            if s.foreign_net is None:
+                return score
+            if s.foreign_net > 500:    score += 0.30
+            elif s.foreign_net > 100:  score += 0.15
+            elif s.foreign_net > 0:    score += 0.05
+            elif s.foreign_net < -200: score -= 0.30
+            elif s.foreign_net < 0:    score -= 0.10
+            if s.trust_net is not None:
+                if s.trust_net > 100:  score += 0.20
+                elif s.trust_net > 0:  score += 0.10
+                elif s.trust_net < 0:  score -= 0.05
+            return max(0.0, min(1.0, score))
+
         def _rank(s):
             conf  = max(0.0, min(1.0, s.confidence))
             rs_n  = max(0.0, min(1.0, (s.rs_score - 0.05) / 0.25))          # center=5%, span=25%
             dev_d = abs(s.ema_dev - 0.05)
             dev_n = max(0.0, 1.0 - dev_d / 0.03) if dev_d < 0.03 else 0.0  # sweet-spot 5%±3%
-            return 0.35 * conf + 0.45 * rs_n + 0.20 * dev_n
+            chip  = _chip_score(s)
+            return 0.30 * conf + 0.40 * rs_n + 0.15 * dev_n + 0.15 * chip
         signals.sort(key=_rank, reverse=True)
         self.logger.info(
             f"評估 {evaluated} 檔 | 已持倉跳過 {skipped_pos} | "
@@ -998,6 +1014,40 @@ class TradingSystem:
                 snap = self.feed.get_snapshot(code)
                 df_gap = self.feed.get_kbars(code, lookback_days=25)
                 if snap and self._is_gap_up_blocked(code, snap, df_gap):
+                    continue
+
+            # 籌碼過濾：法人雙賣 / 資券比過高
+            _chip_cfg = self.config.get("chip_filter", {})
+            if _chip_cfg.get("enabled", True):
+                _margin_max = _chip_cfg.get("margin_short_ratio_max", 4.0)
+                _skip_chip  = False
+                _chip_skip_reason = ""
+                # 資券比過高 → 融資泡沫風險
+                if (signal.margin_short_ratio is not None
+                        and _margin_max > 0
+                        and signal.margin_short_ratio > _margin_max):
+                    _skip_chip = True
+                    _chip_skip_reason = f"資券比 {signal.margin_short_ratio:.1f} > {_margin_max}"
+                # 法人雙賣 → 機構出貨，不跟
+                elif (signal.foreign_net is not None and signal.trust_net is not None
+                        and signal.foreign_net < 0 and signal.trust_net < 0):
+                    _skip_chip = True
+                    _chip_skip_reason = (
+                        f"法人雙賣（外資{signal.foreign_net:+.0f}張 投信{signal.trust_net:+.0f}張）"
+                    )
+                if _skip_chip:
+                    name = self._code_to_name.get(code, "")
+                    self.logger.info(
+                        f"[籌碼過濾] {code} {name} 跳過：{_chip_skip_reason}"
+                        f" | RS={signal.rs_score:+.3f} 信心={signal.confidence:.2f}"
+                    )
+                    self.notifier.notify(
+                        f"🚫 <b>籌碼過濾</b> {code} {name}\n"
+                        "━━━━━━━━━━━━━━━\n"
+                        f"⚠ {_chip_skip_reason}\n"
+                        f"📊 RS={signal.rs_score:+.3f} | 信心={signal.confidence:.2f}",
+                        parse_mode="HTML"
+                    )
                     continue
 
             # EMA 乖離動態倉位：乖離率低縮倉、高放大
