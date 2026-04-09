@@ -408,7 +408,10 @@ def simulate_trades(
         if "date" in _cdf.columns:
             for _, _row in _cdf.iterrows():
                 _d = _row["date"]
-                if hasattr(_d, "date"):
+                if isinstance(_d, str):
+                    from datetime import date as _date_cls
+                    _d = _date_cls.fromisoformat(_d)
+                elif hasattr(_d, "date"):
                     _d = _d.date()
                 _chip_by_date[_d] = _row.to_dict()
 
