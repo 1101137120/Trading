@@ -5,6 +5,9 @@ Schema：
   stocks              — 股票主檔（含已下市）
   daily_prices        — 日 K 棒 OHLCV，單位：價格元、成交量張
   universe_snapshots  — 每日宇宙快照（5 日均量排名），解決存活者偏差
+  institutional_net   — 三大法人日買賣超（張）
+  margin_balance      — 融資融券日餘額（張）
+  foreign_holding     — 外資持股比率（小數）
   db_meta             — 版本 / 最後更新時間等 key-value
 
 使用方式：
@@ -81,6 +84,51 @@ def init_schema(conn: duckdb.DuckDBPyConnection):
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_univ_date ON universe_snapshots(date)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS institutional_net (
+            date        VARCHAR NOT NULL,
+            code        VARCHAR NOT NULL,
+            foreign_net DOUBLE,
+            trust_net   DOUBLE,
+            dealer_net  DOUBLE,
+            total_net   DOUBLE,
+            PRIMARY KEY (date, code)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inst_date ON institutional_net(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inst_code ON institutional_net(code)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS margin_balance (
+            date               VARCHAR NOT NULL,
+            code               VARCHAR NOT NULL,
+            margin_buy         DOUBLE,
+            margin_sell        DOUBLE,
+            margin_balance     DOUBLE,
+            margin_limit       DOUBLE,
+            short_sell         DOUBLE,
+            short_buy          DOUBLE,
+            short_balance      DOUBLE,
+            short_limit        DOUBLE,
+            margin_short_ratio DOUBLE,
+            PRIMARY KEY (date, code)
+        )
+    """)
+    conn.execute("ALTER TABLE margin_balance ADD COLUMN IF NOT EXISTS margin_short_ratio DOUBLE")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_margin_date ON margin_balance(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_margin_code ON margin_balance(code)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS foreign_holding (
+            date           VARCHAR NOT NULL,
+            code           VARCHAR NOT NULL,
+            foreign_shares DOUBLE,
+            holding_pct    DOUBLE,
+            retail_pct     DOUBLE,
+            PRIMARY KEY (date, code)
+        )
+    """)
+    conn.execute("ALTER TABLE foreign_holding ADD COLUMN IF NOT EXISTS retail_pct DOUBLE")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fhold_date ON foreign_holding(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_fhold_code ON foreign_holding(code)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS db_meta (
             key   VARCHAR PRIMARY KEY,
@@ -284,6 +332,154 @@ def upsert_kbars(code: str, df: pd.DataFrame, conn: duckdb.DuckDBPyConnection):
             close=excluded.close, volume=excluded.volume
     """)
     conn.unregister("_upsert_rows")
+
+
+# ──────────────────────────────────────────────
+# 三大法人 / 融資融券 / 外資持股 — 寫入
+# ──────────────────────────────────────────────
+
+def upsert_institutional_net(rows: list[dict], conn: duckdb.DuckDBPyConnection):
+    """批次寫入三大法人買賣超。rows 每筆需有 date/code/foreign_net/trust_net/dealer_net/total_net"""
+    if not rows:
+        return
+    df = pd.DataFrame(rows)[["date", "code", "foreign_net", "trust_net", "dealer_net", "total_net"]]
+    conn.register("_inst_rows", df)
+    conn.execute("""
+        INSERT INTO institutional_net(date, code, foreign_net, trust_net, dealer_net, total_net)
+        SELECT date, code, foreign_net, trust_net, dealer_net, total_net FROM _inst_rows
+        ON CONFLICT (date, code) DO UPDATE SET
+            foreign_net=excluded.foreign_net, trust_net=excluded.trust_net,
+            dealer_net=excluded.dealer_net,   total_net=excluded.total_net
+    """)
+    conn.unregister("_inst_rows")
+
+
+def upsert_margin_balance(rows: list[dict], conn: duckdb.DuckDBPyConnection):
+    """批次寫入融資融券餘額（含資券比計算）。"""
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    # 資券比：融資餘額 ÷ 融券餘額（融券為 0 時設 None）
+    df["margin_short_ratio"] = df.apply(
+        lambda r: round(r["margin_balance"] / r["short_balance"], 2)
+        if r.get("short_balance") and r["short_balance"] > 0 else None,
+        axis=1,
+    )
+    cols = ["date", "code", "margin_buy", "margin_sell", "margin_balance",
+            "margin_limit", "short_sell", "short_buy", "short_balance",
+            "short_limit", "margin_short_ratio"]
+    df = df[cols]
+    conn.register("_margin_rows", df)
+    conn.execute(f"""
+        INSERT INTO margin_balance({','.join(cols)})
+        SELECT {','.join(cols)} FROM _margin_rows
+        ON CONFLICT (date, code) DO UPDATE SET
+            margin_buy=excluded.margin_buy, margin_sell=excluded.margin_sell,
+            margin_balance=excluded.margin_balance, margin_limit=excluded.margin_limit,
+            short_sell=excluded.short_sell, short_buy=excluded.short_buy,
+            short_balance=excluded.short_balance, short_limit=excluded.short_limit,
+            margin_short_ratio=excluded.margin_short_ratio
+    """)
+    conn.unregister("_margin_rows")
+
+
+def upsert_foreign_holding(rows: list[dict], conn: duckdb.DuckDBPyConnection):
+    """批次寫入外資持股比率（含散戶比例粗估）。"""
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    # 散戶比例粗估：1 - 外資持股%（不含投信/自營商，誤差約 5–10%）
+    df["retail_pct"] = (1.0 - df["holding_pct"]).round(4)
+    df = df[["date", "code", "foreign_shares", "holding_pct", "retail_pct"]]
+    conn.register("_fhold_rows", df)
+    conn.execute("""
+        INSERT INTO foreign_holding(date, code, foreign_shares, holding_pct, retail_pct)
+        SELECT date, code, foreign_shares, holding_pct, retail_pct FROM _fhold_rows
+        ON CONFLICT (date, code) DO UPDATE SET
+            foreign_shares=excluded.foreign_shares,
+            holding_pct=excluded.holding_pct,
+            retail_pct=excluded.retail_pct
+    """)
+    conn.unregister("_fhold_rows")
+
+
+def get_latest_inst_date(conn: duckdb.DuckDBPyConnection) -> Optional[str]:
+    """institutional_net 表中最新的日期，無資料回傳 None"""
+    row = conn.execute(
+        "SELECT MAX(date) FROM institutional_net"
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+# ──────────────────────────────────────────────
+# 三大法人 / 融資融券 / 外資持股 — 讀取
+# ──────────────────────────────────────────────
+
+def bulk_load_institutional(
+    codes: list[str],
+    start: str,
+    end: str,
+    db_path: Path = DB_PATH,
+) -> dict[str, pd.DataFrame]:
+    """
+    一次性讀取多支股票的法人/融資/外資資料，回傳 {code: DataFrame}。
+    欄位：date, foreign_net, trust_net, dealer_net, total_net,
+          margin_balance, margin_limit, short_balance, margin_short_ratio,
+          holding_pct, retail_pct
+    無資料時回傳 {}。
+    """
+    if not db_path.exists() or not codes:
+        return {}
+    placeholders = ", ".join("?" * len(codes))
+    with get_conn(db_path, read_only=True) as conn:
+        df = conn.execute(f"""
+            SELECT i.code, i.date,
+                   i.foreign_net, i.trust_net, i.dealer_net, i.total_net,
+                   m.margin_balance, m.margin_limit, m.short_balance,
+                   m.margin_short_ratio,
+                   f.holding_pct, f.retail_pct
+            FROM institutional_net i
+            LEFT JOIN margin_balance  m ON i.date=m.date AND i.code=m.code
+            LEFT JOIN foreign_holding f ON i.date=f.date AND i.code=f.code
+            WHERE i.code IN ({placeholders}) AND i.date>=? AND i.date<=?
+            ORDER BY i.code, i.date
+        """, codes + [start, end]).df()
+    if df.empty:
+        return {}
+    result: dict[str, pd.DataFrame] = {}
+    for code, grp in df.groupby("code", sort=False):
+        result[str(code)] = grp.drop(columns="code").reset_index(drop=True)
+    return result
+
+
+def load_institutional(
+    code: str,
+    start: str,
+    end: str,
+    db_path: Path = DB_PATH,
+) -> pd.DataFrame:
+    """
+    回傳某股三大法人 + 融資融券 + 外資持股的日頻 DataFrame。
+    欄位：date, foreign_net, trust_net, dealer_net, total_net,
+          margin_balance, margin_limit, short_balance, holding_pct
+    無資料時回傳空 DataFrame。
+    """
+    if not db_path.exists():
+        return pd.DataFrame()
+    with get_conn(db_path, read_only=True) as conn:
+        df = conn.execute("""
+            SELECT i.date,
+                   i.foreign_net, i.trust_net, i.dealer_net, i.total_net,
+                   m.margin_balance, m.margin_limit, m.short_balance,
+                   m.margin_short_ratio,
+                   f.holding_pct, f.retail_pct
+            FROM institutional_net i
+            LEFT JOIN margin_balance  m ON i.date=m.date AND i.code=m.code
+            LEFT JOIN foreign_holding f ON i.date=f.date AND i.code=f.code
+            WHERE i.code=? AND i.date>=? AND i.date<=?
+            ORDER BY i.date
+        """, [code, start, end]).df()
+    return df
 
 
 def set_meta(key: str, value: str, conn: duckdb.DuckDBPyConnection):

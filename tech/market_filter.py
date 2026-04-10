@@ -16,12 +16,12 @@ class MarketFilter:
         self.ma_period = cfg.get("ma_period", 20)
         self.feed = feed
 
-    def check_breadth(self, candidates: list[dict], feed, min_ratio: float = 0.0) -> bool:
+    def check_breadth(self, candidates: list[dict], feed, min_ratio: float = 0.0, max_ratio: float = 0.0) -> bool:
         """
-        市場廣度過濾：候選股中站上 EMA20 的比例需 >= min_ratio 才允許開倉。
-        min_ratio=0 時直接回傳 True（停用）。
+        市場廣度過濾：候選股中站上 EMA20 的比例需在 [min_ratio, max_ratio] 內才允許開倉。
+        min_ratio=0 停用下限；max_ratio=0 停用上限。
         """
-        if min_ratio <= 0:
+        if min_ratio <= 0 and max_ratio <= 0:
             return True
         above = total = 0
         for c in candidates[:30]:  # 只取前 30 檔，避免拖慢週期
@@ -34,16 +34,22 @@ class MarketFilter:
             total += 1
         if total < 5:
             logger.info("市場廣度：樣本不足，略過廣度過濾")
-            return True
+            return True, 0.0
         ratio = above / total
-        if ratio < min_ratio:
+        if min_ratio > 0 and ratio < min_ratio:
             logger.info(
                 f"市場廣度不足：{above}/{total}={ratio:.0%} 站上EMA20 "
                 f"< 門檻{min_ratio:.0%}，暫停開倉"
             )
-            return False
+            return False, ratio
+        if max_ratio > 0 and ratio > max_ratio:
+            logger.info(
+                f"市場廣度過熱：{above}/{total}={ratio:.0%} 站上EMA20 "
+                f"> 上限{max_ratio:.0%}，暫停開倉"
+            )
+            return False, ratio
         logger.info(f"市場廣度正常：{above}/{total}={ratio:.0%} 站上EMA20")
-        return True
+        return True, ratio
 
     def is_bull_trend(self) -> bool:
         """牛市判斷：0050 MA20 > MA60（中期上行趨勢確立）。用於調寬移動停損。"""
@@ -99,6 +105,16 @@ class MarketFilter:
             if atr_pct is not None and atr_pct > max_atr:
                 return True, f"0050 ATR% {atr_pct:.3f} > 上限 {max_atr:.3f}"
         return False, ""
+
+    def get_market_drawdown(self) -> float | None:
+        """計算 0050 從歷史高點的回撤幅度（0~1），無資料回傳 None。"""
+        df = self.feed.get_kbars(self.proxy_code, lookback_days=260, use_cache=True)
+        if df is None or len(df) < 20:
+            return None
+        close = df["Close"].astype(float)
+        peak = close.cummax().iloc[-1]
+        current = close.iloc[-1]
+        return float((peak - current) / peak) if peak > 0 else 0.0
 
     def allow_long(self) -> bool:
         if not self.enabled:

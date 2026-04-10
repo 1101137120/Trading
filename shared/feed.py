@@ -1,6 +1,7 @@
 """
 市場資料模組：歷史 K 棒、即時快照
 """
+import time
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
@@ -13,6 +14,13 @@ class MarketDataFeed:
     def __init__(self, api):
         self.api = api
         self._cache: dict[str, pd.DataFrame] = {}
+        self._last_kbar_issue: dict[str, str] = {}
+
+    def _set_kbar_issue(self, code: str, reason: str):
+        self._last_kbar_issue[str(code)] = reason
+
+    def get_last_kbar_issue(self, code: str) -> str:
+        return self._last_kbar_issue.get(str(code), "")
 
     def get_kbars(
         self,
@@ -26,6 +34,7 @@ class MarketDataFeed:
 
         contract = self._get_contract(code)
         if contract is None:
+            self._set_kbar_issue(code, "找不到合約")
             return None
 
         end = datetime.now().strftime("%Y-%m-%d")
@@ -35,6 +44,7 @@ class MarketDataFeed:
             kbars = self.api.kbars(contract=contract, start=start, end=end)
             df = pd.DataFrame({**kbars})
             if df.empty:
+                self._set_kbar_issue(code, "kbars 回傳空資料")
                 return None
             df.columns = [c.lower() if c.lower() == "ts" else c for c in df.columns]
             df["ts"] = pd.to_datetime(df["ts"])
@@ -58,27 +68,36 @@ class MarketDataFeed:
             min_rows = max(10, lookback_days // 5)
             if len(df) < min_rows:
                 logger.warning(f"K 棒資料不足 {code}: {len(df)} 筆（需 >= {min_rows}）")
+                self._set_kbar_issue(code, f"K棒資料不足({len(df)}<{min_rows})")
                 return None
             for col in ("Close", "Volume"):
                 nan_ratio = df[col].isna().sum() / len(df)
                 zero_ratio = (df[col] == 0).sum() / len(df)
                 if nan_ratio > 0.1:
                     logger.warning(f"{code} K 棒 {col} 含過多 NaN ({nan_ratio:.0%})，跳過")
+                    self._set_kbar_issue(code, f"{col} NaN 比例過高({nan_ratio:.0%})")
                     return None
                 if col == "Close" and zero_ratio > 0.1:
                     logger.warning(f"{code} K 棒 Close 含過多 0 值，跳過")
+                    self._set_kbar_issue(code, f"Close 0值比例過高({zero_ratio:.0%})")
                     return None
             # 極端漲跌幅檢查（單日 > 30% 視為資料異常）
             if len(df) > 1:
                 daily_change = df["Close"].pct_change().abs()
                 if (daily_change > 0.30).any():
                     logger.warning(f"{code} K 棒含單日漲跌 > 30%，資料可能異常，跳過")
+                    self._set_kbar_issue(code, "單日漲跌>30%，疑似異常")
                     return None
 
             self._cache[cache_key] = df
+            self._last_kbar_issue.pop(str(code), None)
             return df
         except Exception as e:
-            logger.error(f"取得 K 棒失敗 {code}: {e}")
+            _msg = " ".join(str(e).split())
+            if len(_msg) > 220:
+                _msg = _msg[:220] + "..."
+            self._set_kbar_issue(code, _msg or "未知錯誤")
+            logger.error(f"取得 K 棒失敗 {code}: {_msg}")
             return None
 
     def _get_contract(self, code: str):
@@ -111,22 +130,29 @@ class MarketDataFeed:
             return None
 
     def get_batch_snapshots(self, contracts: list) -> dict[str, dict]:
-        result = {}
-        batch_size = 200
-        for i in range(0, len(contracts), batch_size):
-            batch = contracts[i : i + batch_size]
-            try:
-                snaps = self.api.snapshots(batch)
-                for s in snaps:
-                    code = str(s.code)
-                    prev = getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None)
-                    result[code] = {
-                        "code": code, "open": s.open, "high": s.high, "low": s.low,
-                        "close": s.close, "volume": s.total_volume,
-                        "change_pct": s.change_price / prev if prev else 0.0,
-                    }
-            except Exception as e:
-                logger.warning(f"批次快照失敗 (batch {i}): {e}")
+        def _fetch_all(contracts_list: list) -> dict[str, dict]:
+            out = {}
+            for i in range(0, len(contracts_list), 200):
+                batch = contracts_list[i : i + 200]
+                try:
+                    snaps = self.api.snapshots(batch)
+                    for s in snaps:
+                        code = str(s.code)
+                        prev = getattr(s, "yesterday_close", None) or getattr(s, "prev_close", None)
+                        out[code] = {
+                            "code": code, "open": s.open, "high": s.high, "low": s.low,
+                            "close": s.close, "volume": s.total_volume,
+                            "change_pct": s.change_price / prev if prev else 0.0,
+                        }
+                except Exception as e:
+                    logger.warning(f"批次快照失敗 (batch {i}): {e}")
+            return out
+
+        result = _fetch_all(contracts)
+        if not result and contracts:
+            logger.info("快照回傳為空，等待 3 秒後重試一次（剛連線後 API 尚未就緒）...")
+            time.sleep(3)
+            result = _fetch_all(contracts)
         return result
 
     def get_snapshots_by_codes(self, codes: list) -> dict:

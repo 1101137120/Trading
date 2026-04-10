@@ -22,6 +22,7 @@ import argparse
 import logging
 from datetime import datetime, timedelta
 
+import csv
 import yaml
 import schedule
 from rich.console import Console
@@ -42,6 +43,7 @@ from tech.strategies.engine import StrategyEngine
 from shared.standalone_feed import fetch_kbars
 from shared.news_feed import get_stock_news
 from shared.ai_analyst import analyze_news
+from shared.db import bulk_load_institutional
 
 console = Console()
 _running = True
@@ -200,6 +202,8 @@ class TradingSystem:
         self._exit_queue: queue.Queue = queue.Queue()
         self._code_to_name: dict = {}   # 代碼 → 股票名稱，篩選時更新
         self._is_bull_market: bool = False  # 0050 MA20>MA60，每週期更新一次
+        self._trade_meta: dict[str, dict] = {}  # 進場時記錄的額外 metadata（用於 CSV log）
+        self._current_breadth: float = 0.0      # 最近一次廣度比例
 
     def setup(self) -> bool:
         console.print("[bold cyan]正在連線永豐金...[/bold cyan]")
@@ -224,7 +228,14 @@ class TradingSystem:
             self.broker.subscribe_ticks(list(self.portfolio.positions.keys()))
 
         console.print("[bold green]系統初始化完成[/bold green]")
-        self.notifier.notify("✅ 交易系統啟動完成")
+        self.notifier.notify(
+            "✅ <b>交易系統啟動</b>\n"
+            f"策略: {', '.join(self.config.get('strategies', {}).get('active', []))}\n"
+            f"持倉上限: {self.config['risk'].get('max_positions',5)} | "
+            f"單筆: {self.config['risk'].get('max_position_pct',0.2):.0%} | "
+            f"停損: {self.config['risk'].get('stop_loss_pct',0.08):.0%}",
+            parse_mode="HTML"
+        )
         return True
 
     def teardown(self):
@@ -430,6 +441,16 @@ class TradingSystem:
             if signals and is_hot:
                 self.logger.info(f"大盤過熱，本週期暫停新開倉：{hot_reason}")
                 console.print(f"[bold yellow]⚠ 大盤過熱，暫停新倉：{hot_reason}[/bold yellow]")
+                _hot_codes = "  ".join(
+                    f"{s.code}({s.confidence:.2f})" for s in signals
+                )
+                self.notifier.notify(
+                    f"🌡 <b>大盤過熱，本週期暫停開倉</b>\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    f"⚠ {hot_reason}\n"
+                    f"📋 略過訊號：{_hot_codes}",
+                    parse_mode="HTML"
+                )
                 for s in signals:
                     self.logger.info(f"[訊號-過熱略過] {s.code} 信心={s.confidence:.2f}")
                 signals = []
@@ -441,24 +462,55 @@ class TradingSystem:
                 stbl.add_column("名稱", style="dim")
                 stbl.add_column("信心", justify="right")
                 stbl.add_column("理由", style="dim")
+                _bear_lines = []
                 for s in signals:
-                    stbl.add_row(s.code, code_to_name.get(s.code, ""), f"{s.confidence:.2f}", (s.reason or "")[:40])
+                    name = code_to_name.get(s.code, "")
+                    stbl.add_row(s.code, name, f"{s.confidence:.2f}", (s.reason or "")[:40])
                     self.logger.info(f"[訊號-未執行] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
+                    _bear_lines.append(f"• {s.code} {name}  信心={s.confidence:.2f}")
                 console.print(stbl)
+                self.notifier.notify(
+                    f"🐻 <b>大盤偏空，訊號擱置</b>\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    "0050 MA20 &lt; MA60，多頭趨勢未確立\n"
+                    + "\n".join(_bear_lines),
+                    parse_mode="HTML"
+                )
                 signals = []
 
             _bull_entry_only = self.config.get("market_filter", {}).get("bull_entry_only", False)
             if signals and _bull_entry_only and not self._is_bull_market:
                 self.logger.info("大盤 MA20<MA60（非牛市），bull_entry_only 啟用，本週期不開新倉")
                 console.print("[bold yellow]⚠ 大盤 MA20<MA60，bull_entry_only 模式暫停新倉[/bold yellow]")
+                _bull_codes = "  ".join(f"{s.code}({s.confidence:.2f})" for s in signals)
+                self.notifier.notify(
+                    f"📉 <b>非牛市，bull_entry_only 暫停開倉</b>\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    f"0050 MA20 &lt; MA60\n"
+                    f"📋 略過：{_bull_codes}",
+                    parse_mode="HTML"
+                )
                 for s in signals:
                     self.logger.info(f"[訊號-非牛市略過] {s.code} 信心={s.confidence:.2f}")
                 signals = []
 
-            breadth_min = self.config.get("market_filter", {}).get("breadth_min", 0.0)
-            if signals and breadth_min > 0:
-                if not self.market_filter.check_breadth(candidates, self.feed, breadth_min):
-                    self.logger.info(f"市場廣度不足（門檻 {breadth_min:.0%}），本週期不開新倉")
+            _mf_cfg = self.config.get("market_filter", {})
+            breadth_min = _mf_cfg.get("breadth_min", 0.0)
+            breadth_max = _mf_cfg.get("breadth_max", 0.0)
+            if breadth_min > 0 or breadth_max > 0:
+                _breadth_ok, _breadth_ratio = self.market_filter.check_breadth(candidates, self.feed, breadth_min, breadth_max)
+                self._current_breadth = _breadth_ratio
+                if signals and not _breadth_ok:
+                    _breadth_range = f"{breadth_min:.0%}~{breadth_max:.0%}" if breadth_max > 0 else f">={breadth_min:.0%}"
+                    self.logger.info(f"市場廣度超出範圍（{_breadth_range}），本週期不開新倉")
+                    _breadth_codes = "  ".join(f"{s.code}({s.confidence:.2f})" for s in signals)
+                    self.notifier.notify(
+                        f"📊 <b>市場廣度異常，暫停開倉</b>\n"
+                        "━━━━━━━━━━━━━━━\n"
+                        f"⚠ 廣度需在 {_breadth_range}（目前 {_breadth_ratio:.0%}）\n"
+                        f"📋 略過：{_breadth_codes}",
+                        parse_mode="HTML"
+                    )
                     for s in signals:
                         self.logger.info(f"[訊號-廣度過濾] {s.code} 信心={s.confidence:.2f}")
                     signals = []
@@ -509,8 +561,28 @@ class TradingSystem:
 
             if status == "Filled":
                 self.broker.unsubscribe_ticks([code])
+                pos_snap = self.portfolio.get_position(code)
                 self.portfolio.confirm_sell(code, fill_price, fill_qty)
-                self.notifier.notify(f"✅ 平倉成交 {code} @ {fill_price:.2f}")
+                _exit_date = datetime.now().date().isoformat()
+                if pos_snap:
+                    _pnl_pct = (fill_price - pos_snap.entry_price) / pos_snap.entry_price if pos_snap.entry_price else 0
+                    _pnl_amt = (fill_price - pos_snap.entry_price) * pos_snap.quantity * 1000
+                    _days    = (datetime.now() - pos_snap.entry_time).days if pos_snap.entry_time else 0
+                    _peak    = pos_snap.highest_price
+                    _max_g   = (_peak - pos_snap.entry_price) / pos_snap.entry_price if pos_snap.entry_price > 0 else 0
+                    _reason  = self._trade_meta.get(code, {}).get("exit_reason", "")
+                    _rs      = pos_snap.rs_score
+                    self._write_trade_csv(code, pos_snap, fill_price, _exit_date)
+                    _icon    = "📈" if _pnl_pct >= 0 else "📉"
+                    self.notifier.notify(
+                        f"{_icon} <b>平倉成交</b> {code} {self._code_to_name.get(code,'')}\n"
+                        "━━━━━━━━━━━━━━━\n"
+                        f"💰 成交: {fill_price:.2f} | 成本: {pos_snap.entry_price:.2f}\n"
+                        f"{'🟢' if _pnl_pct >= 0 else '🔴'} 損益: {_pnl_pct:+.2%} / {_pnl_amt:+,.0f}元\n"
+                        f"📅 持有: {_days}天 | 峰值: {_peak:.2f}（最高 {_max_g:+.2%}）\n"
+                        f"📌 原因: {_reason} | 進場RS: {_rs:+.3f}",
+                        parse_mode="HTML"
+                    )
             elif status == "Dead":
                 escalated = self.portfolio.fail_sell(code)  # 升級通知由 portfolio 發送
                 if not escalated:
@@ -729,8 +801,12 @@ class TradingSystem:
             self.portfolio.save_to_file()
 
             self.notifier.notify(
-                f"📈 加碼委託 {code} ×{add_qty}{unit} @ {price:.2f}\n"
-                f"{level_str}加碼 | 獲利={pnl_pct:.1%} | 預算={budget:,.0f}"
+                f"🔺 <b>{level_str}加碼委託</b> {code} {self._code_to_name.get(code,'')}\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"💰 價格: {price:.2f} | 數量: ×{add_qty}{unit}\n"
+                f"📊 持倉獲利: {pnl_pct:+.1%} | 預算: {budget:,.0f}\n"
+                f"🔢 加碼層次: {pos.pyramid_level}/2",
+                parse_mode="HTML"
             )
 
     def _get_market_return_20d(self) -> float:
@@ -753,10 +829,42 @@ class TradingSystem:
         )
         max_evaluate = self.config["screener"].get("max_evaluate", 30)
         min_rs = self.config["screener"].get("min_rs_entry", 0)
-        mkt_ret = self._get_market_return_20d() if min_rs > 0 else 0.0
+        max_rs = self.config["screener"].get("max_rs_entry", 0)
+        mkt_ret = self._get_market_return_20d() if (min_rs > 0 or max_rs > 0) else 0.0
 
         code_to_name = {c["code"]: c.get("name", "") for c in candidates}
         self._code_to_name.update(code_to_name)
+
+        # 籌碼：bulk query 最近 10 日，取最新一筆
+        _today = datetime.now().strftime("%Y-%m-%d")
+        _inst_start = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+        _all_codes = [c["code"] for c in candidates[:max_evaluate]]
+        _inst_data = bulk_load_institutional(_all_codes, _inst_start, _today)
+        def _get_chip(code: str) -> dict:
+            idf = _inst_data.get(code)
+            if idf is None or idf.empty:
+                return {}
+            last = idf.iloc[-1]
+            # 外資/投信取近5日累計
+            n = min(5, len(idf))
+            tail = idf.tail(n)
+            # 連續買超天數（從最新一天往前數，遇到賣超即停）
+            def _streak(col: str) -> int:
+                days = 0
+                for v in reversed(tail[col].tolist()):
+                    if v > 0:
+                        days += 1
+                    else:
+                        break
+                return days
+            return {
+                "foreign_net":        float(tail["foreign_net"].sum()),
+                "trust_net":          float(tail["trust_net"].sum()),
+                "margin_short_ratio": float(last["margin_short_ratio"]) if "margin_short_ratio" in last and last["margin_short_ratio"] else None,
+                "holding_pct":        float(last["holding_pct"])        if "holding_pct"        in last and last["holding_pct"]        else None,
+                "foreign_streak":     _streak("foreign_net"),
+                "trust_streak":       _streak("trust_net"),
+            }
 
         evaluated = skipped_pos = skipped_limit = skipped_rs = 0
         for c in candidates[:max_evaluate]:
@@ -786,13 +894,96 @@ class TradingSystem:
                 self.logger.info(f"跳過 {code} {code_to_name.get(code,'')}：RS {rs_score:+.3f} < {min_rs}")
                 skipped_rs += 1
                 continue
+            if max_rs > 0 and rs_score > max_rs:
+                self.logger.info(f"跳過 {code} {code_to_name.get(code,'')}：RS {rs_score:+.3f} > {max_rs}（趨勢末段）")
+                skipped_rs += 1
+                continue
+            # EMA20 乖離率
+            ema_dev = 0.0
+            if len(df) >= 20:
+                _close = df["Close"].astype(float)
+                _ema20 = float(_close.ewm(span=20, adjust=False).mean().iloc[-1])
+                if _ema20 > 0:
+                    ema_dev = float((_close.iloc[-1] - _ema20) / _ema20)
             evaluated += 1
             sig = self.engine.evaluate(code, df)
             if sig and sig.action == "Buy":
                 sig.rs_score = rs_score
+                sig.ema_dev  = ema_dev
+                chip = _get_chip(code)
+                sig.foreign_net        = chip.get("foreign_net")
+                sig.trust_net          = chip.get("trust_net")
+                sig.margin_short_ratio = chip.get("margin_short_ratio")
+                sig.holding_pct        = chip.get("holding_pct")
+                sig.foreign_streak     = chip.get("foreign_streak", 0)
+                sig.trust_streak       = chip.get("trust_streak", 0)
                 signals.append(sig)
 
-        signals.sort(key=lambda s: s.confidence, reverse=True)
+        # rank_score 排序（conf 30% + rs 40% + ema_dev 15% + chip 15%）
+        def _chip_score(s) -> float:
+            score = 0.5  # 無資料給中性
+            if s.foreign_net is None:
+                return score
+            # 外資買賣超量
+            if s.foreign_net > 500:    score += 0.30
+            elif s.foreign_net > 100:  score += 0.15
+            elif s.foreign_net > 0:    score += 0.05
+            elif s.foreign_net < -200: score -= 0.30
+            elif s.foreign_net < 0:    score -= 0.10
+            # 投信買賣超量
+            if s.trust_net is not None:
+                if s.trust_net > 100:  score += 0.20
+                elif s.trust_net > 0:  score += 0.10
+                elif s.trust_net < 0:  score -= 0.05
+            # 連續買超加分（外資）
+            if s.foreign_streak >= 4:  score += 0.20
+            elif s.foreign_streak >= 3: score += 0.12
+            elif s.foreign_streak >= 2: score += 0.05
+            # 連續買超加分（投信，力道更集中給更高加分）
+            if s.trust_streak >= 4:    score += 0.15
+            elif s.trust_streak >= 3:  score += 0.08
+            elif s.trust_streak >= 2:  score += 0.03
+            return max(0.0, min(1.0, score))
+
+        # rank 參數從 config 讀取，對齊 backtest hybrid 模式
+        _rk = self.config.get("rank", {})
+        _w_conf      = _rk.get("w_conf",      0.00)
+        _w_rs        = _rk.get("w_rs",        0.26)
+        _w_dev       = _rk.get("w_dev",       0.20)
+        _w_rs_sweet  = _rk.get("w_rs_sweet",  0.29)
+        _w_breadth   = _rk.get("w_breadth",   0.10)
+        _w_chip      = _rk.get("w_chip",      0.15)
+        _rs_sweet_spot  = _rk.get("rs_sweet_spot",  0.20)
+        _rs_sweet_tol   = _rk.get("rs_sweet_tol",   0.10)
+        _rs_center      = _rk.get("rs_center",      0.05)
+        _rs_span        = _rk.get("rs_span",         0.25)
+        _dev_sweet_spot = _rk.get("dev_sweet_spot",  0.05)
+        _dev_tol        = _rk.get("dev_tol",         0.03)
+
+        def _rank(s):
+            # conf
+            conf  = max(0.0, min(1.0, s.confidence))
+            # RS 線性分
+            rs_n  = max(0.0, min(1.0, (s.rs_score - _rs_center) / _rs_span))
+            # RS sweet-spot 分（RS 在甜蜜點附近最高分）
+            _rs_d = abs(s.rs_score - _rs_sweet_spot)
+            rs_sw = max(0.0, 1.0 - _rs_d / _rs_sweet_tol) if _rs_d < _rs_sweet_tol else 0.0
+            # EMA dev sweet-spot 分
+            dev_d = abs(s.ema_dev - _dev_sweet_spot)
+            dev_n = max(0.0, 1.0 - dev_d / _dev_tol) if dev_d < _dev_tol else 0.0
+            # breadth（live 無法直接取，給中性 0.5）
+            breadth_n = 0.5
+            chip  = _chip_score(s)
+            total_w = _w_conf + _w_rs + _w_dev + _w_rs_sweet + _w_breadth + _w_chip
+            if total_w <= 0:
+                return conf
+            return (
+                _w_conf * conf + _w_rs * rs_n + _w_dev * dev_n
+                + _w_rs_sweet * rs_sw + _w_breadth * breadth_n + _w_chip * chip
+            ) / total_w
+        for s in signals:
+            s.rank_score = _rank(s)
+        signals.sort(key=lambda s: s.rank_score, reverse=True)
         self.logger.info(
             f"評估 {evaluated} 檔 | 已持倉跳過 {skipped_pos} | "
             f"漲停跳過 {skipped_limit} | RS 不足跳過 {skipped_rs} | "
@@ -803,7 +994,26 @@ class TradingSystem:
             news = get_stock_news(s.code, name)
             analysis = analyze_news(s.code, name, news)
             ai_note = f"[AI {analysis.sentiment} {analysis.score:+.1f}] {analysis.summary}" if analysis.has_news else "[無近期新聞]"
-            self.logger.info(f"[買入訊號] {s.code} {name} 價格={s.price} 信心={s.confidence:.2f} 理由={s.reason} | {ai_note}")
+            _chip_parts = []
+            if s.foreign_net is not None:
+                _fstr = f"外資5日={s.foreign_net:+.0f}張"
+                if s.foreign_streak >= 2:
+                    _fstr += f"(連{s.foreign_streak}日)"
+                _chip_parts.append(_fstr)
+            if s.trust_net is not None:
+                _tstr = f"投信5日={s.trust_net:+.0f}張"
+                if s.trust_streak >= 2:
+                    _tstr += f"(連{s.trust_streak}日)"
+                _chip_parts.append(_tstr)
+            if s.margin_short_ratio is not None:
+                _chip_parts.append(f"資券比={s.margin_short_ratio:.2f}")
+            if s.holding_pct is not None:
+                _chip_parts.append(f"外資持股={s.holding_pct:.1%}")
+            _chip_note = " | 籌碼: " + "  ".join(_chip_parts) if _chip_parts else " | 籌碼: 無資料"
+            self.logger.info(
+                f"[買入訊號] {s.code} {name} 價格={s.price} 信心={s.confidence:.2f} 理由={s.reason}"
+                f"{_chip_note} | {ai_note}"
+            )
         return signals
 
     def _is_gap_up_blocked(self, code: str, snap: dict, df: "pd.DataFrame | None") -> bool:
@@ -885,6 +1095,40 @@ class TradingSystem:
                 if snap and self._is_gap_up_blocked(code, snap, df_gap):
                     continue
 
+            # 籌碼過濾：法人雙賣 / 資券比過高
+            _chip_cfg = self.config.get("chip_filter", {})
+            if _chip_cfg.get("enabled", True):
+                _margin_max = _chip_cfg.get("margin_short_ratio_max", 4.0)
+                _skip_chip  = False
+                _chip_skip_reason = ""
+                # 資券比過高 → 融資泡沫風險
+                if (signal.margin_short_ratio is not None
+                        and _margin_max > 0
+                        and signal.margin_short_ratio > _margin_max):
+                    _skip_chip = True
+                    _chip_skip_reason = f"資券比 {signal.margin_short_ratio:.1f} > {_margin_max}"
+                # 法人雙賣 → 機構出貨，不跟
+                elif (signal.foreign_net is not None and signal.trust_net is not None
+                        and signal.foreign_net < 0 and signal.trust_net < 0):
+                    _skip_chip = True
+                    _chip_skip_reason = (
+                        f"法人雙賣（外資{signal.foreign_net:+.0f}張 投信{signal.trust_net:+.0f}張）"
+                    )
+                if _skip_chip:
+                    name = self._code_to_name.get(code, "")
+                    self.logger.info(
+                        f"[籌碼過濾] {code} {name} 跳過：{_chip_skip_reason}"
+                        f" | RS={signal.rs_score:+.3f} 信心={signal.confidence:.2f}"
+                    )
+                    self.notifier.notify(
+                        f"🚫 <b>籌碼過濾</b> {code} {name}\n"
+                        "━━━━━━━━━━━━━━━\n"
+                        f"⚠ {_chip_skip_reason}\n"
+                        f"📊 RS={signal.rs_score:+.3f} | 信心={signal.confidence:.2f}",
+                        parse_mode="HTML"
+                    )
+                    continue
+
             # EMA 乖離動態倉位：乖離率低縮倉、高放大
             pos_pct = None
             _risk_cfg = self.config.get("risk", {})
@@ -910,6 +1154,26 @@ class TradingSystem:
                                 f"放大倉位 {_base_pct:.2%}→{pos_pct:.2%}"
                             )
 
+            # RS 強弱動態倉位（疊加在 EMA 乖離之後）
+            _rs_high_thr  = _risk_cfg.get("rs_pos_high_thr", 0.0)
+            _rs_high_mult = _risk_cfg.get("rs_pos_high_mult", 1.0)
+            _rs_low_thr   = _risk_cfg.get("rs_pos_low_thr", 0.0)
+            _rs_low_mult  = _risk_cfg.get("rs_pos_low_mult", 1.0)
+            if _rs_high_thr or _rs_low_thr:
+                _base_pct = pos_pct if pos_pct is not None else _risk_cfg.get("max_position_pct", 0.20)
+                if _rs_high_thr > 0 and signal.rs_score >= _rs_high_thr:
+                    pos_pct = min(_base_pct * _rs_high_mult, 0.50)
+                    self.logger.info(
+                        f"{code} RS {signal.rs_score:+.3f} >= {_rs_high_thr}，"
+                        f"放大倉位 {_base_pct:.2%}→{pos_pct:.2%}"
+                    )
+                elif _rs_low_thr > 0 and signal.rs_score < _rs_low_thr:
+                    pos_pct = _base_pct * _rs_low_mult
+                    self.logger.info(
+                        f"{code} RS {signal.rs_score:+.3f} < {_rs_low_thr}，"
+                        f"縮倉 {_base_pct:.2%}→{pos_pct:.2%}"
+                    )
+
             qty, is_odd_lot = self.portfolio.calculate_quantity(price, position_pct=pos_pct)
             if qty <= 0:
                 continue
@@ -922,7 +1186,57 @@ class TradingSystem:
                 self.logger.info(
                     f"牛市模式：持倉上限 {self.config['risk']['max_positions']}→{_max_pos_override}"
                 )
-            if not self.portfolio.can_open_position(order_value, max_positions_override=_max_pos_override):
+            # 大盤深度回撤縮倉：0050 從歷史高點跌逾 threshold 時，持倉上限收緊
+            _dd_thr = self.config.get("risk", {}).get("market_dd_threshold", 0.0)
+            _dd_max = self.config.get("risk", {}).get("market_dd_max_positions", 2)
+            if _dd_thr > 0:
+                _dd = self.market_filter.get_market_drawdown()
+                if _dd is not None and _dd >= _dd_thr:
+                    _base_max = _max_pos_override if _max_pos_override else self.config["risk"].get("max_positions", 5)
+                    _dd_capped = min(_base_max, _dd_max)
+                    if _dd_capped < _base_max:
+                        self.logger.info(
+                            f"大盤回撤 {_dd:.1%} >= {_dd_thr:.0%}，持倉上限縮至 {_dd_capped}"
+                        )
+                        _max_pos_override = _dd_capped
+            _effective_pct = pos_pct if pos_pct else self.config.get("risk", {}).get("max_position_pct", 0.20)
+            if not self.portfolio.can_open_position(
+                order_value,
+                max_positions_override=_max_pos_override,
+                max_pct_override=_effective_pct,
+            ):
+                name = self._code_to_name.get(code, "")
+                _m_parts = []
+                if signal.foreign_net is not None:
+                    _m_parts.append(f"外資5日={signal.foreign_net:+.0f}張")
+                if signal.trust_net is not None:
+                    _m_parts.append(f"投信5日={signal.trust_net:+.0f}張")
+                if signal.margin_short_ratio is not None:
+                    _m_parts.append(f"資券比={signal.margin_short_ratio:.2f}")
+                if signal.holding_pct is not None:
+                    _m_parts.append(f"外資持股={signal.holding_pct:.1%}")
+                _chip_str = "  ".join(_m_parts) if _m_parts else "無籌碼資料"
+                _occupied = len(self.portfolio.positions) + len(self.portfolio.pending_orders)
+                _max_pos  = _max_pos_override if _max_pos_override else self.config["risk"].get("max_positions", 5)
+                _skip_reason = (
+                    f"倉位已滿（{_occupied}/{_max_pos}）"
+                    if _occupied >= _max_pos
+                    else f"資金不足（需{order_value:,.0f} 可用{self.portfolio.available_capital:,.0f}）"
+                )
+                self.logger.info(
+                    f"[錯失] {code} {name} {_skip_reason}"
+                    f" | RS={signal.rs_score:+.3f} ema_dev={signal.ema_dev:.3f} 信心={signal.confidence:.2f}"
+                    f" | 籌碼: {_chip_str}"
+                )
+                self.notifier.notify(
+                    f"⏭ <b>錯失訊號</b> {code} {name}\n"
+                    "━━━━━━━━━━━━━━━\n"
+                    f"🚫 {_skip_reason}\n"
+                    f"📊 RS={signal.rs_score:+.3f} | EMA乖離={signal.ema_dev:.2%} | 信心={signal.confidence:.2f}\n"
+                    f"🏛 {signal.reason}\n"
+                    f"💹 籌碼: {_chip_str}",
+                    parse_mode="HTML"
+                )
                 continue
             if not is_odd_lot and not self.risk.is_valid_order(price, qty):
                 continue
@@ -948,12 +1262,114 @@ class TradingSystem:
                 rs_score=signal.rs_score,
             )
             self.portfolio.add_pending(po)
+            # 記錄進場 metadata（出場時寫 CSV 用）
+            self._trade_meta[code] = {
+                "entry_date":    datetime.now().date().isoformat(),
+                "name":          self._code_to_name.get(code, ""),
+                "strategy":      signal.strategy,
+                "rs_score":      signal.rs_score,
+                "ema_dev":       signal.ema_dev,
+                "confidence":    signal.confidence,
+                "rank_score":    signal.rank_score,
+                "breadth":       self._current_breadth,
+                "foreign_net":   signal.foreign_net,
+                "trust_net":     signal.trust_net,
+                "margin_ratio":  signal.margin_short_ratio,
+                "holding_pct":   signal.holding_pct,
+                "alloc_pct":     _effective_pct,
+                "lots":          qty,
+                "odd_lot":       is_odd_lot,
+                "exit_reason":   None,
+            }
             mode = "[模擬] " if self.dry_run else ""
             lot_note = "零股" if is_odd_lot else "整張"
-            self.notifier.notify(
-                f"📈 {mode}開倉委託 {code} {qty}{unit}({lot_note}) @ {price:.2f}\n"
-                f"停損: {stop_loss:.2f} | 停利: {take_profit:.2f}"
+            _fs = f"(連{signal.foreign_streak}日)" if signal.foreign_streak >= 2 else ""
+            _ts = f"(連{signal.trust_streak}日)" if signal.trust_streak >= 2 else ""
+            _chip_line = (
+                f"\n💹 外資:{signal.foreign_net:+.0f}張{_fs} | 投信:{signal.trust_net:+.0f}張{_ts}"
+                if (signal.foreign_net is not None and signal.trust_net is not None) else ""
             )
+            _msr_line = f" | 資券比:{signal.margin_short_ratio:.2f}" if signal.margin_short_ratio is not None else ""
+            self.notifier.notify(
+                f"📈 <b>{mode}開倉委託</b> {code} {self._code_to_name.get(code,'')}\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"💰 價格: {price:.2f} | 數量: {qty}{unit}({lot_note}) | 倉位: {_effective_pct:.0%}\n"
+                f"🛑 停損: {stop_loss:.2f} ({self.config['risk'].get('stop_loss_pct',0.08):.0%}) | 移停啟動: +{self.config['risk'].get('trailing_stop',{}).get('activation_pct',0.02):.0%}\n"
+                f"📊 RS={signal.rs_score:+.3f} | EMA乖離={signal.ema_dev:.2%} | 信心={signal.confidence:.2f} | 排名={signal.rank_score:.3f}\n"
+                f"🌐 廣度={self._current_breadth:.0%}{_msr_line}"
+                f"{_chip_line}\n"
+                f"🏛 {signal.reason}",
+                parse_mode="HTML"
+            )
+
+    def _write_trade_csv(self, code: str, pos, exit_price: float, exit_date: str):
+        """將已完成交易寫入 tech/logs/trades_YYYY.csv（與回測 CSV 欄位對齊）"""
+        meta = self._trade_meta.get(code, {})
+        year = datetime.now().year
+        log_dir = PROJECT_ROOT / "logs"
+        log_dir.mkdir(exist_ok=True)
+        csv_path = log_dir / f"trades_{year}.csv"
+        entry_price = pos.entry_price
+        hold_days = (datetime.now() - pos.entry_time).days if pos.entry_time else 0
+        pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
+        max_gain_pct = (pos.highest_price - entry_price) / entry_price if (entry_price > 0 and pos.highest_price > 0) else 0
+        lots = meta.get("lots", pos.quantity)
+        cost = entry_price * lots * (1 if pos.odd_lot else 1000)
+        fee_rate = 0.001425
+        tax_rate = 0.003
+        fee_buy  = round(cost * fee_rate)
+        fee_sell = round(exit_price * lots * (1 if pos.odd_lot else 1000) * fee_rate)
+        tax      = round(exit_price * lots * (1 if pos.odd_lot else 1000) * tax_rate)
+        pnl_dollars = (exit_price - entry_price) * lots * (1 if pos.odd_lot else 1000)
+        net_pnl = pnl_dollars - fee_buy - fee_sell - tax
+
+        fieldnames = [
+            "entry_date", "exit_date", "code", "name", "entry_price", "exit_price",
+            "hold_days", "lots", "odd_lot", "cost", "pnl_pct", "max_gain_pct",
+            "exit_reason", "rs_score", "ema_dev", "market_breadth_at_entry",
+            "rank_score", "confidence", "foreign_net", "trust_net", "margin_short_ratio",
+            "holding_pct", "alloc_pct", "strategy", "fee_buy", "fee_sell", "tax",
+            "pnl_dollars", "net_pnl_dollars",
+        ]
+        row = {
+            "entry_date":              meta.get("entry_date", ""),
+            "exit_date":               exit_date,
+            "code":                    code,
+            "name":                    meta.get("name", ""),
+            "entry_price":             entry_price,
+            "exit_price":              exit_price,
+            "hold_days":               hold_days,
+            "lots":                    lots,
+            "odd_lot":                 pos.odd_lot,
+            "cost":                    round(cost),
+            "pnl_pct":                 round(pnl_pct, 4),
+            "max_gain_pct":            round(max_gain_pct, 4),
+            "exit_reason":             meta.get("exit_reason", ""),
+            "rs_score":                meta.get("rs_score", pos.rs_score),
+            "ema_dev":                 meta.get("ema_dev", ""),
+            "market_breadth_at_entry": meta.get("breadth", ""),
+            "rank_score":              meta.get("rank_score", ""),
+            "confidence":              meta.get("confidence", ""),
+            "foreign_net":             meta.get("foreign_net", ""),
+            "trust_net":               meta.get("trust_net", ""),
+            "margin_short_ratio":      meta.get("margin_ratio", ""),
+            "holding_pct":             meta.get("holding_pct", ""),
+            "alloc_pct":               meta.get("alloc_pct", ""),
+            "strategy":                meta.get("strategy", ""),
+            "fee_buy":                 fee_buy,
+            "fee_sell":                fee_sell,
+            "tax":                     tax,
+            "pnl_dollars":             round(pnl_dollars),
+            "net_pnl_dollars":         round(net_pnl),
+        }
+        write_header = not csv_path.exists()
+        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+        self.logger.info(f"[CSV] 交易記錄寫入 {csv_path.name}: {code} {pnl_pct:+.2%}")
+        self._trade_meta.pop(code, None)
 
     def _execute_sell(self, code: str, pos, reason: str):
         exit_price = pos.current_price
@@ -965,6 +1381,8 @@ class TradingSystem:
             f"成本{pos.entry_price:.2f} 損益{pnl_pct:+.1%}({pos.pnl:+,.0f}) | "
             f"持有{hold_days}天 | 峰值{pos.highest_price:.2f}"
         )
+        if code in self._trade_meta:
+            self._trade_meta[code]["exit_reason"] = reason
 
         # 跌停警告：市價單可能無法成交
         snap = self.feed.get_snapshot(code)
@@ -975,9 +1393,19 @@ class TradingSystem:
         if self.dry_run:
             # 模擬模式：直接確認平倉
             self.broker.unsubscribe_ticks([code])
+            _exit_date = datetime.now().date().isoformat()
+            self._write_trade_csv(code, pos, exit_price, _exit_date)
+            _max_g = (pos.highest_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
+            _pnl_icon = "🟢" if pnl_pct >= 0 else "🔴"
             self.portfolio.remove_position(code, exit_price)
             self.notifier.notify(
-                f"📤 [模擬] 平倉 {code} @ {exit_price:.2f} | {reason}"
+                f"📤 <b>[模擬] 平倉</b> {code} {self._code_to_name.get(code,'')}\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"💰 出場: {exit_price:.2f} | 成本: {pos.entry_price:.2f}\n"
+                f"{_pnl_icon} 損益: {pnl_pct:+.1%} ({pos.pnl:+,.0f})\n"
+                f"📅 持有 {hold_days} 天 | 峰值: {pos.highest_price:.2f}（最高 {_max_g:+.2%}）\n"
+                f"📌 出場原因: {reason} | 進場RS: {pos.rs_score:+.3f}",
+                parse_mode="HTML"
             )
             return
 
@@ -1060,11 +1488,20 @@ class TradingSystem:
             path.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             self.logger.warning(f"心跳寫入失敗: {e}")
+        _pos_list = ""
+        for c, p in self.portfolio.positions.items():
+            _pp = (p.current_price - p.entry_price) / p.entry_price if p.entry_price else 0
+            _icon = "🟢" if _pp >= 0 else "🔴"
+            _pos_list += f"\n  {_icon} {c} {self._code_to_name.get(c,'')} {_pp:+.1%} ({p.pnl:+,.0f})"
         self.notifier.notify(
-            f"💓 系統運行中\n"
-            f"持倉: {summary['open_positions']} 支 | "
-            f"未實現: {summary['unrealized_pnl']:+,.0f} 元 | "
-            f"當日損益: {summary['daily_pnl']:+,.0f} 元"
+            f"💓 <b>系統運行中</b> {datetime.now().strftime('%H:%M')}\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"持倉: {summary['open_positions']}/{self.config['risk'].get('max_positions',5)} 支\n"
+            f"未實現: {summary['unrealized_pnl']:+,.0f} 元\n"
+            f"當日損益: {summary['daily_pnl']:+,.0f} 元\n"
+            f"可用資金: {summary['available_capital']:,.0f} 元"
+            + (_pos_list if _pos_list else "\n  （無持倉）"),
+            parse_mode="HTML"
         )
 
     def _print_summary(self):

@@ -63,8 +63,11 @@ class RiskManager:
             eff_trail = (bull_pct if (is_bull and bull_pct > 0) else trail_pct)
             # 強勢個股加成：RS > 0.1 再多給一點空間
             rs_bonus = trail_cfg.get("trail_stop_rs_bonus", 0.0)
-            if rs_bonus > 0 and getattr(position, "rs_score", 0.0) > 0.1:
+            rs = getattr(position, "rs_score", 0.0)
+            if rs_bonus > 0 and rs > 0.1:
                 eff_trail += rs_bonus
+            if rs_bonus > 0 and rs > 0.2:
+                eff_trail += rs_bonus  # 超強勢再加一倍
             if position.highest_price > 0:
                 trail_stop = round(position.highest_price * (1 - eff_trail), 2)
                 if position.current_price <= trail_stop:

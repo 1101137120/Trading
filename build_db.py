@@ -36,6 +36,12 @@ from shared.db import (
     DB_PATH, get_conn, init_schema, upsert_stock, upsert_kbars,
     set_meta, get_meta, get_latest_date, get_all_stocks,
     rebuild_universe_snapshots, db_stats,
+    upsert_institutional_net, upsert_margin_balance, upsert_foreign_holding,
+    get_latest_inst_date,
+)
+from shared.institutional_feed import (
+    fetch_institutional_net, fetch_margin_balance, fetch_foreign_holding,
+    trading_days_range,
 )
 
 console = Console()
@@ -113,11 +119,12 @@ def fetch_delisted_tse() -> list[dict]:
         fields = data.get("fields", [])
         rows   = data.get("data", [])
         # 找欄位索引
+        # 欄位名稱曾改版，動態查找
         try:
-            idx_code    = fields.index("公司代號")
-            idx_name    = fields.index("公司名稱")
-            idx_delist  = fields.index("廢止上市日期")
-        except ValueError:
+            idx_code   = next(i for i, f in enumerate(fields) if "代號" in f or "編號" in f)
+            idx_name   = next(i for i, f in enumerate(fields) if "名稱" in f)
+            idx_delist = next(i for i, f in enumerate(fields) if "日期" in f)
+        except StopIteration:
             console.print("[yellow]下市清單欄位格式有變，略過[/yellow]")
             return []
 
@@ -146,8 +153,10 @@ def fetch_delisted_otc() -> list[dict]:
     url = "https://www.tpex.org.tw/web/stock/delisted/delisted_companies.php"
     result = []
     try:
-        # TPEX 這個頁面回傳 HTML，改用 pandas read_html 解析表格
-        tables = pd.read_html(url, encoding="utf-8")
+        # TPEX 這個頁面回傳 HTML，先用 requests 取回再交給 pandas 解析（繞過 SSL）
+        import io
+        html = requests.get(url, timeout=20, verify=False).text
+        tables = pd.read_html(io.StringIO(html))
         for tbl in tables:
             for _, row in tbl.iterrows():
                 vals = [str(v).strip() for v in row.values]
@@ -228,6 +237,83 @@ def download_kbars(
 # ──────────────────────────────────────────────
 # 主流程
 # ──────────────────────────────────────────────
+
+def _fetch_institutional(update_only: bool, inst_from: str | None = None):
+    """
+    抓取三大法人、融資融券、外資持股資料並存入 DB。
+    - update_only=True：從上次最新日期補到今天（增量）
+    - update_only=False：補最近 252 個交易日（約 1 年）
+    - inst_from：指定起始日（覆蓋上述邏輯，補 inst_from ~ 今天的所有缺漏）
+    """
+    console.print("\n[dim]更新三大法人 / 融資融券 / 外資持股...[/dim]")
+
+    today = date.today().strftime("%Y-%m-%d")
+
+    if inst_from:
+        from_date = inst_from
+        console.print(f"  [dim]指定起始日：{from_date}（補齊至 {today}）[/dim]")
+    else:
+        with get_conn() as conn:
+            latest = get_latest_inst_date(conn)
+
+        if latest is None:
+            # 首次建立：補最近 252 個交易日
+            from_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+        elif update_only:
+            # 增量：從上次之後補到今天
+            from_date = (datetime.strptime(latest, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            # 全量重建：補最近 252 個交易日
+            from_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+
+    dates = trading_days_range(from_date, today)
+    if not dates:
+        console.print("  [dim]三大法人資料已是最新，無需更新[/dim]")
+        return
+
+    console.print(f"  更新日期：{dates[0]} → {dates[-1]}（{len(dates)} 個交易日）")
+
+    ok = skip = 0
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("法人/融資/外資", total=len(dates))
+
+        for idx, d_str in enumerate(dates):
+            progress.update(task, advance=1, description=f"[dim]{d_str}[/dim]")
+
+            inst   = fetch_institutional_net(d_str)
+            margin = fetch_margin_balance(d_str)
+            fhold  = fetch_foreign_holding(d_str)
+
+            if not inst and not margin and not fhold:
+                skip += 1
+                time.sleep(0.5)
+                continue
+
+            with get_conn() as conn:
+                if inst:
+                    upsert_institutional_net(list(inst.values()), conn)
+                if margin:
+                    upsert_margin_balance(list(margin.values()), conn)
+                if fhold:
+                    upsert_foreign_holding(list(fhold.values()), conn)
+                conn.commit()
+            ok += 1
+            # 每 20 天暫停 30 秒，避免 TWSE IP 封鎖
+            if (idx + 1) % 20 == 0:
+                progress.update(task, description="[yellow]防封鎖暫停 30s...[/yellow]")
+                time.sleep(30)
+            else:
+                time.sleep(1.5)
+
+    console.print(f"  完成：[green]{ok}[/green] 日有資料，{skip} 日無資料（假日/休市）")
+
 
 def cmd_stats():
     stats = db_stats()
@@ -361,6 +447,9 @@ def cmd_build(start: str, update_only: bool, rebuild_univ_only: bool, no_deliste
         set_meta("start_date", start, conn)
         conn.commit()
 
+    # ── 4. 三大法人 / 融資融券 / 外資持股 ──
+    _fetch_institutional(update_only)
+
     stats = db_stats()
     console.rule("[bold]完成[/bold]")
     console.print(
@@ -382,10 +471,18 @@ def main():
                         help="顯示 DB 統計後離開")
     parser.add_argument("--no-delisted",      action="store_true",
                         help="跳過已下市股票（速度快 3–5 倍，但存活者偏差未修正）")
+    parser.add_argument("--inst-only",        action="store_true",
+                        help="只更新三大法人/融資融券/外資持股，不下載 K 棒（cron 日更用）")
+    parser.add_argument("--inst-from",         default=None,
+                        help="籌碼起始日（YYYY-MM-DD），配合 --inst-only 補齊歷史缺漏，例：2023-01-01")
     args = parser.parse_args()
 
     if args.stats:
         cmd_stats()
+        return
+
+    if args.inst_only:
+        _fetch_institutional(update_only=not args.inst_from, inst_from=args.inst_from)
         return
 
     cmd_build(

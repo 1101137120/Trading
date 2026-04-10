@@ -52,8 +52,45 @@ class StockScanner:
         logger.info(f"開始批次快照篩選，共 {len(contracts)} 檔...")
         code_to_name = {c.code: getattr(c, "name", "") for c in contracts if hasattr(c, "code")}
         snapshots = self.feed.get_batch_snapshots(contracts)
+        snap_codes = set(snapshots.keys())
+        missing_snapshot = max(0, len(contracts) - len(snapshots))
+        logger.info(
+            f"快照回傳 {len(snapshots)}/{len(contracts)} 檔，無快照 {missing_snapshot} 檔"
+        )
+        if missing_snapshot > 0:
+            _miss_samples = []
+            for _c in contracts:
+                _code = str(getattr(_c, "code", ""))
+                if _code and _code not in snap_codes:
+                    _miss_samples.append(_code)
+                    if len(_miss_samples) >= 8:
+                        break
+            if _miss_samples:
+                logger.info(
+                    "無快照樣本（最多8檔）: " + ", ".join(_miss_samples)
+                )
+
+        # 盤後 fallback：若快照仍全空，改用 TWSE STOCK_DAY_ALL 收盤資料
+        if not snapshots:
+            logger.info("快照全空，嘗試 TWSE STOCK_DAY_ALL 盤後收盤資料 fallback...")
+            try:
+                from shared.standalone_feed import fetch_tse_daily_all
+                tse_data = fetch_tse_daily_all()
+                valid_codes = {str(getattr(c, "code", "")) for c in contracts}
+                snapshots = {code: d for code, d in tse_data.items() if code in valid_codes}
+                # 補齊 code_to_name（STOCK_DAY_ALL 含 name 欄位）
+                for code, d in snapshots.items():
+                    if code not in code_to_name and d.get("name"):
+                        code_to_name[code] = d["name"]
+                logger.info(f"TWSE fallback 取得 {len(snapshots)} 檔收盤資料")
+            except Exception as e:
+                logger.warning(f"TWSE fallback 失敗: {e}")
 
         candidates = []
+        filtered_price = 0
+        filtered_volume = 0
+        filtered_price_samples: list[str] = []
+        filtered_volume_samples: list[str] = []
         for code, snap in snapshots.items():
             close = snap.get("close", 0)
             volume = snap.get("volume", 0)
@@ -64,8 +101,18 @@ class StockScanner:
                 pass
             else:
                 if not (min_price <= close <= max_price):
+                    filtered_price += 1
+                    if len(filtered_price_samples) < 8:
+                        filtered_price_samples.append(
+                            f"{code}({close:.2f})"
+                        )
                     continue
                 if volume < min_volume:
+                    filtered_volume += 1
+                    if len(filtered_volume_samples) < 8:
+                        filtered_volume_samples.append(
+                            f"{code}(vol={volume})"
+                        )
                     continue
 
             candidates.append({
@@ -81,6 +128,13 @@ class StockScanner:
 
         candidates.sort(key=lambda x: x["volume"], reverse=True)
         candidates = candidates[:max_stocks]
+        logger.info(
+            f"快照條件過濾後 {len(candidates)} 檔（價格淘汰 {filtered_price} / 量淘汰 {filtered_volume}）"
+        )
+        if filtered_price_samples:
+            logger.info("價格淘汰樣本（最多8檔）: " + ", ".join(filtered_price_samples))
+        if filtered_volume_samples:
+            logger.info("量淘汰樣本（最多8檔）: " + ", ".join(filtered_volume_samples))
 
         min_avg_vol = self.cfg.get("min_avg_volume_5d", 0)
         if min_avg_vol > 0:
@@ -97,15 +151,41 @@ class StockScanner:
         self, candidates: list[dict], min_avg_vol_5d: int = 2000
     ) -> list[dict]:
         result = []
+        missing_kbar = 0
+        short_kbar = 0
+        below_avg = 0
+        debug_samples: list[str] = []
         for c in candidates:
             df = self.feed.get_kbars(c["code"], lookback_days=10)
-            if df is None or len(df) < 5:
+            if df is None:
+                missing_kbar += 1
+                _reason = ""
+                if hasattr(self.feed, "get_last_kbar_issue"):
+                    _reason = self.feed.get_last_kbar_issue(c["code"])
+                if len(debug_samples) < 8:
+                    debug_samples.append(
+                        f"{c['code']} {c.get('name','')} -> {(_reason or '無錯誤訊息')}"
+                    )
+                continue
+            if len(df) < 5:
+                short_kbar += 1
+                if len(debug_samples) < 8:
+                    debug_samples.append(
+                        f"{c['code']} {c.get('name','')} -> K棒筆數不足({len(df)}<5)"
+                    )
                 continue
             avg_vol = df["Volume"].tail(5).mean()
             if avg_vol >= min_avg_vol_5d:
                 c["avg_volume_5d"] = round(avg_vol, 0)
                 result.append(c)
-        logger.info(f"均量過濾後剩 {len(result)} 檔")
+            else:
+                below_avg += 1
+        logger.info(
+            f"均量過濾：候選 {len(candidates)} 檔 -> 通過 {len(result)} 檔 "
+            f"(K棒失敗 {missing_kbar} / 筆數不足 {short_kbar} / 均量不足 {below_avg})"
+        )
+        if debug_samples:
+            logger.info("均量過濾 debug 範例（最多8筆）:\n" + "\n".join(debug_samples))
         return result
 
     def filter_by_volatility(
