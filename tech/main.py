@@ -815,7 +815,8 @@ class TradingSystem:
         )
         max_evaluate = self.config["screener"].get("max_evaluate", 30)
         min_rs = self.config["screener"].get("min_rs_entry", 0)
-        mkt_ret = self._get_market_return_20d() if min_rs > 0 else 0.0
+        max_rs = self.config["screener"].get("max_rs_entry", 0)
+        mkt_ret = self._get_market_return_20d() if (min_rs > 0 or max_rs > 0) else 0.0
 
         code_to_name = {c["code"]: c.get("name", "") for c in candidates}
         self._code_to_name.update(code_to_name)
@@ -879,6 +880,10 @@ class TradingSystem:
                 self.logger.info(f"跳過 {code} {code_to_name.get(code,'')}：RS {rs_score:+.3f} < {min_rs}")
                 skipped_rs += 1
                 continue
+            if max_rs > 0 and rs_score > max_rs:
+                self.logger.info(f"跳過 {code} {code_to_name.get(code,'')}：RS {rs_score:+.3f} > {max_rs}（趨勢末段）")
+                skipped_rs += 1
+                continue
             # EMA20 乖離率
             ema_dev = 0.0
             if len(df) >= 20:
@@ -926,13 +931,42 @@ class TradingSystem:
             elif s.trust_streak >= 2:  score += 0.03
             return max(0.0, min(1.0, score))
 
+        # rank 參數從 config 讀取，對齊 backtest hybrid 模式
+        _rk = self.config.get("rank", {})
+        _w_conf      = _rk.get("w_conf",      0.00)
+        _w_rs        = _rk.get("w_rs",        0.26)
+        _w_dev       = _rk.get("w_dev",       0.20)
+        _w_rs_sweet  = _rk.get("w_rs_sweet",  0.29)
+        _w_breadth   = _rk.get("w_breadth",   0.10)
+        _w_chip      = _rk.get("w_chip",      0.15)
+        _rs_sweet_spot  = _rk.get("rs_sweet_spot",  0.20)
+        _rs_sweet_tol   = _rk.get("rs_sweet_tol",   0.10)
+        _rs_center      = _rk.get("rs_center",      0.05)
+        _rs_span        = _rk.get("rs_span",         0.25)
+        _dev_sweet_spot = _rk.get("dev_sweet_spot",  0.05)
+        _dev_tol        = _rk.get("dev_tol",         0.03)
+
         def _rank(s):
+            # conf
             conf  = max(0.0, min(1.0, s.confidence))
-            rs_n  = max(0.0, min(1.0, (s.rs_score - 0.05) / 0.25))          # center=5%, span=25%
-            dev_d = abs(s.ema_dev - 0.05)
-            dev_n = max(0.0, 1.0 - dev_d / 0.03) if dev_d < 0.03 else 0.0  # sweet-spot 5%±3%
+            # RS 線性分
+            rs_n  = max(0.0, min(1.0, (s.rs_score - _rs_center) / _rs_span))
+            # RS sweet-spot 分（RS 在甜蜜點附近最高分）
+            _rs_d = abs(s.rs_score - _rs_sweet_spot)
+            rs_sw = max(0.0, 1.0 - _rs_d / _rs_sweet_tol) if _rs_d < _rs_sweet_tol else 0.0
+            # EMA dev sweet-spot 分
+            dev_d = abs(s.ema_dev - _dev_sweet_spot)
+            dev_n = max(0.0, 1.0 - dev_d / _dev_tol) if dev_d < _dev_tol else 0.0
+            # breadth（live 無法直接取，給中性 0.5）
+            breadth_n = 0.5
             chip  = _chip_score(s)
-            return 0.30 * conf + 0.40 * rs_n + 0.15 * dev_n + 0.15 * chip
+            total_w = _w_conf + _w_rs + _w_dev + _w_rs_sweet + _w_breadth + _w_chip
+            if total_w <= 0:
+                return conf
+            return (
+                _w_conf * conf + _w_rs * rs_n + _w_dev * dev_n
+                + _w_rs_sweet * rs_sw + _w_breadth * breadth_n + _w_chip * chip
+            ) / total_w
         signals.sort(key=_rank, reverse=True)
         self.logger.info(
             f"評估 {evaluated} 檔 | 已持倉跳過 {skipped_pos} | "
@@ -1116,6 +1150,19 @@ class TradingSystem:
                 self.logger.info(
                     f"牛市模式：持倉上限 {self.config['risk']['max_positions']}→{_max_pos_override}"
                 )
+            # 大盤深度回撤縮倉：0050 從歷史高點跌逾 threshold 時，持倉上限收緊
+            _dd_thr = self.config.get("risk", {}).get("market_dd_threshold", 0.0)
+            _dd_max = self.config.get("risk", {}).get("market_dd_max_positions", 2)
+            if _dd_thr > 0:
+                _dd = self.market_filter.get_market_drawdown()
+                if _dd is not None and _dd >= _dd_thr:
+                    _base_max = _max_pos_override if _max_pos_override else self.config["risk"].get("max_positions", 5)
+                    _dd_capped = min(_base_max, _dd_max)
+                    if _dd_capped < _base_max:
+                        self.logger.info(
+                            f"大盤回撤 {_dd:.1%} >= {_dd_thr:.0%}，持倉上限縮至 {_dd_capped}"
+                        )
+                        _max_pos_override = _dd_capped
             _effective_pct = pos_pct if pos_pct else self.config.get("risk", {}).get("max_position_pct", 0.20)
             if not self.portfolio.can_open_position(
                 order_value,

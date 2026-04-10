@@ -100,6 +100,16 @@ class MarketFilter:
                 return True, f"0050 ATR% {atr_pct:.3f} > 上限 {max_atr:.3f}"
         return False, ""
 
+    def get_market_drawdown(self) -> float | None:
+        """計算 0050 從歷史高點的回撤幅度（0~1），無資料回傳 None。"""
+        df = self.feed.get_kbars(self.proxy_code, lookback_days=260, use_cache=True)
+        if df is None or len(df) < 20:
+            return None
+        close = df["Close"].astype(float)
+        peak = close.cummax().iloc[-1]
+        current = close.iloc[-1]
+        return float((peak - current) / peak) if peak > 0 else 0.0
+
     def allow_long(self) -> bool:
         if not self.enabled:
             return True
