@@ -44,6 +44,8 @@ from shared.standalone_feed import fetch_kbars
 from shared.news_feed import get_stock_news
 from shared.ai_analyst import analyze_news
 from shared.db import bulk_load_institutional
+from shared.chip_analysis import should_skip_chip as _should_skip_chip
+from shared.position_sizing import calc_position_pct as _calc_position_pct
 
 console = Console()
 _running = True
@@ -1099,21 +1101,10 @@ class TradingSystem:
             _chip_cfg = self.config.get("chip_filter", {})
             if _chip_cfg.get("enabled", True):
                 _margin_max = _chip_cfg.get("margin_short_ratio_max", 4.0)
-                _skip_chip  = False
-                _chip_skip_reason = ""
-                # 資券比過高 → 融資泡沫風險
-                if (signal.margin_short_ratio is not None
-                        and _margin_max > 0
-                        and signal.margin_short_ratio > _margin_max):
-                    _skip_chip = True
-                    _chip_skip_reason = f"資券比 {signal.margin_short_ratio:.1f} > {_margin_max}"
-                # 法人雙賣 → 機構出貨，不跟
-                elif (signal.foreign_net is not None and signal.trust_net is not None
-                        and signal.foreign_net < 0 and signal.trust_net < 0):
-                    _skip_chip = True
-                    _chip_skip_reason = (
-                        f"法人雙賣（外資{signal.foreign_net:+.0f}張 投信{signal.trust_net:+.0f}張）"
-                    )
+                _skip_chip, _chip_skip_reason = _should_skip_chip(
+                    signal.foreign_net, signal.trust_net,
+                    signal.margin_short_ratio, _margin_max,
+                )
                 if _skip_chip:
                     name = self._code_to_name.get(code, "")
                     self.logger.info(
@@ -1129,52 +1120,42 @@ class TradingSystem:
                     )
                     continue
 
-            # EMA 乖離動態倉位：乖離率低縮倉、高放大
-            pos_pct = None
+            # EMA 乖離 + RS 動態倉位（乘數慣例，與 config.yaml 說明一致）
             _risk_cfg = self.config.get("risk", {})
+            _base_pct    = _risk_cfg.get("max_position_pct", 0.20)
             _dev_low_thr  = _risk_cfg.get("dev_low_thr", 0.0)
             _dev_high_thr = _risk_cfg.get("dev_high_thr", 0.0)
+            _rs_high_thr  = _risk_cfg.get("rs_pos_high_thr", 0.0)
+            _rs_low_thr   = _risk_cfg.get("rs_pos_low_thr", 0.0)
+
+            _dev = 0.0
             if _dev_low_thr or _dev_high_thr:
                 _df_dev = self.feed.get_kbars(code, lookback_days=30)
                 if _df_dev is not None and len(_df_dev) >= 20:
                     _ema20 = float(_df_dev["Close"].astype(float).ewm(span=20, adjust=False).mean().iloc[-1])
                     if _ema20 > 0:
                         _dev = (price - _ema20) / _ema20
-                        _base_pct = _risk_cfg.get("max_position_pct", 0.15)
-                        if _dev_low_thr > 0 and _dev < _dev_low_thr:
-                            pos_pct = _base_pct * _risk_cfg.get("dev_low_pct", 1.0)
-                            self.logger.info(
-                                f"{code} EMA20乖離率 {_dev:.2%} < {_dev_low_thr:.2%}，"
-                                f"縮倉 {_base_pct:.2%}→{pos_pct:.2%}"
-                            )
-                        elif _dev_high_thr > 0 and _dev > _dev_high_thr:
-                            pos_pct = min(_base_pct * _risk_cfg.get("dev_high_mult", 1.0), 0.50)
-                            self.logger.info(
-                                f"{code} EMA20乖離率 {_dev:.2%} > {_dev_high_thr:.2%}，"
-                                f"放大倉位 {_base_pct:.2%}→{pos_pct:.2%}"
-                            )
 
-            # RS 強弱動態倉位（疊加在 EMA 乖離之後）
-            _rs_high_thr  = _risk_cfg.get("rs_pos_high_thr", 0.0)
-            _rs_high_mult = _risk_cfg.get("rs_pos_high_mult", 1.0)
-            _rs_low_thr   = _risk_cfg.get("rs_pos_low_thr", 0.0)
-            _rs_low_mult  = _risk_cfg.get("rs_pos_low_mult", 1.0)
-            if _rs_high_thr or _rs_low_thr:
-                _base_pct = pos_pct if pos_pct is not None else _risk_cfg.get("max_position_pct", 0.20)
-                if _rs_high_thr > 0 and signal.rs_score >= _rs_high_thr:
-                    pos_pct = min(_base_pct * _rs_high_mult, 0.50)
-                    self.logger.info(
-                        f"{code} RS {signal.rs_score:+.3f} >= {_rs_high_thr}，"
-                        f"放大倉位 {_base_pct:.2%}→{pos_pct:.2%}"
-                    )
-                elif _rs_low_thr > 0 and signal.rs_score < _rs_low_thr:
-                    pos_pct = _base_pct * _rs_low_mult
-                    self.logger.info(
-                        f"{code} RS {signal.rs_score:+.3f} < {_rs_low_thr}，"
-                        f"縮倉 {_base_pct:.2%}→{pos_pct:.2%}"
-                    )
+            pos_pct = _calc_position_pct(
+                _base_pct, _dev, signal.rs_score,
+                dev_low_thr=_dev_low_thr,
+                dev_low_mult=_risk_cfg.get("dev_low_pct", 1.0),
+                dev_high_thr=_dev_high_thr,
+                dev_high_mult=_risk_cfg.get("dev_high_mult", 1.0),
+                rs_pos_high_thr=_rs_high_thr,
+                rs_pos_high_mult=_risk_cfg.get("rs_pos_high_mult", 1.0),
+                rs_pos_low_thr=_rs_low_thr,
+                rs_pos_low_mult=_risk_cfg.get("rs_pos_low_mult", 1.0),
+            )
+            if pos_pct != _base_pct:
+                self.logger.info(
+                    f"{code} 動態倉位：EMA乖離={_dev:.2%} RS={signal.rs_score:+.3f} "
+                    f"→ {_base_pct:.2%}→{pos_pct:.2%}"
+                )
+            # 若動態計算結果等於 base，傳 None 讓 portfolio 使用預設值
+            pos_pct_arg = pos_pct if pos_pct != _base_pct else None
 
-            qty, is_odd_lot = self.portfolio.calculate_quantity(price, position_pct=pos_pct)
+            qty, is_odd_lot = self.portfolio.calculate_quantity(price, position_pct=pos_pct_arg)
             if qty <= 0:
                 continue
             order_value = price * qty * (1 if is_odd_lot else 1000)

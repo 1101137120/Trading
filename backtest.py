@@ -30,6 +30,17 @@ from shared.db import (
     DB_PATH, get_conn as _db_conn, load_kbars as _db_load_kbars,
     bulk_load_kbars as _db_bulk_load,
 )
+from shared.market_scoring import (
+    clamp01 as _clamp01, safe_float as _safe_float,
+    rs_to_score as _rs_to_score, ema_dev_to_score as _ema_dev_to_score,
+    sweet_spot_score as _sweet_spot_score, calc_rs_score as _calc_rs_score,
+)
+from shared.chip_analysis import (
+    get_chip_on_date as _get_chip_on_date_shared,
+    calc_chip_score as _calc_chip_score,
+    should_skip_chip as _should_skip_chip,
+)
+from shared.position_sizing import calc_position_pct as _calc_position_pct
 from tech.strategies.engine import StrategyEngine
 
 console = Console(record=True)
@@ -422,39 +433,7 @@ def simulate_trades(
                 _chip_by_date[_d] = _row.to_dict()
 
     def _get_chip_on_date(d) -> dict:
-        """取 d 當日或之前最近一筆籌碼資料（最多往前找 7 日）"""
-        if not _chip_by_date:
-            return {}
-        available = [k for k in _chip_by_date if k <= d]
-        if not available:
-            return {}
-        last_d = max(available)
-        if (d - last_d).days > 7:
-            return {}
-        row = _chip_by_date[last_d]
-        # 連續買超天數：取最近5個有資料的日期
-        sorted_dates = sorted(k for k in _chip_by_date if k <= d)
-        tail_dates = sorted_dates[-5:]
-        f_streak = 0
-        for _td in reversed(tail_dates):
-            if (_chip_by_date[_td].get("foreign_net") or 0) > 0:
-                f_streak += 1
-            else:
-                break
-        t_streak = 0
-        for _td in reversed(tail_dates):
-            if (_chip_by_date[_td].get("trust_net") or 0) > 0:
-                t_streak += 1
-            else:
-                break
-        return {
-            "foreign_net":        row.get("foreign_net"),
-            "trust_net":          row.get("trust_net"),
-            "margin_short_ratio": row.get("margin_short_ratio"),
-            "holding_pct":        row.get("holding_pct"),
-            "foreign_streak":     f_streak,
-            "trust_streak":       t_streak,
-        }
+        return _get_chip_on_date_shared(_chip_by_date, d)
 
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
@@ -929,25 +908,19 @@ def simulate_trades(
                         })
                     continue
 
-            # RS 以訊號日收盤計算（代表當下可觀察到的強弱）
-            # EMA trend 是短中期動能策略，用 20 根（約 1 個月）RS 過濾「現在有沒有在動」
-            # 長期 RS 與 EMA60 高度重疊，改用長期反而引入趨勢末段股票
+            # RS 以訊號日收盤計算（EMA trend 短中期動能策略用 20 根約 1 個月）
             rs_score = 0.0
             lookback = min(20, i)
-            if lookback >= 5 and df["Close"].iloc[i - lookback] > 0:
-                stock_ret = (current_price - df["Close"].iloc[i - lookback]) / df["Close"].iloc[i - lookback]
-                if _mkt_dates:
-                    pos = bisect.bisect_right(_mkt_dates, row_date) - 1
-                    past_pos = pos - lookback
-                    if pos >= 0 and past_pos >= 0:
-                        mc_now  = _mkt_closes[pos]
-                        mc_past = _mkt_closes[past_pos]
-                        mkt_ret = (mc_now - mc_past) / mc_past if mc_past > 0 else 0
-                        rs_score = stock_ret - mkt_ret
-                    else:
-                        rs_score = stock_ret
-                else:
-                    rs_score = stock_ret
+            if lookback >= 5:
+                _pos = bisect.bisect_right(_mkt_dates, row_date) - 1
+                _past_pos = _pos - lookback
+                mc_now  = _mkt_closes[_pos]  if (_mkt_dates and _pos >= 0)  else 0.0
+                mc_past = _mkt_closes[_past_pos] if (_mkt_dates and _past_pos >= 0) else 0.0
+                rs_score = _calc_rs_score(
+                    current_price,
+                    float(df["Close"].iloc[i - lookback]),
+                    mc_now, mc_past,
+                )
 
             # RS 過濾：跑輸大盤（下限）或趨勢末段（上限）皆不進場
             if min_rs_entry > 0 and rs_score < min_rs_entry:
@@ -970,15 +943,11 @@ def simulate_trades(
             # 籌碼過濾：法人雙賣 / 資券比過高
             _chip = _get_chip_on_date(row_date)
             if chip_filter:
-                _f_net = _chip.get("foreign_net")
-                _t_net = _chip.get("trust_net")
-                _mr    = _chip.get("margin_short_ratio")
-                _skip_chip_reason = None
-                if _f_net is not None and _t_net is not None and _f_net < 0 and _t_net < 0:
-                    _skip_chip_reason = f"法人雙賣(外資{_f_net:+.0f} 投信{_t_net:+.0f})"
-                elif _mr is not None and chip_margin_max > 0 and _mr > chip_margin_max:
-                    _skip_chip_reason = f"資券比過高({_mr:.1f}>{chip_margin_max})"
-                if _skip_chip_reason:
+                _skip, _skip_chip_reason = _should_skip_chip(
+                    _chip.get("foreign_net"), _chip.get("trust_net"),
+                    _chip.get("margin_short_ratio"), chip_margin_max,
+                )
+                if _skip:
                     if skipped_out is not None:
                         _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
                         skipped_out.append({"code": code, "signal_date": row_date,
@@ -1046,90 +1015,8 @@ def simulate_trades(
 # 資金模擬（含張數、實際損益）
 # ──────────────────────────────────────────────
 
-def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
-                   dev_low_thr: float = 0.03, dev_high_thr: float = 0.05,
-                   dev_low_pct: float = 0.15, dev_high_mult: float = 1.4,
-                   rs_score: float = 0.0,
-                   rs_pos_high_thr: float = 0.0, rs_pos_high_mult: float = 1.0,
-                   rs_pos_low_thr: float = 0.0,  rs_pos_low_mult: float = 1.0) -> float:
-    """
-    根據進場當下 EMA20 乖離率 + RS 強度決定倉位：
-      乖離 < dev_low_thr  → 縮倉 dev_low_pct（貼近 EMA，動能不足）
-      乖離 > dev_high_thr → 加碼 position_pct × dev_high_mult（強動能，上限 50%）
-      中間               → 標準 position_pct
-      RS > rs_pos_high_thr → 再乘 rs_pos_high_mult（強勢股加倉）
-      RS < rs_pos_low_thr  → 再乘 rs_pos_low_mult（弱勢股縮倉）
-    """
-    if dev_low_thr > 0 and ema_dev < dev_low_thr:
-        base = capital * dev_low_pct
-    elif dev_high_thr > 0 and ema_dev > dev_high_thr:
-        base = capital * min(position_pct * dev_high_mult, 0.50)
-    else:
-        base = capital * position_pct
-    # RS 強弱調整（疊加在 EMA 乖離之後）
-    if rs_pos_high_thr > 0 and rs_score >= rs_pos_high_thr:
-        base = min(base * rs_pos_high_mult, capital * 0.50)
-    elif rs_pos_low_thr > 0 and rs_score < rs_pos_low_thr:
-        base *= rs_pos_low_mult
-    return base
 
 
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
-
-
-def _safe_float(v, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _rs_to_score(rs: float, rs_center: float = 0.05, rs_span: float = 0.25) -> float:
-    if rs_span <= 0:
-        return _clamp01(rs)
-    return _clamp01((rs - rs_center) / rs_span)
-
-
-def _ema_dev_to_score(dev: float, sweet_spot: float = 0.05, tolerance: float = 0.03) -> float:
-    if tolerance <= 0:
-        return 0.0
-    distance = abs(dev - sweet_spot)
-    return _clamp01(1.0 - distance / tolerance)
-
-
-def _sweet_spot_score(v: float, sweet_spot: float, tolerance: float, default: float = 0.5) -> float:
-    if v is None:
-        return default
-    if tolerance <= 0:
-        return default
-    distance = abs(float(v) - sweet_spot)
-    return _clamp01(1.0 - distance / tolerance)
-
-
-def _calc_chip_score(chip: dict) -> float:
-    """計算籌碼綜合分數（0-1），無資料給 0.5 中性"""
-    foreign_net = chip.get("foreign_net")
-    if foreign_net is None:
-        return 0.5
-    score = 0.5
-    if foreign_net > 500:    score += 0.30
-    elif foreign_net > 100:  score += 0.15
-    elif foreign_net > 0:    score += 0.05
-    elif foreign_net < -200: score -= 0.30
-    elif foreign_net < 0:    score -= 0.10
-    trust_net = chip.get("trust_net")
-    if trust_net is not None:
-        if trust_net > 100:  score += 0.20
-        elif trust_net > 0:  score += 0.10
-        elif trust_net < 0:  score -= 0.05
-    if chip.get("foreign_streak", 0) >= 4:  score += 0.20
-    elif chip.get("foreign_streak", 0) >= 3: score += 0.12
-    elif chip.get("foreign_streak", 0) >= 2: score += 0.05
-    if chip.get("trust_streak", 0) >= 4:    score += 0.15
-    elif chip.get("trust_streak", 0) >= 3:  score += 0.08
-    elif chip.get("trust_streak", 0) >= 2:  score += 0.03
-    return max(0.0, min(1.0, score))
 
 
 def _trade_rank_score(
@@ -1382,11 +1269,17 @@ def portfolio_simulation(
             if len(active) >= _eff_max:
                 continue
 
-        alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
-                               dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult,
-                               rs_score=trade.get("rs_score", 0.0),
-                               rs_pos_high_thr=rs_pos_high_thr, rs_pos_high_mult=rs_pos_high_mult,
-                               rs_pos_low_thr=rs_pos_low_thr,   rs_pos_low_mult=rs_pos_low_mult)
+        # dev_low_pct 在此函式為絕對值（如 0.15 = 15% 資金），
+        # 轉成 calc_position_pct 的乘數後語意不變。
+        _dev_low_mult = (dev_low_pct / position_pct) if position_pct > 0 else 1.0
+        alloc = capital * _calc_position_pct(
+            position_pct, trade.get("ema_dev", 0.0),
+            rs_score=trade.get("rs_score", 0.0),
+            dev_low_thr=dev_low_thr,   dev_low_mult=_dev_low_mult,
+            dev_high_thr=dev_high_thr, dev_high_mult=dev_high_mult,
+            rs_pos_high_thr=rs_pos_high_thr, rs_pos_high_mult=rs_pos_high_mult,
+            rs_pos_low_thr=rs_pos_low_thr,   rs_pos_low_mult=rs_pos_low_mult,
+        )
         if is_pyramid:
             alloc *= pyramid_alloc_pct  # 加碼用半倉（或自訂比例）
         price = trade["entry_price"]
