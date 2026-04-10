@@ -1211,6 +1211,7 @@ def portfolio_simulation(
     rank_dev_tolerance: float = 0.03,
     rank_breadth_sweet_spot: float = 0.60,
     rank_breadth_tolerance: float = 0.12,
+    idle_0050: bool = True,              # False = 關閉閒置資金停泊 0050
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1268,7 +1269,7 @@ def portfolio_simulation(
         entry_date = trade["entry_date"]
 
         # 閒置資金停泊 0050：0050>MA20 才停泊，否則保持現金
-        if _mkt_keys and _prev_entry_date is not None and entry_date > _prev_entry_date:
+        if idle_0050 and _mkt_keys and _prev_entry_date is not None and entry_date > _prev_entry_date:
             _from_str = _prev_entry_date.strftime("%Y-%m-%d")
             _to_str   = entry_date.strftime("%Y-%m-%d")
             _i0 = bisect.bisect_right(_mkt_keys, _from_str)
@@ -1481,7 +1482,7 @@ def portfolio_simulation(
         })
 
     # 最後一筆進場到最後出場：繼續累積 0050 閒置收益
-    if _mkt_keys and _prev_entry_date is not None and active:
+    if idle_0050 and _mkt_keys and _prev_entry_date is not None and active:
         _end_date = max(pos["exit_date"] for pos in active)
         _from_str = _prev_entry_date.strftime("%Y-%m-%d")
         _to_str   = _end_date.strftime("%Y-%m-%d")
@@ -1588,6 +1589,7 @@ def build_equity_curve(
     end_str: str,
     market_daily_ret: "dict[str, float] | None" = None,
     market_above_ma: "dict[str, bool] | None" = None,
+    idle_0050: bool = True,
 ) -> pd.DataFrame:
     """
     從交易紀錄 + 日 K 棒重建每日資產淨值曲線。
@@ -1669,7 +1671,7 @@ def build_equity_curve(
             open_trades[_ti] = _meta[_ti]
 
         # 0050 停泊（作用在 idle cash = capital）
-        if market_daily_ret and _d in market_daily_ret:
+        if idle_0050 and market_daily_ret and _d in market_daily_ret:
             if market_above_ma is None or market_above_ma.get(_d, False):
                 capital += capital * market_daily_ret[_d]
 
@@ -2434,6 +2436,7 @@ def main():
         rank_dev_tolerance=args.rank_dev_tolerance,
         rank_breadth_sweet_spot=args.rank_breadth_sweet_spot,
         rank_breadth_tolerance=args.rank_breadth_tolerance,
+        idle_0050=not args.no_idle_0050,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -2451,6 +2454,7 @@ def main():
         args.start, args.end,
         market_daily_ret=_mkt_daily_ret if _mkt_daily_ret else None,
         market_above_ma=_mkt_above_ma_lag1 if _mkt_above_ma_lag1 else None,
+        idle_0050=not args.no_idle_0050,
     )
     _eq_metrics = equity_metrics(_eq_df)
 
