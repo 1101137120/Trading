@@ -9,11 +9,12 @@
   --trail-stop-bull     0.22 \
   --trail-stop-rs-bonus 0.05 \
   --trail-activation    0.02 \
-  --max-positions       5 \
+  --max-positions       6 \
   --position-pct        0.2 \
   --stocks              80 \
   --max-price           2000 \
-  --min-rs              0.05 \
+  --min-rs              0.07 \
+  --max-rs              0.40 \
   --rank-mode           hybrid \
   --rank-w-conf         0.00 \
   --rank-w-rs           0.26 \
@@ -35,6 +36,7 @@
   --time-stop-min-pct   0.05 \
   --breadth-filter \
   --breadth-min         0.50 \
+  --breadth-max         0.82 \
   --slippage            0.002 \
   --max-vol-pct         0.03 \
   --min-atr-pct         3.0 \
@@ -56,3 +58,7 @@
   --chip-filter \
   --chip-margin-max     4.0 \
   --rank-w-chip         0.15 \
+  --rs-pos-high-thr     0.15 \
+  --rs-pos-high-mult    1.80 \
+  --rs-pos-low-thr      0.07 \
+  --rs-pos-low-mult     0.80 \

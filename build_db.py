@@ -238,28 +238,33 @@ def download_kbars(
 # 主流程
 # ──────────────────────────────────────────────
 
-def _fetch_institutional(update_only: bool):
+def _fetch_institutional(update_only: bool, inst_from: str | None = None):
     """
     抓取三大法人、融資融券、外資持股資料並存入 DB。
-    - update_only=True：從上次最新日期補到今天（最多 10 天）
+    - update_only=True：從上次最新日期補到今天（增量）
     - update_only=False：補最近 252 個交易日（約 1 年）
+    - inst_from：指定起始日（覆蓋上述邏輯，補 inst_from ~ 今天的所有缺漏）
     """
     console.print("\n[dim]更新三大法人 / 融資融券 / 外資持股...[/dim]")
 
     today = date.today().strftime("%Y-%m-%d")
 
-    with get_conn() as conn:
-        latest = get_latest_inst_date(conn)
-
-    if latest is None:
-        # 首次建立：補最近 252 個交易日
-        from_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
-    elif update_only:
-        # 增量：從上次之後補到今天
-        from_date = (datetime.strptime(latest, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    if inst_from:
+        from_date = inst_from
+        console.print(f"  [dim]指定起始日：{from_date}（補齊至 {today}）[/dim]")
     else:
-        # 全量重建：補最近 252 個交易日
-        from_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+        with get_conn() as conn:
+            latest = get_latest_inst_date(conn)
+
+        if latest is None:
+            # 首次建立：補最近 252 個交易日
+            from_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+        elif update_only:
+            # 增量：從上次之後補到今天
+            from_date = (datetime.strptime(latest, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        else:
+            # 全量重建：補最近 252 個交易日
+            from_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
 
     dates = trading_days_range(from_date, today)
     if not dates:
@@ -468,6 +473,8 @@ def main():
                         help="跳過已下市股票（速度快 3–5 倍，但存活者偏差未修正）")
     parser.add_argument("--inst-only",        action="store_true",
                         help="只更新三大法人/融資融券/外資持股，不下載 K 棒（cron 日更用）")
+    parser.add_argument("--inst-from",         default=None,
+                        help="籌碼起始日（YYYY-MM-DD），配合 --inst-only 補齊歷史缺漏，例：2023-01-01")
     args = parser.parse_args()
 
     if args.stats:
@@ -475,7 +482,7 @@ def main():
         return
 
     if args.inst_only:
-        _fetch_institutional(update_only=True)
+        _fetch_institutional(update_only=not args.inst_from, inst_from=args.inst_from)
         return
 
     cmd_build(

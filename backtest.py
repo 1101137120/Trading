@@ -148,6 +148,7 @@ def build_breadth_map(
     all_kbars: dict[str, pd.DataFrame],
     ema_period: int = 20,
     min_ratio: float = 0.40,
+    max_ratio: float = 0.0,
     db_codes: list[str] | None = None,
     db_start: str | None = None,
     db_end: str | None = None,
@@ -156,6 +157,7 @@ def build_breadth_map(
     """
     逐日計算市場廣度：股票池中收盤 > EMA{ema_period} 的比例。
     比例低於 min_ratio 的交易日禁止開倉（個股環境太差）。
+    比例高於 max_ratio 的交易日禁止開倉（市場過熱，0=停用）。
     回傳 {date: bool}，True = 廣度健康可進場。
     若 return_ratio=True，回傳 {date: float}（原始廣度比例值）。
 
@@ -184,7 +186,9 @@ def build_breadth_map(
             ratio = (daily_above / daily_total.replace(0, float("nan"))).fillna(1.0)
             if return_ratio:
                 return {ts.date(): round(float(v), 4) for ts, v in ratio.items()}
-            return {ts.date(): bool(v >= min_ratio) for ts, v in ratio.items()}
+            return {ts.date(): bool(
+                v >= min_ratio and (max_ratio <= 0 or v <= max_ratio)
+            ) for ts, v in ratio.items()}
         except Exception:
             pass  # fallback 到慢路徑
 
@@ -202,7 +206,9 @@ def build_breadth_map(
     ratio = (daily_above / daily_total.replace(0, float("nan"))).fillna(1.0)
     if return_ratio:
         return {ts.date(): round(float(v), 4) for ts, v in ratio.items()}
-    return {ts.date(): bool(v >= min_ratio) for ts, v in ratio.items()}
+    return {ts.date(): bool(
+        v >= min_ratio and (max_ratio <= 0 or v <= max_ratio)
+    ) for ts, v in ratio.items()}
 
 
 def calc_benchmark(
@@ -604,10 +610,12 @@ def simulate_trades(
                         eff_trail = (trail_stop_bull_pct
                                      if (is_bull and trail_stop_bull_pct > 0)
                                      else trail_stop_pct)
-                        # 強勢個股加成：RS > 0.1 再多給一點空間
+                        # 強勢個股加成：RS > 0.1 給第一段加成，RS > 0.20 再疊第二段
                         rs = position.get("rs_score", 0.0)
                         if trail_stop_rs_bonus > 0 and rs > 0.1:
                             eff_trail += trail_stop_rs_bonus
+                        if trail_stop_rs_bonus > 0 and rs > 0.20:
+                            eff_trail += trail_stop_rs_bonus  # 超強勢再加一倍
                         trail_floor = position["peak_price"] * (1 - eff_trail)
                         if current_price <= trail_floor:
                             exit_price  = current_price * (1 - _eff_exit_slip)
@@ -1040,18 +1048,30 @@ def simulate_trades(
 
 def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
                    dev_low_thr: float = 0.03, dev_high_thr: float = 0.05,
-                   dev_low_pct: float = 0.15, dev_high_mult: float = 1.4) -> float:
+                   dev_low_pct: float = 0.15, dev_high_mult: float = 1.4,
+                   rs_score: float = 0.0,
+                   rs_pos_high_thr: float = 0.0, rs_pos_high_mult: float = 1.0,
+                   rs_pos_low_thr: float = 0.0,  rs_pos_low_mult: float = 1.0) -> float:
     """
-    根據進場當下 EMA20 乖離率決定倉位：
+    根據進場當下 EMA20 乖離率 + RS 強度決定倉位：
       乖離 < dev_low_thr  → 縮倉 dev_low_pct（貼近 EMA，動能不足）
       乖離 > dev_high_thr → 加碼 position_pct × dev_high_mult（強動能，上限 50%）
       中間               → 標準 position_pct
+      RS > rs_pos_high_thr → 再乘 rs_pos_high_mult（強勢股加倉）
+      RS < rs_pos_low_thr  → 再乘 rs_pos_low_mult（弱勢股縮倉）
     """
     if dev_low_thr > 0 and ema_dev < dev_low_thr:
-        return capital * dev_low_pct
-    if dev_high_thr > 0 and ema_dev > dev_high_thr:
-        return capital * min(position_pct * dev_high_mult, 0.50)
-    return capital * position_pct
+        base = capital * dev_low_pct
+    elif dev_high_thr > 0 and ema_dev > dev_high_thr:
+        base = capital * min(position_pct * dev_high_mult, 0.50)
+    else:
+        base = capital * position_pct
+    # RS 強弱調整（疊加在 EMA 乖離之後）
+    if rs_pos_high_thr > 0 and rs_score >= rs_pos_high_thr:
+        base = min(base * rs_pos_high_mult, capital * 0.50)
+    elif rs_pos_low_thr > 0 and rs_score < rs_pos_low_thr:
+        base *= rs_pos_low_mult
+    return base
 
 
 def _clamp01(x: float) -> float:
@@ -1212,6 +1232,12 @@ def portfolio_simulation(
     rank_breadth_sweet_spot: float = 0.60,
     rank_breadth_tolerance: float = 0.12,
     idle_0050: bool = True,              # False = 關閉閒置資金停泊 0050
+    swap_days_max: int = 0,              # 汰舊換新：持倉天數 <= 此值才可被換掉（0=停用）
+    kbars_lookup: "dict | None" = None, # {code_str: DataFrame}，換倉需要取當日收盤價
+    rs_pos_high_thr: float = 0.0,       # RS >= 此值時擴大倉位（0=停用）
+    rs_pos_high_mult: float = 1.3,      # 高 RS 倉位乘數（建議 1.2~1.5）
+    rs_pos_low_thr: float = 0.0,        # RS < 此值時縮小倉位（0=停用）
+    rs_pos_low_mult: float = 0.8,       # 低 RS 倉位乘數（建議 0.7~0.9）
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1357,7 +1383,10 @@ def portfolio_simulation(
                 continue
 
         alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
-                               dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult)
+                               dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult,
+                               rs_score=trade.get("rs_score", 0.0),
+                               rs_pos_high_thr=rs_pos_high_thr, rs_pos_high_mult=rs_pos_high_mult,
+                               rs_pos_low_thr=rs_pos_low_thr,   rs_pos_low_mult=rs_pos_low_mult)
         if is_pyramid:
             alloc *= pyramid_alloc_pct  # 加碼用半倉（或自訂比例）
         price = trade["entry_price"]
@@ -1754,10 +1783,22 @@ def main():
                         help="大盤深度回撤時允許的最大持倉數（預設 2）")
     parser.add_argument("--no-idle-0050", action="store_true", default=False,
                         help="關閉閒置資金停泊 0050（閒置資金維持現金）")
+    parser.add_argument("--swap-days", type=int, default=0,
+                        help="汰舊換新：持倉天數 <= 此值的最低 rank 持倉可被新訊號換掉（0=停用，建議 5）")
+    parser.add_argument("--rs-pos-high-thr", type=float, default=0.0,
+                        help="RS >= 此值時擴大倉位（0=停用，建議 0.15）")
+    parser.add_argument("--rs-pos-high-mult", type=float, default=1.3,
+                        help="高 RS 倉位乘數（預設 1.3 = 26%%）")
+    parser.add_argument("--rs-pos-low-thr", type=float, default=0.0,
+                        help="RS < 此值時縮小倉位（0=停用，建議 0.07）")
+    parser.add_argument("--rs-pos-low-mult", type=float, default=0.8,
+                        help="低 RS 倉位乘數（預設 0.8 = 16%%）")
     parser.add_argument("--tse-only", action="store_true", default=False,
                         help="只交易上市股（TSE），排除上櫃（OTC）")
     parser.add_argument("--breadth-filter", action="store_true", default=False,
                         help="啟用市場廣度過濾：股票池中 >EMA20 比例不足時禁止開倉")
+    parser.add_argument("--breadth-max", type=float, default=0.0,
+                        help="市場廣度上限（0=停用；建議 0.82：廣度過高=過熱，停止開倉）")
     parser.add_argument("--breadth-min", type=float, default=0.40,
                         help="廣度門檻：股票池中站上 EMA20 比例需 >= 此值才允許開倉（預設 0.40）")
     parser.add_argument("--no-log", action="store_true", default=False,
@@ -2207,19 +2248,22 @@ def main():
             _breadth_end   = end.strftime("%Y-%m-%d")
             breadth_map = build_breadth_map(
                 all_kbars, ema_period=20, min_ratio=args.breadth_min,
+                max_ratio=args.breadth_max,
                 db_codes=_breadth_codes if use_db else None,
                 db_start=_breadth_start if use_db else None,
                 db_end=_breadth_end if use_db else None,
             )
             breadth_ratio_map = build_breadth_map(
                 all_kbars, ema_period=20, min_ratio=args.breadth_min,
+                max_ratio=args.breadth_max,
                 db_codes=_breadth_codes if use_db else None,
                 db_start=_breadth_start if use_db else None,
                 db_end=_breadth_end if use_db else None,
                 return_ratio=True,
             )
         blocked = sum(1 for v in breadth_map.values() if not v)
-        console.print(f"[dim]廣度過濾：門檻 {args.breadth_min*100:.0f}%，共 {blocked} 個交易日禁止開倉[/dim]")
+        _breadth_max_str = f" / 上限 {args.breadth_max*100:.0f}%" if args.breadth_max > 0 else ""
+        console.print(f"[dim]廣度過濾：下限 {args.breadth_min*100:.0f}%{_breadth_max_str}，共 {blocked} 個交易日禁止開倉[/dim]")
 
     # ── 配息資料載入（若 DB 有 dividends 表且未停用）──
     _all_dividends: dict = {}
@@ -2437,6 +2481,12 @@ def main():
         rank_breadth_sweet_spot=args.rank_breadth_sweet_spot,
         rank_breadth_tolerance=args.rank_breadth_tolerance,
         idle_0050=not args.no_idle_0050,
+        swap_days_max=args.swap_days,
+        kbars_lookup=all_kbars if args.swap_days > 0 else None,
+        rs_pos_high_thr=args.rs_pos_high_thr,
+        rs_pos_high_mult=args.rs_pos_high_mult,
+        rs_pos_low_thr=args.rs_pos_low_thr,
+        rs_pos_low_mult=args.rs_pos_low_mult,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
