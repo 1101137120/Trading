@@ -43,7 +43,10 @@ def get_conn(db_path: Path = DB_PATH, read_only: bool = False):
             conn.commit()
     except Exception:
         if not read_only:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise
     finally:
         conn.close()

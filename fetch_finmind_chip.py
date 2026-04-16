@@ -126,10 +126,11 @@ def _parse_holding(rows: list[dict], code: str) -> list[dict]:
         foreign = row.get("ForeignInvestmentShares", 0) or 0
         holding_pct = round(foreign / total * 100, 2) if total > 0 else None
         out.append({
-            "date":        row["date"],
-            "code":        code,
-            "holding_pct": holding_pct,
-            "retail_pct":  None,
+            "date":           row["date"],
+            "code":           code,
+            "foreign_shares": foreign,
+            "holding_pct":    holding_pct,
+            "retail_pct":     None,
         })
     return out
 
@@ -226,14 +227,15 @@ def main():
     ) as progress:
         task = progress.add_task("籌碼補齊", total=total)
 
-        with get_conn(DB_PATH, read_only=True) as ro_conn:
-            for code in codes:
+        for code in codes:
                 for year in years:
                     progress.update(task, advance=1, description=f"[dim]{code} {year}[/dim]")
 
-                    if skip and _already_fetched(ro_conn, code, year):
-                        skip_cnt += 1
-                        continue
+                    if skip:
+                        with get_conn(DB_PATH, read_only=True) as ro_conn:
+                            if _already_fetched(ro_conn, code, year):
+                                skip_cnt += 1
+                                continue
 
                     ni, nm, nh = fetch_year(args.token, code, year)
                     done += 1

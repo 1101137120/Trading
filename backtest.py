@@ -30,17 +30,6 @@ from shared.db import (
     DB_PATH, get_conn as _db_conn, load_kbars as _db_load_kbars,
     bulk_load_kbars as _db_bulk_load,
 )
-from shared.market_scoring import (
-    clamp01 as _clamp01, safe_float as _safe_float,
-    rs_to_score as _rs_to_score, ema_dev_to_score as _ema_dev_to_score,
-    sweet_spot_score as _sweet_spot_score, calc_rs_score as _calc_rs_score,
-)
-from shared.chip_analysis import (
-    get_chip_on_date as _get_chip_on_date_shared,
-    calc_chip_score as _calc_chip_score,
-    should_skip_chip as _should_skip_chip,
-)
-from shared.position_sizing import calc_position_pct as _calc_position_pct
 from tech.strategies.engine import StrategyEngine
 
 console = Console(record=True)
@@ -392,7 +381,7 @@ def simulate_trades(
     tax_stock_rate: float = 0.003,
     tax_etf_rate: float = 0.001,
     stock_dividends: "dict | None" = None,   # {ex_date: cash_div_per_share (NT/股)}
-    chip_df: "pd.DataFrame | None" = None,  # 該股的法人/融資日頻資料（bulk_load_institutional 結果）
+    chip_df: "pd.DataFrame | None" = None,  # 該股的法人/融資日頻資料
     chip_filter: bool = False,               # True=啟用法人雙賣/資券比過高過濾
     chip_margin_max: float = 4.0,           # 資券比上限（0=停用）
 ) -> list[dict]:
@@ -433,7 +422,38 @@ def simulate_trades(
                 _chip_by_date[_d] = _row.to_dict()
 
     def _get_chip_on_date(d) -> dict:
-        return _get_chip_on_date_shared(_chip_by_date, d)
+        """取 d 當日或之前最近一筆籌碼資料（最多往前找 7 日）"""
+        if not _chip_by_date:
+            return {}
+        available = [k for k in _chip_by_date if k <= d]
+        if not available:
+            return {}
+        last_d = max(available)
+        if (d - last_d).days > 7:
+            return {}
+        row = _chip_by_date[last_d]
+        sorted_dates = sorted(k for k in _chip_by_date if k <= d)
+        tail_dates = sorted_dates[-5:]
+        f_streak = 0
+        for _td in reversed(tail_dates):
+            if (_chip_by_date[_td].get("foreign_net") or 0) > 0:
+                f_streak += 1
+            else:
+                break
+        t_streak = 0
+        for _td in reversed(tail_dates):
+            if (_chip_by_date[_td].get("trust_net") or 0) > 0:
+                t_streak += 1
+            else:
+                break
+        return {
+            "foreign_net":        row.get("foreign_net"),
+            "trust_net":          row.get("trust_net"),
+            "margin_short_ratio": row.get("margin_short_ratio"),
+            "holding_pct":        row.get("holding_pct"),
+            "foreign_streak":     f_streak,
+            "trust_streak":       t_streak,
+        }
 
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
@@ -589,12 +609,10 @@ def simulate_trades(
                         eff_trail = (trail_stop_bull_pct
                                      if (is_bull and trail_stop_bull_pct > 0)
                                      else trail_stop_pct)
-                        # 強勢個股加成：RS > 0.1 給第一段加成，RS > 0.20 再疊第二段
+                        # 強勢個股加成：RS > 0.1 再多給一點空間
                         rs = position.get("rs_score", 0.0)
                         if trail_stop_rs_bonus > 0 and rs > 0.1:
                             eff_trail += trail_stop_rs_bonus
-                        if trail_stop_rs_bonus > 0 and rs > 0.20:
-                            eff_trail += trail_stop_rs_bonus  # 超強勢再加一倍
                         trail_floor = position["peak_price"] * (1 - eff_trail)
                         if current_price <= trail_floor:
                             exit_price  = current_price * (1 - _eff_exit_slip)
@@ -696,13 +714,6 @@ def simulate_trades(
                     "rs_score": position.get("rs_score", 0.0),
                     "ema_dev": position.get("ema_dev", 0.0),
                     "day_volume": position.get("day_volume", 0),
-                    "foreign_net":        position.get("foreign_net"),
-                    "trust_net":          position.get("trust_net"),
-                    "foreign_streak":     position.get("foreign_streak", 0),
-                    "trust_streak":       position.get("trust_streak", 0),
-                    "margin_short_ratio": position.get("margin_short_ratio"),
-                    "holding_pct":        position.get("holding_pct"),
-                    "chip_score":         position.get("chip_score"),
                 })
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
@@ -908,19 +919,25 @@ def simulate_trades(
                         })
                     continue
 
-            # RS 以訊號日收盤計算（EMA trend 短中期動能策略用 20 根約 1 個月）
+            # RS 以訊號日收盤計算（代表當下可觀察到的強弱）
+            # EMA trend 是短中期動能策略，用 20 根（約 1 個月）RS 過濾「現在有沒有在動」
+            # 長期 RS 與 EMA60 高度重疊，改用長期反而引入趨勢末段股票
             rs_score = 0.0
             lookback = min(20, i)
-            if lookback >= 5:
-                _pos = bisect.bisect_right(_mkt_dates, row_date) - 1
-                _past_pos = _pos - lookback
-                mc_now  = _mkt_closes[_pos]  if (_mkt_dates and _pos >= 0)  else 0.0
-                mc_past = _mkt_closes[_past_pos] if (_mkt_dates and _past_pos >= 0) else 0.0
-                rs_score = _calc_rs_score(
-                    current_price,
-                    float(df["Close"].iloc[i - lookback]),
-                    mc_now, mc_past,
-                )
+            if lookback >= 5 and df["Close"].iloc[i - lookback] > 0:
+                stock_ret = (current_price - df["Close"].iloc[i - lookback]) / df["Close"].iloc[i - lookback]
+                if _mkt_dates:
+                    pos = bisect.bisect_right(_mkt_dates, row_date) - 1
+                    past_pos = pos - lookback
+                    if pos >= 0 and past_pos >= 0:
+                        mc_now  = _mkt_closes[pos]
+                        mc_past = _mkt_closes[past_pos]
+                        mkt_ret = (mc_now - mc_past) / mc_past if mc_past > 0 else 0
+                        rs_score = stock_ret - mkt_ret
+                    else:
+                        rs_score = stock_ret
+                else:
+                    rs_score = stock_ret
 
             # RS 過濾：跑輸大盤（下限）或趨勢末段（上限）皆不進場
             if min_rs_entry > 0 and rs_score < min_rs_entry:
@@ -943,11 +960,15 @@ def simulate_trades(
             # 籌碼過濾：法人雙賣 / 資券比過高
             _chip = _get_chip_on_date(row_date)
             if chip_filter:
-                _skip, _skip_chip_reason = _should_skip_chip(
-                    _chip.get("foreign_net"), _chip.get("trust_net"),
-                    _chip.get("margin_short_ratio"), chip_margin_max,
-                )
-                if _skip:
+                _f_net = _chip.get("foreign_net")
+                _t_net = _chip.get("trust_net")
+                _mr    = _chip.get("margin_short_ratio")
+                _skip_chip_reason = None
+                if _f_net is not None and _t_net is not None and _f_net < 0 and _t_net < 0:
+                    _skip_chip_reason = f"法人雙賣(外資{_f_net:+.0f} 投信{_t_net:+.0f})"
+                elif _mr is not None and chip_margin_max > 0 and _mr > chip_margin_max:
+                    _skip_chip_reason = f"資券比過高({_mr:.1f}>{chip_margin_max})"
+                if _skip_chip_reason:
                     if skipped_out is not None:
                         _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
                         skipped_out.append({"code": code, "signal_date": row_date,
@@ -1002,10 +1023,6 @@ def simulate_trades(
                 "foreign_net":        _chip.get("foreign_net"),
                 "trust_net":          _chip.get("trust_net"),
                 "foreign_streak":     _chip.get("foreign_streak", 0),
-                "trust_streak":       _chip.get("trust_streak", 0),
-                "margin_short_ratio": _chip.get("margin_short_ratio"),
-                "holding_pct":        _chip.get("holding_pct"),
-                "chip_score":         _calc_chip_score(_chip),
             }
 
     return trades
@@ -1015,8 +1032,63 @@ def simulate_trades(
 # 資金模擬（含張數、實際損益）
 # ──────────────────────────────────────────────
 
+def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
+                   dev_low_thr: float = 0.03, dev_high_thr: float = 0.05,
+                   dev_low_pct: float = 0.15, dev_high_mult: float = 1.4,
+                   rs_score: float = 0.0,
+                   rs_pos_high_thr: float = 0.0, rs_pos_high_mult: float = 1.3,
+                   rs_pos_low_thr: float = 0.0,  rs_pos_low_mult: float = 0.8) -> float:
+    """
+    根據進場當下 EMA20 乖離率決定倉位：
+      乖離 < dev_low_thr  → 縮倉 dev_low_pct（貼近 EMA，動能不足）
+      乖離 > dev_high_thr → 加碼 position_pct × dev_high_mult（強動能，上限 50%）
+      中間               → 標準 position_pct
+    可選 RS 調倉：RS >= rs_pos_high_thr 加倉，RS < rs_pos_low_thr 縮倉
+    """
+    if dev_low_thr > 0 and ema_dev < dev_low_thr:
+        base = capital * dev_low_pct
+    elif dev_high_thr > 0 and ema_dev > dev_high_thr:
+        base = capital * min(position_pct * dev_high_mult, 0.50)
+    else:
+        base = capital * position_pct
+    if rs_pos_high_thr > 0 and rs_score >= rs_pos_high_thr:
+        base = min(base * rs_pos_high_mult, capital * 0.50)
+    elif rs_pos_low_thr > 0 and rs_score < rs_pos_low_thr:
+        base *= rs_pos_low_mult
+    return base
 
 
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _rs_to_score(rs: float, rs_center: float = 0.05, rs_span: float = 0.25) -> float:
+    if rs_span <= 0:
+        return _clamp01(rs)
+    return _clamp01((rs - rs_center) / rs_span)
+
+
+def _ema_dev_to_score(dev: float, sweet_spot: float = 0.05, tolerance: float = 0.03) -> float:
+    if tolerance <= 0:
+        return 0.0
+    distance = abs(dev - sweet_spot)
+    return _clamp01(1.0 - distance / tolerance)
+
+
+def _sweet_spot_score(v: float, sweet_spot: float, tolerance: float, default: float = 0.5) -> float:
+    if v is None:
+        return default
+    if tolerance <= 0:
+        return default
+    distance = abs(float(v) - sweet_spot)
+    return _clamp01(1.0 - distance / tolerance)
 
 
 def _trade_rank_score(
@@ -1099,9 +1171,6 @@ def portfolio_simulation(
     market_above_ma: dict | None = None,     # {date_str: bool}，True = 0050>MA20，可停泊
     bull_max_positions: int = 0,             # 牛市（MA20>MA60）時允許更多持倉（0=停用）
     market_bull_dates: dict | None = None,   # {date_str: bool}，True = MA20>MA60
-    market_dd_threshold: float = 0.0,        # 0050 回撤超過此值時縮倉（0=停用）
-    market_dd_max_positions: int = 2,        # 大盤深度回撤時最大持倉數
-    market_dd_by_date: dict | None = None,   # {date_str: drawdown_pct}，預算的 0050 rolling DD
     odd_lot_penalty_pct: float = 0.003,      # 零股額外執行成本（買賣各 0.3%）
     rank_mode: str = "confidence",
     rank_w_conf: float = 0.35,
@@ -1118,13 +1187,16 @@ def portfolio_simulation(
     rank_dev_tolerance: float = 0.03,
     rank_breadth_sweet_spot: float = 0.60,
     rank_breadth_tolerance: float = 0.12,
+    market_dd_threshold: float = 0.0,        # 0050 回撤超過此值時縮倉（0=停用）
+    market_dd_max_positions: int = 2,        # 大盤深度回撤時最大持倉數
+    market_dd_by_date: dict | None = None,   # {date_str: drawdown_pct}
     idle_0050: bool = True,              # False = 關閉閒置資金停泊 0050
-    swap_days_max: int = 0,              # 汰舊換新：持倉天數 <= 此值才可被換掉（0=停用）
-    kbars_lookup: "dict | None" = None, # {code_str: DataFrame}，換倉需要取當日收盤價
+    swap_days_max: int = 0,              # 汰舊換新（預留，未實作）
+    kbars_lookup: "dict | None" = None, # 換倉用 K 棒查詢（預留）
     rs_pos_high_thr: float = 0.0,       # RS >= 此值時擴大倉位（0=停用）
-    rs_pos_high_mult: float = 1.3,      # 高 RS 倉位乘數（建議 1.2~1.5）
+    rs_pos_high_mult: float = 1.3,      # 高 RS 倉位乘數
     rs_pos_low_thr: float = 0.0,        # RS < 此值時縮小倉位（0=停用）
-    rs_pos_low_mult: float = 0.8,       # 低 RS 倉位乘數（建議 0.7~0.9）
+    rs_pos_low_mult: float = 0.8,       # 低 RS 倉位乘數
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1261,25 +1333,19 @@ def portfolio_simulation(
             _eff_max   = (bull_max_positions
                           if (bull_max_positions > 0 and _is_bull)
                           else max_positions)
-            # 大盤深度回撤縮倉：0050 從高點跌逾 threshold 時，持倉上限收緊
-            if (market_dd_threshold > 0 and market_dd_by_date is not None):
+            # 大盤深度回撤縮倉
+            if market_dd_threshold > 0 and market_dd_by_date is not None:
                 _mkt_dd = market_dd_by_date.get(_entry_ds, 0.0)
                 if _mkt_dd >= market_dd_threshold:
                     _eff_max = min(_eff_max, market_dd_max_positions)
             if len(active) >= _eff_max:
                 continue
 
-        # dev_low_pct 在此函式為絕對值（如 0.15 = 15% 資金），
-        # 轉成 calc_position_pct 的乘數後語意不變。
-        _dev_low_mult = (dev_low_pct / position_pct) if position_pct > 0 else 1.0
-        alloc = capital * _calc_position_pct(
-            position_pct, trade.get("ema_dev", 0.0),
-            rs_score=trade.get("rs_score", 0.0),
-            dev_low_thr=dev_low_thr,   dev_low_mult=_dev_low_mult,
-            dev_high_thr=dev_high_thr, dev_high_mult=dev_high_mult,
-            rs_pos_high_thr=rs_pos_high_thr, rs_pos_high_mult=rs_pos_high_mult,
-            rs_pos_low_thr=rs_pos_low_thr,   rs_pos_low_mult=rs_pos_low_mult,
-        )
+        alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
+                               dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult,
+                               rs_score=trade.get("rs_score", 0.0),
+                               rs_pos_high_thr=rs_pos_high_thr, rs_pos_high_mult=rs_pos_high_mult,
+                               rs_pos_low_thr=rs_pos_low_thr,   rs_pos_low_mult=rs_pos_low_mult)
         if is_pyramid:
             alloc *= pyramid_alloc_pct  # 加碼用半倉（或自訂比例）
         price = trade["entry_price"]
@@ -1368,6 +1434,7 @@ def portfolio_simulation(
             rank_w_dev=rank_w_dev,
             rank_w_rs_sweet=rank_w_rs_sweet,
             rank_w_breadth=rank_w_breadth,
+            rank_w_chip=rank_w_chip,
             rank_rs_center=rank_rs_center,
             rank_rs_span=rank_rs_span,
             rank_rs_sweet_spot=rank_rs_sweet_spot,
@@ -1681,19 +1748,19 @@ def main():
     parser.add_argument("--rs-pos-high-thr", type=float, default=0.0,
                         help="RS >= 此值時擴大倉位（0=停用，建議 0.15）")
     parser.add_argument("--rs-pos-high-mult", type=float, default=1.3,
-                        help="高 RS 倉位乘數（預設 1.3 = 26%%）")
+                        help="高 RS 倉位乘數（預設 1.3）")
     parser.add_argument("--rs-pos-low-thr", type=float, default=0.0,
                         help="RS < 此值時縮小倉位（0=停用，建議 0.07）")
     parser.add_argument("--rs-pos-low-mult", type=float, default=0.8,
-                        help="低 RS 倉位乘數（預設 0.8 = 16%%）")
+                        help="低 RS 倉位乘數（預設 0.8）")
     parser.add_argument("--tse-only", action="store_true", default=False,
                         help="只交易上市股（TSE），排除上櫃（OTC）")
     parser.add_argument("--breadth-filter", action="store_true", default=False,
                         help="啟用市場廣度過濾：股票池中 >EMA20 比例不足時禁止開倉")
-    parser.add_argument("--breadth-max", type=float, default=0.0,
-                        help="市場廣度上限（0=停用；建議 0.82：廣度過高=過熱，停止開倉）")
     parser.add_argument("--breadth-min", type=float, default=0.40,
                         help="廣度門檻：股票池中站上 EMA20 比例需 >= 此值才允許開倉（預設 0.40）")
+    parser.add_argument("--breadth-max", type=float, default=0.0,
+                        help="市場廣度上限（0=停用；建議 0.82：廣度過高=過熱，停止開倉）")
     parser.add_argument("--no-log", action="store_true", default=False,
                         help="停用回測 log 記錄（預設會 append 到 backtest_history.md）")
     parser.add_argument("--log-file", type=str, default="backtest_history.md",
@@ -2271,62 +2338,62 @@ def main():
     s = summarize(all_trades)
 
     # ── 0050 日報酬 + MA20 訊號（供閒置資金輪動）──
-    # 停泊報酬使用原始收盤日報酬；訊號採 lag1 以避免 look-ahead。
     _mkt_daily_ret: dict[str, float] = {}
     _mkt_above_ma: dict[str, bool] = {}   # True = 0050 > MA20，可停泊
     _mkt_bull_dates: dict[str, bool] = {}  # True = 0050 MA20 > MA60（牛市）
     try:
-            if use_db:
-                import duckdb as _ddb_pre
-                _con_pre = _ddb_pre.connect("data/stocks.db", read_only=True)
-                _mkt_pre = _con_pre.execute(
-                    "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
-                ).df()
-                _con_pre.close()
-                _mkt_pre_d = [str(d)[:10] for d in _mkt_pre["date"].values]
-                # 原始收盤價（未調整）供停泊交易記錄顯示用
-                _mkt_raw_c = _mkt_pre["close"].values.astype(float)
-                _mkt_raw_lut: dict[str, float] = dict(zip(_mkt_pre_d, _mkt_raw_c))
-                # adjust_splits 消除除權造成的單日暴跌（如 2009-01-02 -43%）
-                _mkt_adj_df = adjust_splits(
-                    pd.DataFrame({"Close": _mkt_raw_c.copy()}),
-                    threshold=0.10,
-                )
-                _mkt_pre_c = _mkt_adj_df["Close"].values.astype(float)
-                for _ii in range(1, len(_mkt_pre_d)):
-                    if _mkt_pre_c[_ii - 1] > 0:
-                        _mkt_daily_ret[_mkt_pre_d[_ii]] = float(
-                            _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
-                        )
-                # MA20 / MA60 訊號（用調整後價格）
-                _ma_period = args.market_ma  # 與大盤過濾器一致
-                for _ii in range(len(_mkt_pre_d)):
-                    if _ii < _ma_period:
-                        continue
-                    _ma = float(_mkt_pre_c[_ii - _ma_period:_ii].mean())
-                    _mkt_above_ma[_mkt_pre_d[_ii]] = bool(_mkt_pre_c[_ii] > _ma)
-                    if _ii >= 60:
-                        _ma60v = float(_mkt_pre_c[_ii - 60:_ii].mean())
-                        _mkt_bull_dates[_mkt_pre_d[_ii]] = bool(_ma > _ma60v)
-            elif market_df is not None and "ts" in market_df.columns:
-                _mdf = market_df.sort_values("ts")
-                _mdf_adj = adjust_splits(
-                    _mdf[["Close"]].reset_index(drop=True), threshold=0.10
-                )
-                _mdf_c = _mdf_adj["Close"].values.astype(float)
-                _mdf_d = _mdf["ts"].dt.strftime("%Y-%m-%d").values
-                for _ii in range(1, len(_mdf_d)):
-                    if _mdf_c[_ii - 1] > 0:
-                        _mkt_daily_ret[_mdf_d[_ii]] = float(_mdf_c[_ii] / _mdf_c[_ii - 1] - 1)
-                _ma_period = args.market_ma
-                for _ii in range(max(_ma_period, 60), len(_mdf_d)):
-                    _ma = float(_mdf_c[_ii - _ma_period:_ii].mean())
-                    _mkt_above_ma[_mdf_d[_ii]] = bool(_mdf_c[_ii] > _ma)
-                    _ma60v = float(_mdf_c[_ii - 60:_ii].mean())
-                    _mkt_bull_dates[_mdf_d[_ii]] = bool(_ma > _ma60v)
+        if use_db:
+            import duckdb as _ddb_pre
+            _con_pre = _ddb_pre.connect("data/stocks.db", read_only=True)
+            _mkt_pre = _con_pre.execute(
+                "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
+            ).df()
+            _con_pre.close()
+            _mkt_pre_d = [str(d)[:10] for d in _mkt_pre["date"].values]
+            # 原始收盤價（未調整）供停泊交易記錄顯示用
+            _mkt_raw_c = _mkt_pre["close"].values.astype(float)
+            _mkt_raw_lut: dict[str, float] = dict(zip(_mkt_pre_d, _mkt_raw_c))
+            # adjust_splits 消除除權造成的單日暴跌（如 2009-01-02 -43%）
+            _mkt_adj_df = adjust_splits(
+                pd.DataFrame({"Close": _mkt_raw_c.copy()}),
+                threshold=0.10,
+            )
+            _mkt_pre_c = _mkt_adj_df["Close"].values.astype(float)
+            for _ii in range(1, len(_mkt_pre_d)):
+                if _mkt_pre_c[_ii - 1] > 0:
+                    _mkt_daily_ret[_mkt_pre_d[_ii]] = float(
+                        _mkt_pre_c[_ii] / _mkt_pre_c[_ii - 1] - 1
+                    )
+            # MA20 / MA60 訊號（用調整後價格）
+            _ma_period = args.market_ma  # 與大盤過濾器一致
+            for _ii in range(len(_mkt_pre_d)):
+                if _ii < _ma_period:
+                    continue
+                _ma = float(_mkt_pre_c[_ii - _ma_period:_ii].mean())
+                _mkt_above_ma[_mkt_pre_d[_ii]] = bool(_mkt_pre_c[_ii] > _ma)
+                if _ii >= 60:
+                    _ma60v = float(_mkt_pre_c[_ii - 60:_ii].mean())
+                    _mkt_bull_dates[_mkt_pre_d[_ii]] = bool(_ma > _ma60v)
+        elif market_df is not None and "ts" in market_df.columns:
+            _mdf = market_df.sort_values("ts")
+            _mdf_adj = adjust_splits(
+                _mdf[["Close"]].reset_index(drop=True), threshold=0.10
+            )
+            _mdf_c = _mdf_adj["Close"].values.astype(float)
+            _mdf_d = _mdf["ts"].dt.strftime("%Y-%m-%d").values
+            for _ii in range(1, len(_mdf_d)):
+                if _mdf_c[_ii - 1] > 0:
+                    _mkt_daily_ret[_mdf_d[_ii]] = float(_mdf_c[_ii] / _mdf_c[_ii - 1] - 1)
+            _ma_period = args.market_ma
+            for _ii in range(max(_ma_period, 60), len(_mdf_d)):
+                _ma = float(_mdf_c[_ii - _ma_period:_ii].mean())
+                _mkt_above_ma[_mdf_d[_ii]] = bool(_mdf_c[_ii] > _ma)
+                _ma60v = float(_mdf_c[_ii - 60:_ii].mean())
+                _mkt_bull_dates[_mdf_d[_ii]] = bool(_ma > _ma60v)
     except Exception:
-            pass
+        pass
 
+    # lag1：停泊訊號用前一日的 MA20 判斷（避免 lookahead）
     _mkt_above_ma_lag1: dict[str, bool] = {}
     if _mkt_above_ma:
         _prev = False
@@ -2884,11 +2951,6 @@ def main():
         "pyramid_gain2":        args.pyramid_gain2,
         "pyramid_rs_min":       args.pyramid_rs_min,
         "pyramid_alloc":        args.pyramid_alloc,
-        "rank_w_chip":          args.rank_w_chip,
-        "chip_filter":          args.chip_filter,
-        "chip_margin_max":      args.chip_margin_max,
-        "market_dd_threshold":  args.market_dd_threshold,
-        "market_dd_max_pos":    args.market_dd_max_positions,
     }
 
     # ── 自動時間戳路徑（--output-csv 預設值時才自動命名）──
@@ -2965,31 +3027,6 @@ def main():
                 .astype(int)
             )
             csv_df.loc[_real, "signal_rank_metric"] = _rank_col
-
-        # ── 錯失標的（--show-skipped）追加進 CSV ──
-        if args.show_skipped and all_skipped_signals is not None:
-            _taken_keys = {(t["code"], t["entry_date"]) for t in psim["taken_trades"]}
-            _pos_skipped = [
-                {**t, "skip_reason": "倉位已滿", "status": "錯失"}
-                for t in all_trades
-                if (t["code"], t["entry_date"]) not in _taken_keys
-            ]
-            _sig_skipped = [{**m, "status": "錯失"} for m in all_skipped_signals]
-            _all_missed  = _sig_skipped + _pos_skipped
-            if _all_missed:
-                _missed_df = pd.DataFrame(_all_missed)
-                # 確保 skip_reason / signal_date 保留在主表
-                for _extra in ("skip_reason", "signal_date"):
-                    if _extra not in csv_df.columns:
-                        csv_df[_extra] = ""
-                # 對齊欄位（兩邊取聯集）
-                _all_cols = list(csv_df.columns) + [c for c in _missed_df.columns if c not in csv_df.columns]
-                for _col in _all_cols:
-                    if _col not in csv_df.columns:
-                        csv_df[_col] = ""
-                    if _col not in _missed_df.columns:
-                        _missed_df[_col] = ""
-                csv_df = pd.concat([csv_df[_all_cols], _missed_df[_all_cols]], ignore_index=True)
 
         for _k, _v in _run_params.items():
             csv_df[_k] = _v
