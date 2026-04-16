@@ -1903,6 +1903,8 @@ def main():
                         help="顯示被過濾掉但假設持有會高報酬的標的（大盤/廣度/RS/冷卻過濾）")
     parser.add_argument("--output-csv", type=str, default="backtest_result.csv",
                         help="CSV 輸出路徑（預設 backtest_result.csv）")
+    parser.add_argument("--skipped-csv", type=str, default="",
+                        help="將跳過訊號（含倉位已滿）存入此 CSV；需同時加 --show-skipped")
     args = parser.parse_args()
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
@@ -3125,6 +3127,18 @@ def main():
                 )
             else:
                 console.print("[dim]所有跳過的訊號假設持有均無法獲利[/dim]")
+
+        # 存跳過 CSV
+        if args.skipped_csv and all_missed:
+            _sk_df = pd.DataFrame(all_missed)
+            _sk_cols = [c for c in [
+                "code", "name", "market", "signal_date", "entry_date",
+                "skip_reason", "entry_price", "exit_price",
+                "pnl_pct", "max_gain_pct", "hold_days", "exit_reason",
+                "strategy", "rs_score", "ema_dev",
+            ] if c in _sk_df.columns]
+            _sk_df[_sk_cols].to_csv(args.skipped_csv, index=False)
+            console.print(f"[dim]跳過訊號已存至 {args.skipped_csv}（{len(_sk_df)} 筆）[/dim]")
 
     # ════════════════════════════════════════
     # 11. 回測 log（append）
