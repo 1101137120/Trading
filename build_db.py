@@ -21,6 +21,7 @@ import time
 import random
 import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, date, timedelta
 from pathlib import Path
 
@@ -284,16 +285,33 @@ def _fetch_institutional(update_only: bool, inst_from: str | None = None):
     ) as progress:
         task = progress.add_task("法人/融資/外資", total=len(dates))
 
+        import sys as _sys
+
+        # 預先載入已有資料的日期，跳過不重抓
+        with get_conn() as conn:
+            _existing = set(r[0] for r in conn.execute(
+                "SELECT DISTINCT date FROM institutional_net"
+            ).fetchall())
+        print(f"[LOG] 已有 {len(_existing)} 個交易日資料，跳過不重抓", flush=True)
+        print(f"[LOG] 需抓取 {len(dates) - sum(1 for d in dates if d in _existing)} 個交易日", flush=True)
+
         for idx, d_str in enumerate(dates):
             progress.update(task, advance=1, description=f"[dim]{d_str}[/dim]")
 
+            # 已有資料直接跳過
+            if d_str in _existing:
+                skip += 1
+                continue
+
             inst   = fetch_institutional_net(d_str)
+            time.sleep(2.0)
             margin = fetch_margin_balance(d_str)
+            time.sleep(2.0)
             fhold  = fetch_foreign_holding(d_str)
 
             if not inst and not margin and not fhold:
                 skip += 1
-                time.sleep(0.5)
+                time.sleep(1.0)
                 continue
 
             with get_conn() as conn:
@@ -305,13 +323,21 @@ def _fetch_institutional(update_only: bool, inst_from: str | None = None):
                     upsert_foreign_holding(list(fhold.values()), conn)
                 conn.commit()
             ok += 1
-            # 每 20 天暫停 30 秒，避免 TWSE IP 封鎖
-            if (idx + 1) % 20 == 0:
-                progress.update(task, description="[yellow]防封鎖暫停 30s...[/yellow]")
-                time.sleep(30)
-            else:
-                time.sleep(1.5)
 
+            # 每 50 筆 log 一次進度
+            if ok % 50 == 0:
+                pct = (idx + 1) / len(dates) * 100
+                print(f"[LOG] {d_str} | 進度 {idx+1}/{len(dates)} ({pct:.1f}%) | 已寫入 {ok} 天 | 跳過 {skip} 天", flush=True)
+
+            # 每 10 天暫停 90 秒，避免 TWSE IP 封鎖
+            if ok % 10 == 0:
+                print(f"[LOG] 防封鎖暫停 90s... (已完成 {ok} 天)", flush=True)
+                progress.update(task, description="[yellow]防封鎖暫停 90s...[/yellow]")
+                time.sleep(90)
+            else:
+                time.sleep(4.0)
+
+    print(f"[LOG] 完成！已寫入 {ok} 天，跳過 {skip} 天", flush=True)
     console.print(f"  完成：[green]{ok}[/green] 日有資料，{skip} 日無資料（假日/休市）")
 
 

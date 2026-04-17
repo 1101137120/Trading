@@ -1020,9 +1020,10 @@ def simulate_trades(
                 "accumulated_div": 0.0,       # 持倉期間累計配息（NT/股）
                 "market_breadth_at_entry": round(_mkt_breadth_entry, 4) if _mkt_breadth_entry == _mkt_breadth_entry else "",
                 "market_rs_at_entry": _mkt_rs_entry if _mkt_rs_entry == _mkt_rs_entry else "",
-                "foreign_net":        _chip.get("foreign_net"),
-                "trust_net":          _chip.get("trust_net"),
-                "foreign_streak":     _chip.get("foreign_streak", 0),
+                "foreign_net":          _chip.get("foreign_net"),
+                "trust_net":            _chip.get("trust_net"),
+                "margin_short_ratio":   _chip.get("margin_short_ratio"),
+                "foreign_streak":       _chip.get("foreign_streak", 0),
             }
 
     return trades
@@ -1870,6 +1871,8 @@ def main():
                         help="ATR%% 下限：進場時 ATR/price 低於此值視為低波動廢訊號跳過（建議 2.0~4.0；None=用 config）")
     parser.add_argument("--min-ema-dev", type=float, default=None,
                         help="EMA20 乖離率下限：進場時收盤距 EMA20 低於此值視為無動能跳過（建議 0.03=3%%；None=用 config）")
+    parser.add_argument("--max-ema-dev", type=float, default=None,
+                        help="EMA20 乖離率上限：超過此值視為過熱跳過（建議 0.10=10%%；None=停用）")
     # ── 動態倉位（EMA 乖離率分層）──
     parser.add_argument("--dev-low-thr",   type=float, default=0.03,
                         help="乖離率縮倉門檻：低於此值用 dev-low-pct 倉位（預設 0.03=3%%；0=停用）")
@@ -1940,6 +1943,8 @@ def main():
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_atr_pct"] = args.min_atr_pct
     if args.min_ema_dev is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_ema_dev"] = args.min_ema_dev
+    if args.max_ema_dev is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["max_ema_dev"] = args.max_ema_dev
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
