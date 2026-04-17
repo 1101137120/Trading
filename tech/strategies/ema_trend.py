@@ -27,6 +27,7 @@ class EmaTrendStrategy(BaseStrategy):
         self.min_ema_dev = cfg.get("min_ema_dev", 0.0)  # 收盤距 EMA20 乖離率下限（0=停用）；太貼近無動能
         self.max_ema_dev = cfg.get("max_ema_dev", 0.0)  # 收盤距 EMA20 乖離率上限（0=停用）
         self.min_atr_pct = cfg.get("min_atr_pct", 0.0)  # ATR% 下限，過低視為死魚股（0=停用）
+        self.signal_day_max_gain = cfg.get("signal_day_max_gain", 0.0)  # 信號日單日漲幅上限（0=停用）；大紅棒假突破過濾
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.ema_slow + self.adx_period + 5
@@ -72,6 +73,12 @@ class EmaTrendStrategy(BaseStrategy):
             if self.min_ema_dev > 0 and dev < self.min_ema_dev:
                 return None
             if self.max_ema_dev > 0 and dev > self.max_ema_dev:
+                return None
+
+        # 信號日單日漲幅過大 → 假突破過濾
+        if self.signal_day_max_gain > 0 and len(close) >= 2:
+            prev_close = close.iloc[-2]
+            if prev_close > 0 and (price - prev_close) / prev_close > self.signal_day_max_gain:
                 return None
 
         # 量能不得嚴重萎縮
@@ -164,6 +171,12 @@ class EmaTrendStrategy(BaseStrategy):
                     continue
                 if self.max_ema_dev > 0 and dev > self.max_ema_dev:
                     continue
+            # 信號日單日漲幅過大 → 假突破過濾
+            if self.signal_day_max_gain > 0 and i >= 1:
+                prev_c = close_v[i - 1]
+                if prev_c > 0 and (price - prev_c) / prev_c > self.signal_day_max_gain:
+                    continue
+
             # 量能
             avg_v = vol_ma5[i]
             vol_ratio = volume.values[i] / avg_v if (avg_v and avg_v > 0) else 1.0

@@ -362,6 +362,8 @@ def simulate_trades(
     market_atr_max: float = 0.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
+    momentum_confirm_days: int = 0,
+    momentum_confirm_min: float = 0.01,
     early_exit_days: int = 0,
     early_exit_lag: float = 0.03,
     breadth_allow: dict = None,
@@ -639,6 +641,12 @@ def simulate_trades(
                             if pnl_pct_cur - mkt_ret < -early_exit_lag:
                                 exit_price  = current_price * (1 - _eff_exit_slip)
                                 exit_reason = "時間停損(跑輸大盤)"
+                elif (momentum_confirm_days > 0
+                      and hold >= momentum_confirm_days
+                      and pnl_pct_cur < -momentum_confirm_min):
+                    # 進場 N 天內仍虧超過門檻 → 動能確認失敗，提早停損減少損失
+                    exit_price  = current_price * (1 - _eff_exit_slip)
+                    exit_reason = "動能確認停損"
                 elif (time_stop_days > 0 and hold >= time_stop_days
                       and pnl_pct_cur < time_stop_min_pct):
                     # 持倉超過 N 天但漲幅未達門檻 → 佔位不賺，強制出場
@@ -1860,6 +1868,10 @@ def main():
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
                         help="時間停損最低漲幅門檻（預設 0.05 = 5%%），搭配 --time-stop-days 使用")
+    parser.add_argument("--momentum-confirm-days", type=int, default=0,
+                        help="動能確認天數：進場 N 天內最高點未超過門檻則提早停損（0=停用；建議 5）")
+    parser.add_argument("--momentum-confirm-min", type=float, default=0.01,
+                        help="動能確認最低漲幅：N 天內最高點須超過進場價此比例（預設 0.01=1%%）")
     parser.add_argument("--early-exit-days", type=int, default=0,
                         help="動態提早出場：持倉 N 天仍虧且跑輸大盤超過門檻則出場（0=停用，建議 10）")
     parser.add_argument("--early-exit-lag", type=float, default=0.03,
@@ -1873,6 +1885,8 @@ def main():
                         help="EMA20 乖離率下限：進場時收盤距 EMA20 低於此值視為無動能跳過（建議 0.03=3%%；None=用 config）")
     parser.add_argument("--max-ema-dev", type=float, default=None,
                         help="EMA20 乖離率上限：超過此值視為過熱跳過（建議 0.10=10%%；None=停用）")
+    parser.add_argument("--signal-day-max-gain", type=float, default=None,
+                        help="信號日單日漲幅上限：超過此值視為假突破跳過（建議 0.05=5%%；None=停用）")
     # ── 動態倉位（EMA 乖離率分層）──
     parser.add_argument("--dev-low-thr",   type=float, default=0.03,
                         help="乖離率縮倉門檻：低於此值用 dev-low-pct 倉位（預設 0.03=3%%；0=停用）")
@@ -1945,6 +1959,8 @@ def main():
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_ema_dev"] = args.min_ema_dev
     if args.max_ema_dev is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["max_ema_dev"] = args.max_ema_dev
+    if args.signal_day_max_gain is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["signal_day_max_gain"] = args.signal_day_max_gain
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
@@ -2299,6 +2315,8 @@ def main():
                 market_atr_max=args.market_atr_max,
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
+                momentum_confirm_days=args.momentum_confirm_days,
+                momentum_confirm_min=args.momentum_confirm_min,
                 early_exit_days=args.early_exit_days,
                 early_exit_lag=args.early_exit_lag,
                 breadth_allow=breadth_map,
