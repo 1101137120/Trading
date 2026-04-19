@@ -463,6 +463,22 @@ def simulate_trades(
             "trust_streak":       t_streak,
         }
 
+    def _calc_chip_score(chip: dict) -> float:
+        """
+        組合籌碼排名分數 (0~1，高=好)：
+        - short_util 低 → 好（無人做空）：0%→1.0, 8%→0.47, ≥15%→0.0
+        - foreign_net 正 → 好（外資買超）：>2000張→1.0, 0→0.5, <-2000張→0.0
+        沒有資料的訊號跳過，全無資料回傳 0.5（中性，不影響排名）。
+        """
+        parts = []
+        _su = chip.get("short_util")
+        if _su is not None:
+            parts.append(max(0.0, 1.0 - _su / 0.15))
+        _fn = chip.get("foreign_net")
+        if _fn is not None:
+            parts.append(min(1.0, max(0.0, (_fn + 2000) / 4000)))
+        return sum(parts) / len(parts) if parts else 0.5
+
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
     market_bull: dict[date, bool] = {}   # True = 0050 MA20 > MA60（持續上行）
@@ -727,6 +743,7 @@ def simulate_trades(
                     "short_balance":      position.get("short_balance"),
                     "foreign_net": position.get("foreign_net"),
                     "trust_net": position.get("trust_net"),
+                    "chip_score": position.get("chip_score", 0.5),
                 })
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
@@ -1043,6 +1060,7 @@ def simulate_trades(
                 "short_balance":        _chip.get("short_balance"),
                 "margin_short_ratio":   _chip.get("margin_short_ratio"),
                 "foreign_streak":       _chip.get("foreign_streak", 0),
+                "chip_score":           _calc_chip_score(_chip),
             }
 
     return trades
