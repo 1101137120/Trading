@@ -384,6 +384,7 @@ def simulate_trades(
     chip_df: "pd.DataFrame | None" = None,  # 該股的法人/融資日頻資料
     chip_filter: bool = False,               # True=啟用法人雙賣/資券比過高過濾
     chip_margin_max: float = 4.0,           # 資券比上限（0=停用）
+    short_util_max: float = 0.0,            # 融券使用率上限（0=停用，例如 0.08=8%）
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -446,9 +447,16 @@ def simulate_trades(
                 t_streak += 1
             else:
                 break
+        _sl = row.get("short_limit")
+        _sb = row.get("short_balance")
+        _short_util = (_sb / _sl) if (_sl and _sl > 0 and _sb is not None) else None
         return {
             "foreign_net":        row.get("foreign_net"),
             "trust_net":          row.get("trust_net"),
+            "margin_balance":     row.get("margin_balance"),
+            "short_balance":      _sb,
+            "short_limit":        _sl,
+            "short_util":         _short_util,   # 融券使用率 = short_balance / short_limit
             "margin_short_ratio": row.get("margin_short_ratio"),
             "holding_pct":        row.get("holding_pct"),
             "foreign_streak":     f_streak,
@@ -715,6 +723,8 @@ def simulate_trades(
                     "ema_dev": position.get("ema_dev", 0.0),
                     "day_volume": position.get("day_volume", 0),
                     "margin_short_ratio": position.get("margin_short_ratio"),
+                    "margin_balance":     position.get("margin_balance"),
+                    "short_balance":      position.get("short_balance"),
                     "foreign_net": position.get("foreign_net"),
                     "trust_net": position.get("trust_net"),
                 })
@@ -960,25 +970,29 @@ def simulate_trades(
                                         "strategy": sig.strategy, **_fwd})
                 continue
 
-            # 籌碼過濾：法人雙賣 / 資券比過高
+            # 籌碼過濾：法人雙賣 / 資券比過高 / 融券使用率過高
             _chip = _get_chip_on_date(row_date)
+            _skip_chip_reason = None
             if chip_filter:
                 _f_net = _chip.get("foreign_net")
                 _t_net = _chip.get("trust_net")
                 _mr    = _chip.get("margin_short_ratio")
-                _skip_chip_reason = None
                 if _f_net is not None and _t_net is not None and _f_net < 0 and _t_net < 0:
                     _skip_chip_reason = f"法人雙賣(外資{_f_net:+.0f} 投信{_t_net:+.0f})"
                 elif _mr is not None and chip_margin_max > 0 and _mr > chip_margin_max:
                     _skip_chip_reason = f"資券比過高({_mr:.1f}>{chip_margin_max})"
-                if _skip_chip_reason:
-                    if skipped_out is not None:
-                        _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
-                        skipped_out.append({"code": code, "signal_date": row_date,
-                                            "skip_reason": _skip_chip_reason,
-                                            "entry_price": round(entry_price, 2),
-                                            "strategy": sig.strategy, **_fwd})
-                    continue
+            if _skip_chip_reason is None and short_util_max > 0:
+                _su = _chip.get("short_util")
+                if _su is not None and _su > short_util_max:
+                    _skip_chip_reason = f"融券使用率過高({_su:.1%}>{short_util_max:.0%})"
+            if _skip_chip_reason:
+                if skipped_out is not None:
+                    _fwd = _forward_scan(df, i + 1, entry_price, stop, target, end, slippage_pct)
+                    skipped_out.append({"code": code, "signal_date": row_date,
+                                        "skip_reason": _skip_chip_reason,
+                                        "entry_price": round(entry_price, 2),
+                                        "strategy": sig.strategy, **_fwd})
+                continue
 
             # 記錄進場當天大盤收盤（用於動態時間停損的相對表現比較）
             _mpos = bisect.bisect_right(_mkt_dates, next_date) - 1
@@ -1025,6 +1039,8 @@ def simulate_trades(
                 "market_rs_at_entry": _mkt_rs_entry if _mkt_rs_entry == _mkt_rs_entry else "",
                 "foreign_net":          _chip.get("foreign_net"),
                 "trust_net":            _chip.get("trust_net"),
+                "margin_balance":       _chip.get("margin_balance"),
+                "short_balance":        _chip.get("short_balance"),
                 "margin_short_ratio":   _chip.get("margin_short_ratio"),
                 "foreign_streak":       _chip.get("foreign_streak", 0),
             }
@@ -1841,6 +1857,8 @@ def main():
                         help="啟用籌碼過濾：法人雙賣或資券比過高時跳過進場")
     parser.add_argument("--chip-margin-max", type=float, default=4.0,
                         help="資券比上限，超過視為融資泡沫（0=停用，預設 4.0）")
+    parser.add_argument("--short-util-max", type=float, default=0.0,
+                        help="融券使用率上限（short_balance/short_limit），超過跳過進場（0=停用，例如 0.08=8%%）")
     parser.add_argument("--rank-w-chip", type=float, default=0.0,
                         help="rank_score 籌碼因子權重（預設 0=停用）")
     parser.add_argument("--rank-rs-center", type=float, default=0.05,
@@ -2328,6 +2346,7 @@ def main():
                 chip_df=_all_chip_data.get(code) if _all_chip_data else None,
                 chip_filter=args.chip_filter,
                 chip_margin_max=args.chip_margin_max,
+                short_util_max=args.short_util_max,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")

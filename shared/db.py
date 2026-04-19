@@ -438,7 +438,7 @@ def bulk_load_institutional(
         df = conn.execute(f"""
             SELECT i.code, i.date,
                    i.foreign_net, i.trust_net, i.dealer_net, i.total_net,
-                   m.margin_balance, m.margin_limit, m.short_balance,
+                   m.margin_balance, m.margin_limit, m.short_balance, m.short_limit,
                    m.margin_short_ratio,
                    f.holding_pct, f.retail_pct
             FROM institutional_net i
@@ -473,7 +473,7 @@ def load_institutional(
         df = conn.execute("""
             SELECT i.date,
                    i.foreign_net, i.trust_net, i.dealer_net, i.total_net,
-                   m.margin_balance, m.margin_limit, m.short_balance,
+                   m.margin_balance, m.margin_limit, m.short_balance, m.short_limit,
                    m.margin_short_ratio,
                    f.holding_pct, f.retail_pct
             FROM institutional_net i
