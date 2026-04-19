@@ -303,11 +303,15 @@ def _fetch_institutional(update_only: bool, inst_from: str | None = None):
                 skip += 1
                 continue
 
-            inst   = fetch_institutional_net(d_str)
-            time.sleep(2.0)
-            margin = fetch_margin_balance(d_str)
-            time.sleep(2.0)
-            fhold  = fetch_foreign_holding(d_str)
+            # 三個 API 同時打，節省等待時間
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=3) as _ex:
+                _fi = _ex.submit(fetch_institutional_net, d_str)
+                _fm = _ex.submit(fetch_margin_balance,    d_str)
+                _ff = _ex.submit(fetch_foreign_holding,   d_str)
+                inst   = _fi.result()
+                margin = _fm.result()
+                fhold  = _ff.result()
 
             if not inst and not margin and not fhold:
                 skip += 1
@@ -329,13 +333,13 @@ def _fetch_institutional(update_only: bool, inst_from: str | None = None):
                 pct = (idx + 1) / len(dates) * 100
                 print(f"[LOG] {d_str} | 進度 {idx+1}/{len(dates)} ({pct:.1f}%) | 已寫入 {ok} 天 | 跳過 {skip} 天", flush=True)
 
-            # 每 10 天暫停 90 秒，避免 TWSE IP 封鎖
+            # 每 10 天暫停 60 秒，避免 TWSE IP 封鎖
             if ok % 10 == 0:
-                print(f"[LOG] 防封鎖暫停 90s... (已完成 {ok} 天)", flush=True)
-                progress.update(task, description="[yellow]防封鎖暫停 90s...[/yellow]")
-                time.sleep(90)
+                print(f"[LOG] 防封鎖暫停 60s... (已完成 {ok} 天)", flush=True)
+                progress.update(task, description="[yellow]防封鎖暫停 60s...[/yellow]")
+                time.sleep(60)
             else:
-                time.sleep(4.0)
+                time.sleep(2.0)
 
     print(f"[LOG] 完成！已寫入 {ok} 天，跳過 {skip} 天", flush=True)
     console.print(f"  完成：[green]{ok}[/green] 日有資料，{skip} 日無資料（假日/休市）")

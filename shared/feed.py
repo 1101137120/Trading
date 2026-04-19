@@ -44,6 +44,11 @@ class MarketDataFeed:
             kbars = self.api.kbars(contract=contract, start=start, end=end)
             df = pd.DataFrame({**kbars})
             if df.empty:
+                # 重連後 API 尚未就緒，等 5 秒重試一次
+                time.sleep(5)
+                kbars = self.api.kbars(contract=contract, start=start, end=end)
+                df = pd.DataFrame({**kbars})
+            if df.empty:
                 self._set_kbar_issue(code, "kbars 回傳空資料")
                 return None
             df.columns = [c.lower() if c.lower() == "ts" else c for c in df.columns]

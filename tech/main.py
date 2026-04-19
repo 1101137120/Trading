@@ -1745,8 +1745,13 @@ def main():
         else:
             if system.broker.just_reconnected:
                 system.broker.just_reconnected = False
-                console.print("[yellow]重連成功，重新訂閱 Tick[/yellow]")
+                # 重連後 broker.api 是新物件，feed 需同步指向新實例（scanner/market_filter 共用同一 feed 物件）
+                system.feed.api = system.broker.api
+                system.feed.clear_cache()
+                console.print("[yellow]重連成功，Feed API 已更新，等待暖機 20 秒...[/yellow]")
+                time.sleep(20)
                 system._sync_tick_subscriptions()
+                console.print("[yellow]Tick 已重新訂閱[/yellow]")
                 system.notifier.notify("🔄 交易系統已重連，Tick 訂閱已恢復")
             system._drain_exit_queue()
         try:

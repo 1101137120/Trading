@@ -55,10 +55,8 @@
   --market-bull-entry  \
   --market-dd-threshold    0.15 \
   --market-dd-max-positions 2 \
-  --chip-filter \
-  --chip-margin-max     4.0 \
-  --rank-w-chip         0.15 \
   --rs-pos-high-thr     0.15 \
   --rs-pos-high-mult    1.80 \
   --rs-pos-low-thr      0.07 \
   --rs-pos-low-mult     0.80 \
+  "$@"

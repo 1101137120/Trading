@@ -362,8 +362,6 @@ def simulate_trades(
     market_atr_max: float = 0.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
-    momentum_confirm_days: int = 0,
-    momentum_confirm_min: float = 0.01,
     early_exit_days: int = 0,
     early_exit_lag: float = 0.03,
     breadth_allow: dict = None,
@@ -641,12 +639,6 @@ def simulate_trades(
                             if pnl_pct_cur - mkt_ret < -early_exit_lag:
                                 exit_price  = current_price * (1 - _eff_exit_slip)
                                 exit_reason = "時間停損(跑輸大盤)"
-                elif (momentum_confirm_days > 0
-                      and hold >= momentum_confirm_days
-                      and pnl_pct_cur < -momentum_confirm_min):
-                    # 進場 N 天內仍虧超過門檻 → 動能確認失敗，提早停損減少損失
-                    exit_price  = current_price * (1 - _eff_exit_slip)
-                    exit_reason = "動能確認停損"
                 elif (time_stop_days > 0 and hold >= time_stop_days
                       and pnl_pct_cur < time_stop_min_pct):
                     # 持倉超過 N 天但漲幅未達門檻 → 佔位不賺，強制出場
@@ -722,6 +714,9 @@ def simulate_trades(
                     "rs_score": position.get("rs_score", 0.0),
                     "ema_dev": position.get("ema_dev", 0.0),
                     "day_volume": position.get("day_volume", 0),
+                    "margin_short_ratio": position.get("margin_short_ratio"),
+                    "foreign_net": position.get("foreign_net"),
+                    "trust_net": position.get("trust_net"),
                 })
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
@@ -1868,10 +1863,6 @@ def main():
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
                         help="時間停損最低漲幅門檻（預設 0.05 = 5%%），搭配 --time-stop-days 使用")
-    parser.add_argument("--momentum-confirm-days", type=int, default=0,
-                        help="動能確認天數：進場 N 天內最高點未超過門檻則提早停損（0=停用；建議 5）")
-    parser.add_argument("--momentum-confirm-min", type=float, default=0.01,
-                        help="動能確認最低漲幅：N 天內最高點須超過進場價此比例（預設 0.01=1%%）")
     parser.add_argument("--early-exit-days", type=int, default=0,
                         help="動態提早出場：持倉 N 天仍虧且跑輸大盤超過門檻則出場（0=停用，建議 10）")
     parser.add_argument("--early-exit-lag", type=float, default=0.03,
@@ -2270,7 +2261,7 @@ def main():
 
     # ── 籌碼資料批次載入（法人/融資/外資，供籌碼過濾與 rank 使用）──
     _all_chip_data: dict = {}
-    if (args.chip_filter or args.rank_w_chip > 0) and use_db:
+    if use_db:  # 有 DB 時一律載入籌碼，供分析與過濾使用
         from shared.db import bulk_load_institutional as _bulk_inst
         _inst_start = start.strftime("%Y-%m-%d")
         _inst_end   = end.strftime("%Y-%m-%d")
@@ -2315,8 +2306,6 @@ def main():
                 market_atr_max=args.market_atr_max,
                 time_stop_days=args.time_stop_days,
                 time_stop_min_pct=args.time_stop_min_pct,
-                momentum_confirm_days=args.momentum_confirm_days,
-                momentum_confirm_min=args.momentum_confirm_min,
                 early_exit_days=args.early_exit_days,
                 early_exit_lag=args.early_exit_lag,
                 breadth_allow=breadth_map,
