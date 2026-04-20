@@ -32,23 +32,6 @@ class StockScanner:
         if not contracts:
             return []
 
-        if exclude_etf:
-            before = len(contracts)
-            contracts = [c for c in contracts if not str(c.code).startswith("00")]
-            logger.info(f"排除 ETF 後剩 {len(contracts)} 個合約（移除 {before - len(contracts)} 檔）")
-
-        # 排除處置股：day_trade == No 表示受限制，撮合每 5 分鐘一次，掛單難成交
-        exclude_disposed = self.cfg.get("exclude_disposed", True)
-        if exclude_disposed:
-            before = len(contracts)
-            contracts = [
-                c for c in contracts
-                if str(getattr(getattr(c, "day_trade", None), "value", getattr(c, "day_trade", "Yes"))) != "No"
-            ]
-            removed = before - len(contracts)
-            if removed:
-                logger.info(f"排除處置股/限制股 {removed} 檔（day_trade=No）")
-
         logger.info(f"開始批次快照篩選，共 {len(contracts)} 檔...")
         code_to_name = {c.code: getattr(c, "name", "") for c in contracts if hasattr(c, "code")}
         snapshots = self.feed.get_batch_snapshots(contracts)
@@ -69,22 +52,6 @@ class StockScanner:
                 logger.info(
                     "無快照樣本（最多8檔）: " + ", ".join(_miss_samples)
                 )
-
-        # 盤後 fallback：若快照仍全空，改用 TWSE STOCK_DAY_ALL 收盤資料
-        if not snapshots:
-            logger.info("快照全空，嘗試 TWSE STOCK_DAY_ALL 盤後收盤資料 fallback...")
-            try:
-                from shared.standalone_feed import fetch_tse_daily_all
-                tse_data = fetch_tse_daily_all()
-                valid_codes = {str(getattr(c, "code", "")) for c in contracts}
-                snapshots = {code: d for code, d in tse_data.items() if code in valid_codes}
-                # 補齊 code_to_name（STOCK_DAY_ALL 含 name 欄位）
-                for code, d in snapshots.items():
-                    if code not in code_to_name and d.get("name"):
-                        code_to_name[code] = d["name"]
-                logger.info(f"TWSE fallback 取得 {len(snapshots)} 檔收盤資料")
-            except Exception as e:
-                logger.warning(f"TWSE fallback 失敗: {e}")
 
         candidates = []
         filtered_price = 0

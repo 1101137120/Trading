@@ -35,12 +35,9 @@ from shared.portfolio import Portfolio, Position, PendingOrder
 from shared.risk import RiskManager
 from shared.feed import MarketDataFeed
 from shared.notifier import Notifier
-from shared.exdiv_checker import ExDividendChecker
 from tech.market_filter import MarketFilter
 from tech.screener.scanner import StockScanner
-from tech.screener.standalone_scanner import StandaloneStockScanner
 from tech.strategies.engine import StrategyEngine
-from shared.standalone_feed import fetch_kbars
 from shared.news_feed import get_stock_news
 from shared.ai_analyst import analyze_news
 from shared.db import bulk_load_institutional
@@ -79,112 +76,6 @@ def signal_handler(sig, frame):
     _running = False
 
 
-def _run_standalone_scan(config: dict):
-    """免券商掃描：證交所 OpenAPI + 技術策略評估"""
-    logger = logging.getLogger("main")
-    console.print("[bold cyan]免券商模式：使用證交所 OpenAPI[/bold cyan]")
-    scanner = StandaloneStockScanner(config)
-    engine = StrategyEngine(config)
-
-    lookback = max(
-        config["strategies"].get("momentum", {}).get("lookback_days", 30),
-        config["strategies"].get("breakout", {}).get("lookback_days", 20),
-        config["strategies"].get("mean_reversion", {}).get("lookback_days", 30),
-    )
-    lookback += 10
-
-    candidates = scanner.screen()
-    if not candidates:
-        console.print("[yellow]無符合篩選條件的標的[/yellow]")
-        return
-
-    # 顯示 0050 ATR% 震盪警示
-    try:
-        _df0050 = fetch_kbars("0050", lookback_days=15)
-        if _df0050 is not None and len(_df0050) >= 10 and "High" in _df0050.columns:
-            import pandas as _pd
-            _atr_pct = ((_df0050["High"].astype(float) - _df0050["Low"].astype(float)) /
-                        _df0050["Close"].astype(float)).iloc[-10:].mean() * 100
-            if _atr_pct > 2.0:
-                _atr_clr, _atr_tag = "bold red", "⚠ 極端震盪"
-            elif _atr_pct > 1.5:
-                _atr_clr, _atr_tag = "yellow", "⚠ 高震盪"
-            elif _atr_pct > 1.0:
-                _atr_clr, _atr_tag = "cyan", "輕微震盪"
-            else:
-                _atr_clr, _atr_tag = "green", "市場平靜"
-            console.print(f"[{_atr_clr}]0050 ATR%（10日）= {_atr_pct:.2f}%  {_atr_tag}[/{_atr_clr}]")
-    except Exception:
-        pass
-
-    console.print(f"\n[bold green]共篩選出 {len(candidates)} 檔[/bold green]")
-    console.print("[dim]⚠ 資料來源：TWSE STOCK_DAY_ALL（收盤後約 14:00 更新；盤中執行看到的是前一交易日資料）[/dim]\n")
-    logger.info(f"初步篩選通過 {len(candidates)} 檔")
-    for c in candidates:
-        logger.info(
-            f"[通過篩選] {c['code']} {c.get('name', '')[:8]} "
-            f"收={c['close']:.2f} 量={c['volume']:,} 漲跌={c['change_pct']:+.2%}"
-        )
-
-    table = Table(title="篩選結果（上市）", show_header=True)
-    table.add_column("代碼", style="cyan")
-    table.add_column("名稱", style="dim")
-    table.add_column("現價", justify="right")
-    table.add_column("成交量", justify="right")
-    table.add_column("漲跌%", justify="right")
-    for c in candidates:
-        clr = "green" if c["change_pct"] >= 0 else "red"
-        table.add_row(
-            c["code"],
-            (c.get("name", "") or "")[:8],
-            f"{c['close']:.2f}",
-            f"{c['volume']:,.0f}",
-            f"[{clr}]{c['change_pct']:+.2%}[/{clr}]",
-        )
-    console.print(table)
-
-    console.print("\n[bold]策略評估中...[/bold]")
-    signals = []
-    stock_rejects: list[tuple[str, str, list[str]]] = []  # (code, name, reasons)
-    for c in candidates[:30]:  # 最多評估前 30 檔
-        df = fetch_kbars(c["code"], lookback_days=lookback)
-        if df is None or len(df) < 20:
-            stock_rejects.append((c["code"], c.get("name", "")[:8], ["K棒不足"]))
-            continue
-        sig = engine.evaluate(c["code"], df)
-        if sig and sig.action == "Buy":
-            signals.append(sig)
-        else:
-            reasons = []
-            for s in engine.strategies:
-                if hasattr(s, "diagnose"):
-                    r = s.diagnose(c["code"], df)
-                    reasons.append(f"{s.name}: {r}")
-            if reasons:
-                stock_rejects.append((c["code"], c.get("name", "")[:8], reasons))
-
-    signals.sort(key=lambda s: s.confidence, reverse=True)
-    if signals:
-        stbl = Table(title="買入訊號（技術策略）", show_header=True)
-        stbl.add_column("代碼", style="cyan")
-        stbl.add_column("信心", justify="right")
-        stbl.add_column("理由", style="dim")
-        for s in signals:
-            stbl.add_row(s.code, f"{s.confidence:.2f}", (s.reason or "")[:40])
-            logger.info(f"[買入訊號] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
-        console.print(stbl)
-    else:
-        console.print("[dim]無買入訊號[/dim]")
-        logger.info("無買入訊號")
-
-    if stock_rejects:
-        console.print("\n[bold]各檔被篩掉原因[/bold]")
-        for code, name, reasons in stock_rejects:
-            line = f"{code} {name}: {' | '.join(reasons)}"
-            console.print(f"  [dim]{line}[/dim]")
-            logger.info(f"篩掉 {line}")
-
-
 class TradingSystem:
     def __init__(self, config: dict, dry_run: bool = False):
         self.config = config
@@ -196,7 +87,6 @@ class TradingSystem:
         self.portfolio = Portfolio(config, persist_path=persist_path)
         self.risk = RiskManager(config)
         self.notifier = Notifier(config)
-        self.exdiv = ExDividendChecker()
         self.feed: MarketDataFeed = None
         self.scanner: StockScanner = None
         self.engine: StrategyEngine = None
@@ -208,12 +98,12 @@ class TradingSystem:
         self._current_breadth: float = 0.0      # 最近一次廣度比例
 
     def setup(self) -> bool:
-        console.print("[bold cyan]正在連線永豐金...[/bold cyan]")
+        console.print("[bold cyan]正在連線 Alpaca...[/bold cyan]")
         if not self.broker.connect():
             console.print("[bold red]連線失敗！請檢查 API Key 設定[/bold red]")
             return False
 
-        self.feed = MarketDataFeed(self.broker.api)
+        self.feed = MarketDataFeed(self.broker)
         self.scanner = StockScanner(self.config, self.broker, self.feed)
         self.engine = StrategyEngine(self.config)
         self.market_filter = MarketFilter(self.config, self.feed)
@@ -251,7 +141,6 @@ class TradingSystem:
         saved, saved_pending = self.portfolio.load_from_file()
         broker_positions = self.broker.get_positions()
 
-        # 同一檔股票可能同時有整張 + 零股 → 合併成一筆，整張優先
         broker_map: dict[str, dict] = {}
         for p in broker_positions:
             code = str(p["code"])
@@ -267,7 +156,7 @@ class TradingSystem:
                     ) / total_qty
                 prev["quantity"] = total_qty
                 self.logger.warning(
-                    f"{code} 同時有整張+零股持倉，已合併（共 {total_qty}）"
+                    f"{code} 重複持倉已合併（共 {total_qty}）"
                 )
             else:
                 broker_map[code] = dict(p)
@@ -302,9 +191,6 @@ class TradingSystem:
                     stop_loss=self.risk.calc_stop_loss(entry, direction),
                     take_profit=self.risk.calc_take_profit(entry, direction),
                     current_price=bp.get("last_price", entry),
-                    odd_lot=saved.get(code, Position(code=code, direction="Buy",
-                        quantity=0, entry_price=0, entry_time=datetime.now(),
-                        stop_loss=0, take_profit=0)).odd_lot,
                 )
 
             with self.portfolio._lock:
@@ -332,15 +218,15 @@ class TradingSystem:
                 continue
             lost.append((code, po))
             self.logger.warning(
-                f"[重啟遺留掛單] {code} {po.action} {po.quantity}張 @ {po.price} "
-                f"→ 請至永豐金確認委託狀態"
+                f"[重啟遺留掛單] {code} {po.action} {po.quantity}股 @ {po.price} "
+                f"→ 請至 Alpaca 確認委託狀態"
             )
         if lost:
             codes_str = ", ".join(c for c, _ in lost)
             console.print(f"[yellow]警告：{len(lost)} 筆重啟前的掛單已遺失追蹤：{codes_str}[/yellow]")
             self.notifier.notify(
                 f"⚠️ 系統重啟後發現 {len(lost)} 筆遺留掛單（{codes_str}），"
-                "請至永豐金 App 手動確認委託狀態"
+                "請至 Alpaca 手動確認委託狀態"
             )
 
     def _warn_untracked_broker_trades(self, saved_pending: dict):
@@ -372,9 +258,6 @@ class TradingSystem:
         self.portfolio.update_price(code, price)
         pos = self.portfolio.get_position(code)
         if pos is None:
-            return
-        # 除息日暫停停損，避免除息貼息被誤判為下殺
-        if self.exdiv.is_ex_dividend_today(code):
             return
         reason = self.risk.check_exit_conditions(pos, is_bull=self._is_bull_market)
         if reason and self.portfolio.try_mark_exit(code):
@@ -432,8 +315,8 @@ class TradingSystem:
                     _atr_clr, _atr_tag = "cyan", "輕微震盪"
                 else:
                     _atr_clr, _atr_tag = "green", "市場平靜"
-                console.print(f"[{_atr_clr}]0050 ATR%（10日）= {_atr_pct:.2f}%  {_atr_tag}[/{_atr_clr}]")
-                self.logger.info(f"0050 ATR%={_atr_pct:.2f}% {_atr_tag}")
+                console.print(f"[{_atr_clr}]SPY ATR%（10日）= {_atr_pct:.2f}%  {_atr_tag}[/{_atr_clr}]")
+                self.logger.info(f"SPY ATR%={_atr_pct:.2f}% {_atr_tag}")
 
             code_to_name = {c["code"]: c.get("name", "") for c in candidates}
             signals = self._evaluate_candidates(candidates)
@@ -568,7 +451,7 @@ class TradingSystem:
                 _exit_date = datetime.now().date().isoformat()
                 if pos_snap:
                     _pnl_pct = (fill_price - pos_snap.entry_price) / pos_snap.entry_price if pos_snap.entry_price else 0
-                    _pnl_amt = (fill_price - pos_snap.entry_price) * pos_snap.quantity * 1000
+                    _pnl_amt = (fill_price - pos_snap.entry_price) * pos_snap.quantity
                     _days    = (datetime.now() - pos_snap.entry_time).days if pos_snap.entry_time else 0
                     _peak    = pos_snap.highest_price
                     _max_g   = (_peak - pos_snap.entry_price) / pos_snap.entry_price if pos_snap.entry_price > 0 else 0
@@ -669,7 +552,7 @@ class TradingSystem:
             pending = set(self.portfolio._pending_exits)
         codes_to_check = [
             code for code in list(self.portfolio.positions.keys())
-            if code not in pending and not self.exdiv.is_ex_dividend_today(code)
+            if code not in pending
         ]
         if not codes_to_check:
             return
@@ -763,36 +646,28 @@ class TradingSystem:
             if price <= 0:
                 continue
 
-            # 加碼量：原始倉位成本 × alloc_pct，不超過可用資金
-            orig_cost = pos.entry_price * pos.quantity * pos._lot_multiplier
+            orig_cost = pos.entry_price * pos.quantity
             budget    = min(orig_cost * alloc, self.portfolio.available_capital)
-            if pos.odd_lot:
-                add_qty = int(budget / price)
-            else:
-                add_qty = int(budget / (price * 1000))
+            add_qty = int(budget / price)
 
             if add_qty <= 0:
                 self.logger.info(
                     f"[加碼跳過] {code} 可用資金不足（預算 {budget:.0f}）"
                 )
                 continue
-            if not pos.odd_lot and not self.risk.is_valid_order(price, add_qty):
+            if not self.risk.is_valid_order(price, add_qty):
                 self.logger.info(f"[加碼跳過] {code} 委託金額不符最低限制")
                 continue
 
-            unit  = "股" if pos.odd_lot else "張"
             level_str = "第一次" if not is_second else "第二次"
             self.logger.info(
-                f"[加碼下單] {code} ×{add_qty}{unit} @ {price:.2f} | "
+                f"[加碼下單] {code} ×{add_qty}股 @ {price:.2f} | "
                 f"{level_str}加碼 獲利={pnl_pct:.1%} 預算={budget:.0f}"
             )
 
             trade = None
             if not self.dry_run:
-                if pos.odd_lot:
-                    trade = self.broker.place_odd_lot_order(code, "Buy", price, add_qty)
-                else:
-                    trade = self.broker.place_limit_order(code, "Buy", price, add_qty)
+                trade = self.broker.place_limit_order(code, "Buy", price, add_qty)
                 if trade is None:
                     self.logger.error(f"[加碼失敗] {code} 下單回傳 None")
                     self.notifier.notify(f"⚠️ 加碼下單失敗 {code}")
@@ -805,15 +680,14 @@ class TradingSystem:
             self.notifier.notify(
                 f"🔺 <b>{level_str}加碼委託</b> {code} {self._code_to_name.get(code,'')}\n"
                 "━━━━━━━━━━━━━━━\n"
-                f"💰 價格: {price:.2f} | 數量: ×{add_qty}{unit}\n"
+                f"💰 價格: {price:.2f} | 數量: ×{add_qty}股\n"
                 f"📊 持倉獲利: {pnl_pct:+.1%} | 預算: {budget:,.0f}\n"
                 f"🔢 加碼層次: {pos.pyramid_level}/2",
                 parse_mode="HTML"
             )
 
     def _get_market_return_20d(self) -> float:
-        """計算 0050 近 20 日報酬，用於 RS 過濾"""
-        df = self.feed.get_kbars("0050", lookback_days=30)
+        df = self.feed.get_kbars("SPY", lookback_days=30)
         if df is None or len(df) < 21:
             return 0.0
         close = df["Close"].astype(float)
@@ -870,7 +744,7 @@ class TradingSystem:
                 "short_util":         _short_util,
             }
 
-        evaluated = skipped_pos = skipped_limit = skipped_rs = 0
+        evaluated = skipped_pos = skipped_rs = 0
         for c in candidates[:max_evaluate]:
             code = c["code"]
             if self.portfolio.has_position_or_pending(code):
@@ -879,10 +753,6 @@ class TradingSystem:
             if self.portfolio.is_in_loss_cooldown(code):
                 until = self.portfolio.loss_cooldowns.get(code)
                 self.logger.info(f"跳過 {code}：停損冷卻中（至 {until.strftime('%m/%d') if until else '?'}）")
-                continue
-            if self.risk.is_limit_up(c.get("change_pct", 0)):
-                skipped_limit += 1
-                self.logger.info(f"跳過 {code}：漲幅 {c['change_pct']:.1%} 接近漲停")
                 continue
             df = self.feed.get_kbars(code, lookback_days=lookback + 30)
             if df is None:
@@ -975,8 +845,7 @@ class TradingSystem:
         signals.sort(key=lambda s: s.rank_score, reverse=True)
         self.logger.info(
             f"評估 {evaluated} 檔 | 已持倉跳過 {skipped_pos} | "
-            f"漲停跳過 {skipped_limit} | RS 不足跳過 {skipped_rs} | "
-            f"訊號 {len(signals)} 個"
+            f"RS 不足跳過 {skipped_rs} | 訊號 {len(signals)} 個"
         )
         for s in signals:
             name = code_to_name.get(s.code, "")
@@ -1149,10 +1018,10 @@ class TradingSystem:
             # 若動態計算結果等於 base，傳 None 讓 portfolio 使用預設值
             pos_pct_arg = pos_pct if pos_pct != _base_pct else None
 
-            qty, is_odd_lot = self.portfolio.calculate_quantity(price, position_pct=pos_pct_arg)
+            qty, _ = self.portfolio.calculate_quantity(price, position_pct=pos_pct_arg)
             if qty <= 0:
                 continue
-            order_value = price * qty * (1 if is_odd_lot else 1000)
+            order_value = price * qty
             # 牛市放寬持倉上限（MA20>MA60 時允許更多同時持倉）
             _bull_max = self.config.get("risk", {}).get("bull_max_positions", 0)
             _is_bull  = self._is_bull_market  # 每個週期已計算
@@ -1215,19 +1084,15 @@ class TradingSystem:
                     parse_mode="HTML"
                 )
                 continue
-            if not is_odd_lot and not self.risk.is_valid_order(price, qty):
+            if not self.risk.is_valid_order(price, qty):
                 continue
             stop_loss = self.risk.calc_stop_loss(price)
             take_profit = self.risk.calc_take_profit(price)
-            unit = "股" if is_odd_lot else "張"
-            self.logger.info(f"[BUY] {code} {qty}{unit} @ {price} | 信心={signal.confidence:.2f} | {'零股' if is_odd_lot else '整張'}")
+            self.logger.info(f"[BUY] {code} {qty}股 @ {price} | 信心={signal.confidence:.2f}")
 
             trade = None
             if not self.dry_run:
-                if is_odd_lot:
-                    trade = self.broker.place_odd_lot_order(code, "Buy", price, qty)
-                else:
-                    trade = self.broker.place_limit_order(code, "Buy", price, qty)
+                trade = self.broker.place_limit_order(code, "Buy", price, qty)
                 if trade is None:
                     self.notifier.notify(f"⚠️ 開倉下單失敗 {code}")
                     continue
@@ -1235,11 +1100,10 @@ class TradingSystem:
             po = PendingOrder(
                 code=code, action="Buy", quantity=qty, price=price,
                 stop_loss=stop_loss, take_profit=take_profit,
-                placed_time=datetime.now(), trade_ref=trade, odd_lot=is_odd_lot,
+                placed_time=datetime.now(), trade_ref=trade,
                 rs_score=signal.rs_score,
             )
             self.portfolio.add_pending(po)
-            # 記錄進場 metadata（出場時寫 CSV 用）
             self._trade_meta[code] = {
                 "entry_date":    datetime.now().date().isoformat(),
                 "name":          self._code_to_name.get(code, ""),
@@ -1256,27 +1120,15 @@ class TradingSystem:
                 "holding_pct":   signal.holding_pct,
                 "alloc_pct":     _effective_pct,
                 "lots":          qty,
-                "odd_lot":       is_odd_lot,
                 "exit_reason":   None,
             }
             mode = "[模擬] " if self.dry_run else ""
-            lot_note = "零股" if is_odd_lot else "整張"
-            _fs = f"(連{signal.foreign_streak}日)" if signal.foreign_streak >= 2 else ""
-            _ts = f"(連{signal.trust_streak}日)" if signal.trust_streak >= 2 else ""
-            _su_str = f" | 融券使用率:{signal.short_util:.1%}" if signal.short_util is not None else ""
-            _chip_line = (
-                f"\n💹 外資:{signal.foreign_net:+.0f}張{_fs} | 投信:{signal.trust_net:+.0f}張{_ts}{_su_str}"
-                if (signal.foreign_net is not None and signal.trust_net is not None) else ""
-            )
-            _msr_line = f" | 資券比:{signal.margin_short_ratio:.2f}" if signal.margin_short_ratio is not None else ""
             self.notifier.notify(
                 f"📈 <b>{mode}開倉委託</b> {code} {self._code_to_name.get(code,'')}\n"
                 "━━━━━━━━━━━━━━━\n"
-                f"💰 價格: {price:.2f} | 數量: {qty}{unit}({lot_note}) | 倉位: {_effective_pct:.0%}\n"
-                f"🛑 停損: {stop_loss:.2f} ({self.config['risk'].get('stop_loss_pct',0.08):.0%}) | 移停啟動: +{self.config['risk'].get('trailing_stop',{}).get('activation_pct',0.02):.0%}\n"
-                f"📊 RS={signal.rs_score:+.3f} | EMA乖離={signal.ema_dev:.2%} | 信心={signal.confidence:.2f} | 排名={signal.rank_score:.3f}\n"
-                f"🌐 廣度={self._current_breadth:.0%}{_msr_line}"
-                f"{_chip_line}\n"
+                f"💰 Price: {price:.2f} | Qty: {qty}shares | Alloc: {_effective_pct:.0%}\n"
+                f"🛑 Stop: {stop_loss:.2f} ({self.config['risk'].get('stop_loss_pct',0.08):.0%}) | Trail: +{self.config['risk'].get('trailing_stop',{}).get('activation_pct',0.02):.0%}\n"
+                f"📊 RS={signal.rs_score:+.3f} | EMA dev={signal.ema_dev:.2%} | Conf={signal.confidence:.2f} | Rank={signal.rank_score:.3f}\n"
                 f"🏛 {signal.reason}",
                 parse_mode="HTML"
             )
@@ -1293,18 +1145,16 @@ class TradingSystem:
         pnl_pct = (exit_price - entry_price) / entry_price if entry_price > 0 else 0
         max_gain_pct = (pos.highest_price - entry_price) / entry_price if (entry_price > 0 and pos.highest_price > 0) else 0
         lots = meta.get("lots", pos.quantity)
-        cost = entry_price * lots * (1 if pos.odd_lot else 1000)
-        fee_rate = 0.001425
-        tax_rate = 0.003
-        fee_buy  = round(cost * fee_rate)
-        fee_sell = round(exit_price * lots * (1 if pos.odd_lot else 1000) * fee_rate)
-        tax      = round(exit_price * lots * (1 if pos.odd_lot else 1000) * tax_rate)
-        pnl_dollars = (exit_price - entry_price) * lots * (1 if pos.odd_lot else 1000)
-        net_pnl = pnl_dollars - fee_buy - fee_sell - tax
+        cost = entry_price * lots
+        fee_buy  = 0
+        fee_sell = 0
+        tax      = 0
+        pnl_dollars = (exit_price - entry_price) * lots
+        net_pnl = pnl_dollars
 
         fieldnames = [
             "entry_date", "exit_date", "code", "name", "entry_price", "exit_price",
-            "hold_days", "lots", "odd_lot", "cost", "pnl_pct", "max_gain_pct",
+            "hold_days", "lots", "cost", "pnl_pct", "max_gain_pct",
             "exit_reason", "rs_score", "ema_dev", "market_breadth_at_entry",
             "rank_score", "confidence", "foreign_net", "trust_net", "short_util", "margin_short_ratio",
             "holding_pct", "alloc_pct", "strategy", "fee_buy", "fee_sell", "tax",
@@ -1319,7 +1169,6 @@ class TradingSystem:
             "exit_price":              exit_price,
             "hold_days":               hold_days,
             "lots":                    lots,
-            "odd_lot":                 pos.odd_lot,
             "cost":                    round(cost),
             "pnl_pct":                 round(pnl_pct, 4),
             "max_gain_pct":            round(max_gain_pct, 4),
@@ -1353,12 +1202,11 @@ class TradingSystem:
 
     def _execute_sell(self, code: str, pos, reason: str):
         exit_price = pos.current_price
-        unit = "股" if pos.odd_lot else "張"
         pnl_pct = (exit_price - pos.entry_price) / pos.entry_price if pos.entry_price > 0 else 0
         hold_days = (datetime.now() - pos.entry_time).days if pos.entry_time else 0
         self.logger.info(
-            f"[SELL] {code} {pos.quantity}{unit} @ {exit_price} | {reason} | "
-            f"成本{pos.entry_price:.2f} 損益{pnl_pct:+.1%}({pos.pnl:+,.0f}) | "
+            f"[SELL] {code} {pos.quantity}股 @ {exit_price} | {reason} | "
+            f"成本{pos.entry_price:.2f} 損益{pnl_pct:+.1%}({pos.pnl:+,.2f}) | "
             f"持有{hold_days}天 | 峰值{pos.highest_price:.2f}"
         )
         if code in self._trade_meta:
@@ -1389,10 +1237,7 @@ class TradingSystem:
             )
             return
 
-        if pos.odd_lot:
-            trade = self.broker.place_odd_lot_market_order(code, "Sell", pos.quantity)
-        else:
-            trade = self.broker.place_market_order(code, "Sell", pos.quantity)
+        trade = self.broker.place_market_order(code, "Sell", pos.quantity)
         if trade is None:
             self.logger.error(f"賣出下單失敗 {code}，解除退出標記待下週期重試")
             with self.portfolio._lock:
@@ -1512,7 +1357,7 @@ class TradingSystem:
                 else:
                     exit_str = f"[dim]停{pos.stop_loss:.2f}[/dim]"
                     exit_log = f"停損{pos.stop_loss:.2f}"
-                qty_str = f"{pos.quantity}{'股' if pos.odd_lot else '張'}"
+                qty_str = f"{pos.quantity}股"
                 table.add_row(
                     code, name, qty_str,
                     f"{pos.entry_price:.2f}", f"{pos.current_price:.2f}",
@@ -1551,16 +1396,14 @@ class TradingSystem:
         else:
             mkt_status = "✅ 多頭"
 
-        # 取 0050 / 00631L 今日漲跌%
         bench_parts = []
-        for etf_code in ("0050", "00631L"):
+        for etf_code in ("SPY", "QQQ"):
             try:
                 snap = self.feed.get_snapshot(etf_code)
                 if snap and snap.get("change_pct") is not None:
                     pct = snap["change_pct"] * 100
                     clr = "green" if pct >= 0 else "red"
-                    label = "0050" if etf_code == "0050" else "正2"
-                    bench_parts.append(f"{label}[{clr}]{pct:+.2f}%[/{clr}]")
+                    bench_parts.append(f"{etf_code}[{clr}]{pct:+.2f}%[/{clr}]")
             except Exception:
                 pass
         bench_str = "  |  " + "  ".join(bench_parts) if bench_parts else ""
@@ -1595,10 +1438,9 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    parser = argparse.ArgumentParser(description="技術策略自動交易")
+    parser = argparse.ArgumentParser(description="US stocks technical trading")
     parser.add_argument("--dry-run", action="store_true", help="不實際下單")
     parser.add_argument("--scan-only", action="store_true", help="只篩選標的")
-    parser.add_argument("--standalone", action="store_true", help="免券商模式：掃描上市股並評估策略，不連永豐")
     parser.add_argument("--config", default=None, help="設定檔路徑")
     args = parser.parse_args()
 
@@ -1606,22 +1448,16 @@ def main():
     config = load_config(config_path)
     setup_logger("root", config, log_file=str(PROJECT_ROOT / "logs" / "trading.log"))
 
-    # 多實例防護：--scan-only、--standalone 不需要鎖
     _lock_fd = None
-    if not args.scan_only and not args.standalone:
+    if not args.scan_only:
         _lock_fd = _acquire_instance_lock(PROJECT_ROOT / "data" / ".trading.lock")
         if _lock_fd is None:
             console.print("[bold red]錯誤：已有另一個 tech 實例在執行中，請確認後再啟動[/bold red]")
             sys.exit(1)
 
-    mode = "模擬" if config["broker"].get("simulation") else "正式"
+    mode = "Paper" if config["broker"].get("simulation") else "Live"
     dry = " [DRY-RUN]" if args.dry_run else ""
-    console.rule(f"[bold]技術策略交易 | {mode}模式{dry}[/bold]")
-
-    # 免券商模式：單用技術分析，不連永豐（--standalone 即掃描並結束）
-    if args.standalone:
-        _run_standalone_scan(config)
-        return
+    console.rule(f"[bold]US Stock Trading | {mode}{dry}[/bold]")
 
     system = TradingSystem(config, dry_run=args.dry_run)
     if not system.setup():
@@ -1657,9 +1493,6 @@ def main():
             stock_rejects: list[tuple[str, str, list[str]]] = []
             for c in candidates[:max_evaluate]:
                 code = c["code"]
-                if system.risk.is_limit_up(c.get("change_pct", 0)):
-                    stock_rejects.append((code, c.get("name", "")[:8], ["接近漲停"]))
-                    continue
                 df = system.feed.get_kbars(code, lookback_days=lookback + 30)
                 if df is None or len(df) < 20:
                     stock_rejects.append((code, c.get("name", "")[:8], ["K棒不足"]))
@@ -1739,23 +1572,21 @@ def main():
 
     while _running:
         if not system.broker.ensure_connected():
-            console.print("[red]連線失敗，5 秒後重試...[/red]")
-            system.notifier.notify("🔴 永豐金連線失敗，嘗試重連中")
+            console.print("[red]Alpaca 連線失敗，5 秒後重試...[/red]")
+            system.notifier.notify("🔴 Alpaca 連線失敗，嘗試重連中")
         else:
             if system.broker.just_reconnected:
                 system.broker.just_reconnected = False
-                # 重連後 broker.api 是新物件，feed 需同步指向新實例（scanner/market_filter 共用同一 feed 物件）
-                system.feed.api = system.broker.api
+                system.feed.api = system.broker
                 system.feed.clear_cache()
-                console.print("[yellow]重連成功，Feed API 已更新，等待暖機 30 秒...[/yellow]")
+                console.print("[yellow]重連成功，等待暖機 30 秒...[/yellow]")
                 time.sleep(30)
-                # 驗證 kbars API 已就緒，避免重連後首個週期全部回傳空資料
                 for _attempt in range(6):
-                    _test = system.feed.get_kbars("0050", lookback_days=5, use_cache=False)
+                    _test = system.feed.get_kbars("SPY", lookback_days=5, use_cache=False)
                     if _test is not None:
                         system.logger.info(f"重連後 kbars API 就緒（第{_attempt+1}次驗證）")
                         break
-                    _issue = system.feed.get_last_kbar_issue("0050") or "回傳空資料"
+                    _issue = system.feed.get_last_kbar_issue("SPY") or "回傳空資料"
                     system.logger.warning(f"重連後 kbars 尚未就緒（第{_attempt+1}/6，{_issue}），等待 20 秒...")
                     time.sleep(20)
                 else:
