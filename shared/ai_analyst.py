@@ -46,7 +46,7 @@ def analyze_news(code: str, name: str, news_items: list[dict]) -> AnalysisResult
         for n in news_items[:5]
     )
 
-    prompt = f"""以下是台股 {code} {name} 的近期新聞標題與摘要：
+    prompt = f"""以下是美股 {code} {name} 的近期新聞標題與摘要：
 
 {news_text}
 

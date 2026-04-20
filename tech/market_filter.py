@@ -52,7 +52,7 @@ class MarketFilter:
         return True, ratio
 
     def is_bull_trend(self) -> bool:
-        """牛市判斷：0050 MA20 > MA60（中期上行趨勢確立）。用於調寬移動停損。"""
+        """牛市判斷：proxy MA20 > MA60（中期上行趨勢確立）。用於調寬移動停損。"""
         if not self.enabled:
             return False
         df = self.feed.get_kbars(self.proxy_code, lookback_days=70, use_cache=True)
@@ -66,7 +66,7 @@ class MarketFilter:
         return bool(ma20 > ma60)
 
     def market_atr_pct(self) -> float | None:
-        """計算 0050 近 10 日 ATR%（平均日振幅／收盤價），用於震盪程度警示。"""
+        """計算 proxy 近 10 日 ATR%（平均日振幅／收盤價），用於震盪程度警示。"""
         df = self.feed.get_kbars(self.proxy_code, lookback_days=15, use_cache=True)
         if df is None or len(df) < 10:
             return None
@@ -78,11 +78,7 @@ class MarketFilter:
 
     def is_overheating(self) -> tuple[bool, str]:
         """
-        大盤過熱過濾：0050 近期漲幅或波動率超標時暫停新開倉。
-        設定鍵（market_filter 區塊）：
-          max_20d_gain: 0050 近20日漲幅上限（0=停用，建議 0.10）
-          max_10d_gain: 0050 近10日漲幅上限（0=停用，建議 0.07）
-          max_atr_pct:  0050 ATR% 上限（0=停用，建議 0.015）
+        大盤過熱過濾：proxy 近期漲幅或波動率超標時暫停新開倉。
         回傳 (is_hot, reason_string)。
         """
         max_20d = self._cfg.get("max_20d_gain", 0.0)
@@ -97,19 +93,19 @@ class MarketFilter:
         if max_20d > 0 and len(close) >= 21:
             gain_20d = (close.iloc[-1] - close.iloc[-21]) / close.iloc[-21]
             if gain_20d > max_20d:
-                return True, f"0050 近20日漲幅 {gain_20d:.1%} > 上限 {max_20d:.1%}"
+                return True, f"{self.proxy_code} 近20日漲幅 {gain_20d:.1%} > 上限 {max_20d:.1%}"
         if max_10d > 0 and len(close) >= 11:
             gain_10d = (close.iloc[-1] - close.iloc[-11]) / close.iloc[-11]
             if gain_10d > max_10d:
-                return True, f"0050 近10日漲幅 {gain_10d:.1%} > 上限 {max_10d:.1%}"
+                return True, f"{self.proxy_code} 近10日漲幅 {gain_10d:.1%} > 上限 {max_10d:.1%}"
         if max_atr > 0:
             atr_pct = self.market_atr_pct()
             if atr_pct is not None and atr_pct > max_atr:
-                return True, f"0050 ATR% {atr_pct:.3f} > 上限 {max_atr:.3f}"
+                return True, f"{self.proxy_code} ATR% {atr_pct:.3f} > 上限 {max_atr:.3f}"
         return False, ""
 
     def get_market_drawdown(self) -> float | None:
-        """計算 0050 從歷史高點的回撤幅度（0~1），無資料回傳 None。"""
+        """計算 proxy 從歷史高點的回撤幅度（0~1），無資料回傳 None。"""
         df = self.feed.get_kbars(self.proxy_code, lookback_days=260, use_cache=True)
         if df is None or len(df) < 20:
             return None
