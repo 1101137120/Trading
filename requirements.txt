@@ -1,5 +1,6 @@
 certifi>=2023.0.0
-shioaji>=1.1.0
+shioaji>=1.1.0  # Taiwan branch only
+alpaca-py>=0.38.0  # US branch only
 pandas>=2.0.0
 numpy>=1.24.0
 pyyaml>=6.0
