@@ -24,6 +24,7 @@ class Signal:
     holding_pct: float | None = None      # 外資持股比例
     foreign_streak: int = 0               # 外資連續買超天數（0=無資料或未連買）
     trust_streak: int = 0                 # 投信連續買超天數
+    short_util: float | None = None       # 融券使用率（short_balance / short_limit）
     rank_score: float = 0.0              # hybrid 排名分數（進場時記錄）
 
 

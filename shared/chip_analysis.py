@@ -45,28 +45,20 @@ def get_chip_on_date(chip_by_date: dict, d, lookback_days: int = 7) -> dict:
 
 
 def calc_chip_score(chip: dict) -> float:
-    """計算籌碼綜合分數（0~1），無資料給 0.5 中性。"""
+    """
+    籌碼排名分數（0~1，高=好）。對齊 backtest _calc_chip_score：
+    - short_util 低 → 好：0%→1.0, 8%→0.47, ≥15%→0.0
+    - foreign_net 正 → 好：>+2000張→1.0, 0→0.5, <-2000張→0.0
+    兩項取平均；無資料回傳 0.5（中性）。
+    """
+    parts = []
+    short_util = chip.get("short_util")
+    if short_util is not None:
+        parts.append(max(0.0, 1.0 - short_util / 0.15))
     foreign_net = chip.get("foreign_net")
-    if foreign_net is None:
-        return 0.5
-    score = 0.5
-    if foreign_net > 500:    score += 0.30
-    elif foreign_net > 100:  score += 0.15
-    elif foreign_net > 0:    score += 0.05
-    elif foreign_net < -200: score -= 0.30
-    elif foreign_net < 0:    score -= 0.10
-    trust_net = chip.get("trust_net")
-    if trust_net is not None:
-        if trust_net > 100:  score += 0.20
-        elif trust_net > 0:  score += 0.10
-        elif trust_net < 0:  score -= 0.05
-    if chip.get("foreign_streak", 0) >= 4:    score += 0.20
-    elif chip.get("foreign_streak", 0) >= 3:  score += 0.12
-    elif chip.get("foreign_streak", 0) >= 2:  score += 0.05
-    if chip.get("trust_streak", 0) >= 4:      score += 0.15
-    elif chip.get("trust_streak", 0) >= 3:    score += 0.08
-    elif chip.get("trust_streak", 0) >= 2:    score += 0.03
-    return max(0.0, min(1.0, score))
+    if foreign_net is not None:
+        parts.append(min(1.0, max(0.0, (foreign_net + 2000) / 4000)))
+    return sum(parts) / len(parts) if parts else 0.5
 
 
 def should_skip_chip(

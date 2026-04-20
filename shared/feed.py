@@ -111,7 +111,22 @@ class MarketDataFeed:
             try:
                 contract = self.api.Contracts.Stocks[code]
             except Exception:
-                return None
+                pass
+        if contract is None:
+            # 部分 ETF（如 0050）可能需要交易所前綴查詢
+            for exch in ("TSE", "OTC"):
+                try:
+                    exch_obj = getattr(self.api.Contracts.Stocks, exch, None)
+                    if exch_obj is None:
+                        continue
+                    c = exch_obj.get(code) if hasattr(exch_obj, "get") else None
+                    if c is not None:
+                        contract = c
+                        break
+                    contract = exch_obj[code]
+                    break
+                except Exception:
+                    pass
         return contract
 
     def get_snapshot(self, code: str) -> Optional[dict]:

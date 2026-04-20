@@ -31,7 +31,11 @@ from shared.db import (
 
 console = Console()
 logger = logging.getLogger("finmind_chip")
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 FINMIND_API = "https://api.finmindtrade.com/api/v4/data"
 SLEEP_BETWEEN = 0.5   # 每次 request 間隔（秒），free tier 600次/天約需 0.14s，留緩衝
@@ -136,14 +140,18 @@ def _parse_holding(rows: list[dict], code: str) -> list[dict]:
 
 
 def _already_fetched(conn, code: str, year: int) -> bool:
-    """判斷某股某年的法人資料是否已存在（至少有 1 筆）"""
+    """institutional_net 和 margin_balance 都有資料才算已抓取"""
     start = f"{year}-01-01"
     end   = f"{year}-12-31"
-    r = conn.execute(
+    ni = conn.execute(
         "SELECT COUNT(*) FROM institutional_net WHERE code=? AND date>=? AND date<=?",
         [code, start, end]
-    ).fetchone()
-    return (r[0] or 0) > 0
+    ).fetchone()[0] or 0
+    nm = conn.execute(
+        "SELECT COUNT(*) FROM margin_balance WHERE code=? AND date>=? AND date<=?",
+        [code, start, end]
+    ).fetchone()[0] or 0
+    return ni > 0 and nm > 0
 
 
 def fetch_year(token: str, code: str, year: int):
@@ -169,14 +177,21 @@ def fetch_year(token: str, code: str, year: int):
         if holding:
             upsert_foreign_holding(holding, conn)
 
-    return len(inst), len(margin), len(holding)
+    ni, nm, nh = len(inst), len(margin), len(holding)
+    if ni == 0 and nm == 0 and nh == 0:
+        logger.debug(f"{code} {year}: 無資料（FinMind 無歷史）")
+    else:
+        logger.info(f"{code} {year}: 法人={ni}筆 融資券={nm}筆 持股={nh}筆")
+    return ni, nm, nh
 
 
 def main():
     parser = argparse.ArgumentParser(description="FinMind 籌碼補齊")
     parser.add_argument("--token",      default="eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNi0wNC0xMCAxNTowMzo0OCIsInVzZXJfaWQiOiJtaWtlODY3NSIsImVtYWlsIjoibWlrZTI1NTkyMDAwMjAwMEBnbWFpbC5jb20iLCJpcCI6IjIyMC4xMzAuMjMuMjI4In0.NvJJeP0kjTW_pim9myVytYsJcma_73_IW90yk9WiTJ0")
-    parser.add_argument("--year-start", type=int, default=2023)
+    parser.add_argument("--year-start", type=int, default=2009)
     parser.add_argument("--year-end",   type=int, default=date.today().year)
+    parser.add_argument("--force-years", nargs="*", type=int,
+                        help="這些年份強制重抓（忽略 skip，補部分年份缺口用）")
     parser.add_argument("--all-stocks", action="store_true", help="抓全部 daily_prices 股票（慢）")
     parser.add_argument("--codes",      nargs="*", help="指定股票代碼")
     parser.add_argument("--skip-existing", action="store_true", default=True,
@@ -185,6 +200,7 @@ def main():
     args = parser.parse_args()
 
     skip = args.skip_existing and not args.no_skip
+    force_years = set(args.force_years or [])
 
     # 決定股票清單
     with get_conn(DB_PATH, read_only=True) as conn:
@@ -209,38 +225,34 @@ def main():
     years = list(range(args.year_start, args.year_end + 1))
     total = len(codes) * len(years)
 
-    console.print(f"[bold]FinMind 籌碼補齊[/bold]")
-    console.print(f"股票數: {len(codes)} | 年份: {years[0]}~{years[-1]} | 總任務: {total}")
-    console.print(f"預估時間（free tier）: {total * 3 * SLEEP_BETWEEN / 3600:.1f} 小時")
-    console.print()
+    logger.info(f"=== FinMind 籌碼補齊開始 ===")
+    logger.info(f"股票數: {len(codes)} | 年份: {years[0]}~{years[-1]} | 總任務: {total}")
+    if force_years:
+        logger.info(f"強制重抓年份: {sorted(force_years)}")
+    logger.info(f"預估時間: {total * 3 * SLEEP_BETWEEN / 3600:.1f} 小時")
 
-    done = skip_cnt = 0
+    done = skip_cnt = err_cnt = 0
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("{task.completed}/{task.total}"),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        task = progress.add_task("籌碼補齊", total=total)
+    for i, code in enumerate(codes, 1):
+        for year in years:
+            force = year in force_years
+            if skip and not force:
+                with get_conn(DB_PATH, read_only=True) as ro_conn:
+                    if _already_fetched(ro_conn, code, year):
+                        skip_cnt += 1
+                        continue
 
-        for code in codes:
-                for year in years:
-                    progress.update(task, advance=1, description=f"[dim]{code} {year}[/dim]")
+            try:
+                ni, nm, nh = fetch_year(args.token, code, year)
+                done += 1
+            except Exception as e:
+                logger.warning(f"{code} {year}: 錯誤 {e}")
+                err_cnt += 1
 
-                    if skip:
-                        with get_conn(DB_PATH, read_only=True) as ro_conn:
-                            if _already_fetched(ro_conn, code, year):
-                                skip_cnt += 1
-                                continue
+        if i % 50 == 0:
+            logger.info(f"--- 進度 {i}/{len(codes)} 支股票 | 已抓={done} 跳過={skip_cnt} 錯誤={err_cnt} ---")
 
-                    ni, nm, nh = fetch_year(args.token, code, year)
-                    done += 1
-
-    console.print(f"\n[green]完成！[/green] 抓取 {done} 個 (code,year)，跳過 {skip_cnt} 個已有資料")
+    logger.info(f"=== 完成 === 抓取={done} 跳過={skip_cnt} 錯誤={err_cnt}")
 
     # 最終統計
     with get_conn(DB_PATH, read_only=True) as conn:

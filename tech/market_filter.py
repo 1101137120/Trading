@@ -57,6 +57,8 @@ class MarketFilter:
             return False
         df = self.feed.get_kbars(self.proxy_code, lookback_days=70, use_cache=True)
         if df is None or len(df) < 60:
+            issue = self.feed.get_last_kbar_issue(self.proxy_code) or "資料不足"
+            logger.warning(f"牛市判斷：無法取得 {self.proxy_code} K 棒（{issue}），預設非牛市")
             return False
         close = df["Close"].astype(float)
         ma20 = close.rolling(20).mean().iloc[-1]
@@ -126,7 +128,8 @@ class MarketFilter:
             use_cache=True,
         )
         if df is None or len(df) < self.ma_period:
-            logger.warning(f"大盤過濾：無法取得 {self.proxy_code} K 棒，預設允許開倉")
+            issue = self.feed.get_last_kbar_issue(self.proxy_code) or "資料不足"
+            logger.warning(f"大盤過濾：無法取得 {self.proxy_code} K 棒（{issue}），預設允許開倉")
             return True
 
         close = df["Close"].astype(float)

@@ -847,10 +847,8 @@ class TradingSystem:
             if idf is None or idf.empty:
                 return {}
             last = idf.iloc[-1]
-            # 外資/投信取近5日累計
             n = min(5, len(idf))
             tail = idf.tail(n)
-            # 連續買超天數（從最新一天往前數，遇到賣超即停）
             def _streak(col: str) -> int:
                 days = 0
                 for v in reversed(tail[col].tolist()):
@@ -859,13 +857,17 @@ class TradingSystem:
                     else:
                         break
                 return days
+            _sl = float(last["short_limit"]) if "short_limit" in last and last["short_limit"] else 0.0
+            _sb = float(last["short_balance"]) if "short_balance" in last and last["short_balance"] else None
+            _short_util = (_sb / _sl) if (_sl > 0 and _sb is not None) else None
             return {
-                "foreign_net":        float(tail["foreign_net"].sum()),
-                "trust_net":          float(tail["trust_net"].sum()),
+                "foreign_net":        float(last["foreign_net"]) if "foreign_net" in last and last["foreign_net"] is not None else None,
+                "trust_net":          float(last["trust_net"])   if "trust_net"   in last and last["trust_net"]   is not None else None,
                 "margin_short_ratio": float(last["margin_short_ratio"]) if "margin_short_ratio" in last and last["margin_short_ratio"] else None,
                 "holding_pct":        float(last["holding_pct"])        if "holding_pct"        in last and last["holding_pct"]        else None,
                 "foreign_streak":     _streak("foreign_net"),
                 "trust_streak":       _streak("trust_net"),
+                "short_util":         _short_util,
             }
 
         evaluated = skipped_pos = skipped_limit = skipped_rs = 0
@@ -919,33 +921,18 @@ class TradingSystem:
                 sig.holding_pct        = chip.get("holding_pct")
                 sig.foreign_streak     = chip.get("foreign_streak", 0)
                 sig.trust_streak       = chip.get("trust_streak", 0)
+                sig.short_util         = chip.get("short_util")
                 signals.append(sig)
 
         # rank_score 排序（conf 30% + rs 40% + ema_dev 15% + chip 15%）
         def _chip_score(s) -> float:
-            score = 0.5  # 無資料給中性
-            if s.foreign_net is None:
-                return score
-            # 外資買賣超量
-            if s.foreign_net > 500:    score += 0.30
-            elif s.foreign_net > 100:  score += 0.15
-            elif s.foreign_net > 0:    score += 0.05
-            elif s.foreign_net < -200: score -= 0.30
-            elif s.foreign_net < 0:    score -= 0.10
-            # 投信買賣超量
-            if s.trust_net is not None:
-                if s.trust_net > 100:  score += 0.20
-                elif s.trust_net > 0:  score += 0.10
-                elif s.trust_net < 0:  score -= 0.05
-            # 連續買超加分（外資）
-            if s.foreign_streak >= 4:  score += 0.20
-            elif s.foreign_streak >= 3: score += 0.12
-            elif s.foreign_streak >= 2: score += 0.05
-            # 連續買超加分（投信，力道更集中給更高加分）
-            if s.trust_streak >= 4:    score += 0.15
-            elif s.trust_streak >= 3:  score += 0.08
-            elif s.trust_streak >= 2:  score += 0.03
-            return max(0.0, min(1.0, score))
+            # 對齊 backtest _calc_chip_score：short_util 低 + foreign_net 正 → 高分
+            parts = []
+            if s.short_util is not None:
+                parts.append(max(0.0, 1.0 - s.short_util / 0.15))
+            if s.foreign_net is not None:
+                parts.append(min(1.0, max(0.0, (s.foreign_net + 2000) / 4000)))
+            return sum(parts) / len(parts) if parts else 0.5
 
         # rank 參數從 config 讀取，對齊 backtest hybrid 模式
         _rk = self.config.get("rank", {})
@@ -998,15 +985,17 @@ class TradingSystem:
             ai_note = f"[AI {analysis.sentiment} {analysis.score:+.1f}] {analysis.summary}" if analysis.has_news else "[無近期新聞]"
             _chip_parts = []
             if s.foreign_net is not None:
-                _fstr = f"外資5日={s.foreign_net:+.0f}張"
+                _fstr = f"外資={s.foreign_net:+.0f}張"
                 if s.foreign_streak >= 2:
                     _fstr += f"(連{s.foreign_streak}日)"
                 _chip_parts.append(_fstr)
             if s.trust_net is not None:
-                _tstr = f"投信5日={s.trust_net:+.0f}張"
+                _tstr = f"投信={s.trust_net:+.0f}張"
                 if s.trust_streak >= 2:
                     _tstr += f"(連{s.trust_streak}日)"
                 _chip_parts.append(_tstr)
+            if s.short_util is not None:
+                _chip_parts.append(f"融券使用率={s.short_util:.1%}")
             if s.margin_short_ratio is not None:
                 _chip_parts.append(f"資券比={s.margin_short_ratio:.2f}")
             if s.holding_pct is not None:
@@ -1097,14 +1086,19 @@ class TradingSystem:
                 if snap and self._is_gap_up_blocked(code, snap, df_gap):
                     continue
 
-            # 籌碼過濾：法人雙賣 / 資券比過高
+            # 籌碼過濾：法人雙賣 / 資券比過高 / 融券使用率過高
             _chip_cfg = self.config.get("chip_filter", {})
             if _chip_cfg.get("enabled", True):
                 _margin_max = _chip_cfg.get("margin_short_ratio_max", 4.0)
+                _short_util_max = _chip_cfg.get("short_util_max", 0.0)
                 _skip_chip, _chip_skip_reason = _should_skip_chip(
                     signal.foreign_net, signal.trust_net,
                     signal.margin_short_ratio, _margin_max,
                 )
+                if not _skip_chip and _short_util_max > 0 and signal.short_util is not None:
+                    if signal.short_util > _short_util_max:
+                        _skip_chip = True
+                        _chip_skip_reason = f"融券使用率過高({signal.short_util:.1%}>{_short_util_max:.0%})"
                 if _skip_chip:
                     name = self._code_to_name.get(code, "")
                     self.logger.info(
@@ -1189,9 +1183,11 @@ class TradingSystem:
                 name = self._code_to_name.get(code, "")
                 _m_parts = []
                 if signal.foreign_net is not None:
-                    _m_parts.append(f"外資5日={signal.foreign_net:+.0f}張")
+                    _m_parts.append(f"外資={signal.foreign_net:+.0f}張")
                 if signal.trust_net is not None:
-                    _m_parts.append(f"投信5日={signal.trust_net:+.0f}張")
+                    _m_parts.append(f"投信={signal.trust_net:+.0f}張")
+                if signal.short_util is not None:
+                    _m_parts.append(f"融券使用率={signal.short_util:.1%}")
                 if signal.margin_short_ratio is not None:
                     _m_parts.append(f"資券比={signal.margin_short_ratio:.2f}")
                 if signal.holding_pct is not None:
@@ -1255,6 +1251,7 @@ class TradingSystem:
                 "breadth":       self._current_breadth,
                 "foreign_net":   signal.foreign_net,
                 "trust_net":     signal.trust_net,
+                "short_util":    signal.short_util,
                 "margin_ratio":  signal.margin_short_ratio,
                 "holding_pct":   signal.holding_pct,
                 "alloc_pct":     _effective_pct,
@@ -1266,8 +1263,9 @@ class TradingSystem:
             lot_note = "零股" if is_odd_lot else "整張"
             _fs = f"(連{signal.foreign_streak}日)" if signal.foreign_streak >= 2 else ""
             _ts = f"(連{signal.trust_streak}日)" if signal.trust_streak >= 2 else ""
+            _su_str = f" | 融券使用率:{signal.short_util:.1%}" if signal.short_util is not None else ""
             _chip_line = (
-                f"\n💹 外資:{signal.foreign_net:+.0f}張{_fs} | 投信:{signal.trust_net:+.0f}張{_ts}"
+                f"\n💹 外資:{signal.foreign_net:+.0f}張{_fs} | 投信:{signal.trust_net:+.0f}張{_ts}{_su_str}"
                 if (signal.foreign_net is not None and signal.trust_net is not None) else ""
             )
             _msr_line = f" | 資券比:{signal.margin_short_ratio:.2f}" if signal.margin_short_ratio is not None else ""
@@ -1308,7 +1306,7 @@ class TradingSystem:
             "entry_date", "exit_date", "code", "name", "entry_price", "exit_price",
             "hold_days", "lots", "odd_lot", "cost", "pnl_pct", "max_gain_pct",
             "exit_reason", "rs_score", "ema_dev", "market_breadth_at_entry",
-            "rank_score", "confidence", "foreign_net", "trust_net", "margin_short_ratio",
+            "rank_score", "confidence", "foreign_net", "trust_net", "short_util", "margin_short_ratio",
             "holding_pct", "alloc_pct", "strategy", "fee_buy", "fee_sell", "tax",
             "pnl_dollars", "net_pnl_dollars",
         ]
@@ -1333,6 +1331,7 @@ class TradingSystem:
             "confidence":              meta.get("confidence", ""),
             "foreign_net":             meta.get("foreign_net", ""),
             "trust_net":               meta.get("trust_net", ""),
+            "short_util":              meta.get("short_util", ""),
             "margin_short_ratio":      meta.get("margin_ratio", ""),
             "holding_pct":             meta.get("holding_pct", ""),
             "alloc_pct":               meta.get("alloc_pct", ""),
@@ -1748,8 +1747,19 @@ def main():
                 # 重連後 broker.api 是新物件，feed 需同步指向新實例（scanner/market_filter 共用同一 feed 物件）
                 system.feed.api = system.broker.api
                 system.feed.clear_cache()
-                console.print("[yellow]重連成功，Feed API 已更新，等待暖機 20 秒...[/yellow]")
-                time.sleep(20)
+                console.print("[yellow]重連成功，Feed API 已更新，等待暖機 30 秒...[/yellow]")
+                time.sleep(30)
+                # 驗證 kbars API 已就緒，避免重連後首個週期全部回傳空資料
+                for _attempt in range(6):
+                    _test = system.feed.get_kbars("0050", lookback_days=5, use_cache=False)
+                    if _test is not None:
+                        system.logger.info(f"重連後 kbars API 就緒（第{_attempt+1}次驗證）")
+                        break
+                    _issue = system.feed.get_last_kbar_issue("0050") or "回傳空資料"
+                    system.logger.warning(f"重連後 kbars 尚未就緒（第{_attempt+1}/6，{_issue}），等待 20 秒...")
+                    time.sleep(20)
+                else:
+                    system.logger.warning("重連後 kbars 驗證失敗（已等待 2 分鐘），繼續執行")
                 system._sync_tick_subscriptions()
                 console.print("[yellow]Tick 已重新訂閱[/yellow]")
                 system.notifier.notify("🔄 交易系統已重連，Tick 訂閱已恢復")

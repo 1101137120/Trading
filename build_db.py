@@ -287,12 +287,16 @@ def _fetch_institutional(update_only: bool, inst_from: str | None = None):
 
         import sys as _sys
 
-        # 預先載入已有資料的日期，跳過不重抓
+        # 預先載入已有資料的日期：institutional_net 或 margin_balance 都有就跳過
         with get_conn() as conn:
-            _existing = set(r[0] for r in conn.execute(
+            _inst_dates = set(r[0] for r in conn.execute(
                 "SELECT DISTINCT date FROM institutional_net"
             ).fetchall())
-        print(f"[LOG] 已有 {len(_existing)} 個交易日資料，跳過不重抓", flush=True)
+            _margin_dates = set(r[0] for r in conn.execute(
+                "SELECT DISTINCT date FROM margin_balance"
+            ).fetchall())
+            _existing = _inst_dates | _margin_dates
+        print(f"[LOG] 已有 {len(_existing)} 個交易日資料（法人={len(_inst_dates)} 融資券={len(_margin_dates)}），跳過不重抓", flush=True)
         print(f"[LOG] 需抓取 {len(dates) - sum(1 for d in dates if d in _existing)} 個交易日", flush=True)
 
         for idx, d_str in enumerate(dates):
