@@ -12,7 +12,7 @@ class MarketFilter:
         cfg = config.get("market_filter", {})
         self._cfg = cfg
         self.enabled = cfg.get("enabled", True)
-        self.proxy_code = cfg.get("proxy_code", "0050")
+        self.proxy_code = cfg.get("proxy_code", "SPY")
         self.ma_period = cfg.get("ma_period", 20)
         self.feed = feed
 
