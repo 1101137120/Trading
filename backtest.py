@@ -1301,6 +1301,12 @@ def portfolio_simulation(
     _prev_entry_date = None
     _parking_records: list[dict] = []   # 每段閒置停泊期間記錄
     _park_mode = "0050"  # VIXTWN 狀態機："0050" 或 "00631L"
+    # 分模式停泊統計
+    _park_gain_by_mode:  dict[str, float] = {"0050": 0.0, "00631L": 0.0}
+    _park_days_by_mode:  dict[str, int]   = {"0050": 0,   "00631L": 0}
+    _park_win_by_mode:   dict[str, int]   = {"0050": 0,   "00631L": 0}
+    _park_switches = 0
+    _park_prev_mode: "str | None" = None
 
     for trade in trades_sorted:
         entry_date = trade["entry_date"]
@@ -1313,6 +1319,8 @@ def portfolio_simulation(
             _j0 = bisect.bisect_left(_mkt_keys, _to_str)
             _period_cap  = capital
             _period_gain = 0.0
+            _period_gain_by_mode: dict = {"0050": 0.0, "00631L": 0.0}
+            _period_days_by_mode: dict = {"0050": 0,   "00631L": 0}
             _park_buy_paid = False
             for _ki in range(_i0, _j0):
                 _ds  = _mkt_keys[_ki]
@@ -1324,9 +1332,13 @@ def portfolio_simulation(
                     _vix = vixtwn_daily.get(_ds)
                     if _vix is not None:
                         if _vix >= vix_park_hi:
-                            _park_mode = "00631L"
+                            if _park_mode != "00631L":
+                                _park_mode = "00631L"; _park_switches += 1
                         elif _vix <= vix_park_lo:
-                            _park_mode = "0050"
+                            if _park_mode != "0050":
+                                _park_mode = "0050"; _park_switches += 1
+                if _park_prev_mode is None:
+                    _park_prev_mode = _park_mode
                 # 第一個停泊日：扣買入手續費
                 if not _park_buy_paid:
                     _park_fee_buy = max(capital * fee_rate, min_fee)
@@ -1345,6 +1357,12 @@ def portfolio_simulation(
                 _period_gain     += _g
                 _yr_key = int(_ds[:4])
                 _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
+                _park_gain_by_mode[_park_mode] += _g
+                _park_days_by_mode[_park_mode] += 1
+                if _g > 0:
+                    _park_win_by_mode[_park_mode] += 1
+                _period_gain_by_mode[_park_mode] += _g
+                _period_days_by_mode[_park_mode] += 1
             # 停泊結束：扣賣出手續費 + ETF 稅
             if _park_buy_paid:
                 _park_fee_sell = max(capital * fee_rate, min_fee)
@@ -1357,6 +1375,8 @@ def portfolio_simulation(
                 _parking_records.append({
                     "from_date": _from_str, "to_date": _to_str,
                     "capital": _period_cap, "gain": _period_gain,
+                    "gain_by_mode": dict(_period_gain_by_mode),
+                    "days_by_mode": dict(_period_days_by_mode),
                 })
 
         # ✅ 修正：在這裡直接更新時間，確保時間線正常推進，不受後續 continue 影響   
@@ -1543,6 +1563,8 @@ def portfolio_simulation(
         _j0 = bisect.bisect_right(_mkt_keys, _to_str)  # 含末日
         _period_cap  = capital
         _period_gain = 0.0
+        _period_gain_by_mode = {"0050": 0.0, "00631L": 0.0}
+        _period_days_by_mode = {"0050": 0,   "00631L": 0}
         _park_buy_paid = False
         for _ki in range(_i0, _j0):
             _ds  = _mkt_keys[_ki]
@@ -1553,9 +1575,13 @@ def portfolio_simulation(
                 _vix = vixtwn_daily.get(_ds)
                 if _vix is not None:
                     if _vix >= vix_park_hi:
-                        _park_mode = "00631L"
+                        if _park_mode != "00631L":
+                            _park_mode = "00631L"; _park_switches += 1
                     elif _vix <= vix_park_lo:
-                        _park_mode = "0050"
+                        if _park_mode != "0050":
+                            _park_mode = "0050"; _park_switches += 1
+            if _park_prev_mode is None:
+                _park_prev_mode = _park_mode
             # 第一個停泊日：扣買入手續費
             if not _park_buy_paid:
                 _park_fee_buy = max(capital * fee_rate, min_fee)
@@ -1574,6 +1600,12 @@ def portfolio_simulation(
             _period_gain     += _g
             _yr_key = int(_ds[:4])
             _yr_0050_gain[_yr_key] = _yr_0050_gain.get(_yr_key, 0) + _g
+            _park_gain_by_mode[_park_mode] += _g
+            _park_days_by_mode[_park_mode] += 1
+            if _g > 0:
+                _park_win_by_mode[_park_mode] += 1
+            _period_gain_by_mode[_park_mode] += _g
+            _period_days_by_mode[_park_mode] += 1
         # 停泊結束：扣賣出手續費 + ETF 稅
         if _park_buy_paid:
             _park_fee_sell = max(capital * fee_rate, min_fee)
@@ -1586,6 +1618,8 @@ def portfolio_simulation(
             _parking_records.append({
                 "from_date": _from_str, "to_date": _to_str,
                 "capital": _period_cap, "gain": _period_gain,
+                "gain_by_mode": dict(_period_gain_by_mode),
+                "days_by_mode": dict(_period_days_by_mode),
             })
 
     # 回測結束，釋放剩餘持倉
@@ -1612,6 +1646,19 @@ def portfolio_simulation(
         "total_0050_gain": round(_total_0050_gain, 0),
         "yr_0050_gain": _yr_0050_gain,
         "parking_records": _parking_records,
+        "park_stats": {
+            "0050":   {
+                "days":     _park_days_by_mode["0050"],
+                "gain":     round(_park_gain_by_mode["0050"], 0),
+                "win_days": _park_win_by_mode["0050"],
+            },
+            "00631L": {
+                "days":     _park_days_by_mode["00631L"],
+                "gain":     round(_park_gain_by_mode["00631L"], 0),
+                "win_days": _park_win_by_mode["00631L"],
+            },
+            "switches": _park_switches,
+        },
     }
 
 
@@ -2661,10 +2708,27 @@ def main():
                f"[{'green' if holding_total>=0 else 'red'}]{holding_total:+,.0f} 元[/]"
                f"  [dim]({len(holding_df)} 筆)[/dim]")
     _s_0050 = psim.get("total_0050_gain", 0)
+    _park_stats = psim.get("park_stats", {})
     if _s_0050 != 0:
-        ov.add_row("停泊0050貢獻",
-                   f"[{'green' if _s_0050>=0 else 'red'}]{_s_0050:+,.0f} 元[/]"
-                   f"  [dim](閒置資金×0050日報酬，已含於最終資金)[/dim]")
+        _ps0 = _park_stats.get("0050",   {"days": 0, "gain": 0, "win_days": 0})
+        _ps1 = _park_stats.get("00631L", {"days": 0, "gain": 0, "win_days": 0})
+        _sw  = _park_stats.get("switches", 0)
+        def _park_row(ps: dict) -> str:
+            d = ps["days"]
+            if d == 0:
+                return "[dim]0天  —[/dim]"
+            wr  = ps["win_days"] / d * 100
+            avg = ps["gain"] / d if d else 0
+            clr = "green" if ps["gain"] >= 0 else "red"
+            return (f"[{clr}]{ps['gain']:+,.0f}元[/{clr}]"
+                    f"  [dim]{d}天  日勝率{wr:.0f}%  日均{avg:+.0f}元[/dim]")
+        ov.add_row("停泊 0050",   _park_row(_ps0))
+        if _ps1["days"] > 0:
+            ov.add_row("停泊 00631L", _park_row(_ps1))
+            ov.add_row("[dim]停泊切換[/dim]", f"[dim]{_sw} 次（VIXTWN ≥{args.vix_park_hi:.0f}→正2，≤{args.vix_park_lo:.0f}→0050）[/dim]")
+        else:
+            ov.add_row("[dim]停泊合計[/dim]",
+                       f"[dim]已含於最終資金  切換{_sw}次[/dim]")
     ov.add_row("總手續費+稅",   f"{psim['total_fee_tax']:>14,.0f} 元")
     ov.add_row("執行/跳過",
                f"{len(taken_df)} 筆執行  [dim]{psim['skipped']} 筆跳過[/dim]")
