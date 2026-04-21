@@ -519,6 +519,25 @@ def get_meta(key: str, conn: duckdb.DuckDBPyConnection) -> Optional[str]:
 # 宇宙快照重建
 # ──────────────────────────────────────────────
 
+def rebuild_indexes(conn: duckdb.DuckDBPyConnection):
+    """
+    重建所有 date 二級索引。
+    DuckDB 在大量 UPSERT 後 secondary index 可能損壞（equality query 結果錯誤），
+    每次全量 build 或 --update 後呼叫此函數修復。
+    """
+    _indexes = [
+        ("idx_dp_date",     "daily_prices",       "date"),
+        ("idx_univ_date",   "universe_snapshots",  "date"),
+        ("idx_inst_date",   "institutional_net",   "date"),
+        ("idx_margin_date", "margin_balance",      "date"),
+        ("idx_fhold_date",  "foreign_holding",     "date"),
+    ]
+    for idx_name, table, col in _indexes:
+        conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
+        conn.execute(f"CREATE INDEX {idx_name} ON {table}({col})")
+    conn.commit()
+
+
 def rebuild_universe_snapshots(conn: duckdb.DuckDBPyConnection, vol_window: int = 5):
     """
     從 daily_prices 重新計算每日宇宙快照並寫入 universe_snapshots。

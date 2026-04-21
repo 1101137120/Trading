@@ -36,7 +36,7 @@ from shared.standalone_feed import fetch_tse_daily_all, fetch_kbars
 from shared.db import (
     DB_PATH, get_conn, init_schema, upsert_stock, upsert_kbars,
     set_meta, get_meta, get_latest_date, get_all_stocks,
-    rebuild_universe_snapshots, db_stats,
+    rebuild_universe_snapshots, rebuild_indexes, db_stats,
     upsert_institutional_net, upsert_margin_balance, upsert_foreign_holding,
     get_latest_inst_date,
 )
@@ -369,6 +369,7 @@ def cmd_build(start: str, update_only: bool, rebuild_univ_only: bool, no_deliste
 
         if rebuild_univ_only:
             rebuild_universe_snapshots(conn)
+            rebuild_indexes(conn)
             set_meta("universe_rebuilt_at", datetime.now().isoformat(), conn)
             conn.commit()
             return
@@ -476,12 +477,15 @@ def cmd_build(start: str, update_only: bool, rebuild_univ_only: bool, no_deliste
         console.print()
         rebuild_universe_snapshots(conn)
 
+        # ── 4. 重建 index（防止 UPSERT 累積導致 DuckDB index 損壞）──
+        rebuild_indexes(conn)
+
         # 記錄更新時間
         set_meta("last_updated", datetime.now().isoformat(), conn)
         set_meta("start_date", start, conn)
         conn.commit()
 
-    # ── 4. 三大法人 / 融資融券 / 外資持股 ──
+    # ── 5. 三大法人 / 融資融券 / 外資持股 ──
     _fetch_institutional(update_only)
 
     stats = db_stats()

@@ -58,7 +58,6 @@
   --rs-pos-high-mult    1.80 \
   --rs-pos-low-thr      0.07 \
   --rs-pos-low-mult     0.80 \
-  --short-util-max      0.08 \
   --rank-w-chip         0.15 \
   --vix-park-hi         30 \
   --vix-park-lo         20 \
