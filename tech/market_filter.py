@@ -3,6 +3,8 @@
 """
 import pandas as pd
 import logging
+from functools import lru_cache
+from datetime import date
 
 logger = logging.getLogger("market_filter")
 
@@ -117,6 +119,34 @@ class MarketFilter:
         peak = close.cummax().iloc[-1]
         current = close.iloc[-1]
         return float((peak - current) / peak) if peak > 0 else 0.0
+
+    def is_panic_mode(self) -> tuple[bool, float]:
+        """
+        VIX 恐慌過濾：VIX >= vix_panic_threshold 視為恐慌模式。
+        回傳 (is_panic, vix_value)；無法取得資料時回傳 (False, 0.0)。
+        結果依交易日快取，避免頻繁呼叫 yfinance。
+        """
+        threshold = self._cfg.get("vix_panic_threshold", 0.0)
+        if threshold <= 0:
+            return False, 0.0
+        today = date.today().isoformat()
+        cached = getattr(self, "_vix_cache", None)
+        if cached and cached[0] == today:
+            vix_val = cached[1]
+            return vix_val >= threshold, vix_val
+        try:
+            import yfinance as yf
+            hist = yf.Ticker("^VIX").history(period="2d")
+            if hist.empty:
+                return False, 0.0
+            vix_val = float(hist["Close"].iloc[-1])
+            self._vix_cache = (today, vix_val)
+            is_panic = vix_val >= threshold
+            logger.info(f"VIX={vix_val:.1f} 門檻={threshold:.0f} → {'恐慌模式' if is_panic else '正常'}")
+            return is_panic, vix_val
+        except Exception as e:
+            logger.warning(f"VIX 取得失敗: {e}")
+            return False, 0.0
 
     def allow_long(self) -> bool:
         if not self.enabled:

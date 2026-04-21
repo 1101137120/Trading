@@ -206,6 +206,8 @@ class TradingSystem:
         self._is_bull_market: bool = False  # 0050 MA20>MA60，每週期更新一次
         self._trade_meta: dict[str, dict] = {}  # 進場時記錄的額外 metadata（用於 CSV log）
         self._current_breadth: float = 0.0      # 最近一次廣度比例
+        self._park_mode: str = "none"            # "none"/"0050"/"00631L"  VIXTWN 停泊模式
+        self._vixtwn: dict[str, float] = {}      # VIXTWN 每日收盤值，啟動時載入
 
     def setup(self) -> bool:
         console.print("[bold cyan]正在連線永豐金...[/bold cyan]")
@@ -229,6 +231,7 @@ class TradingSystem:
         if self.portfolio.positions:
             self.broker.subscribe_ticks(list(self.portfolio.positions.keys()))
 
+        self._load_vixtwn()
         console.print("[bold green]系統初始化完成[/bold green]")
         self.notifier.notify(
             "✅ <b>交易系統啟動</b>\n"
@@ -458,27 +461,42 @@ class TradingSystem:
                 signals = []
 
             if signals and not self.market_filter.allow_long():
-                self.logger.info("大盤趨勢偏空，本週期不開新倉")
-                stbl = Table(title="買入訊號（大盤偏空，僅供參考）", show_header=True)
-                stbl.add_column("代碼", style="cyan")
-                stbl.add_column("名稱", style="dim")
-                stbl.add_column("信心", justify="right")
-                stbl.add_column("理由", style="dim")
-                _bear_lines = []
-                for s in signals:
-                    name = code_to_name.get(s.code, "")
-                    stbl.add_row(s.code, name, f"{s.confidence:.2f}", (s.reason or "")[:40])
-                    self.logger.info(f"[訊號-未執行] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
-                    _bear_lines.append(f"• {s.code} {name}  信心={s.confidence:.2f}")
-                console.print(stbl)
-                self.notifier.notify(
-                    f"🐻 <b>大盤偏空，訊號擱置</b>\n"
-                    "━━━━━━━━━━━━━━━\n"
-                    "0050 MA20 &lt; MA60，多頭趨勢未確立\n"
-                    + "\n".join(_bear_lines),
-                    parse_mode="HTML"
-                )
-                signals = []
+                # 恐慌反彈例外：VIX 高點時允許 panic_rebound 訊號穿越大盤偏空封鎖
+                _panic_signals = [s for s in signals if s.strategy == "panic_rebound"]
+                _vix_thr = self.config.get("market_filter", {}).get("vix_panic_threshold", 0.0)
+                _vix_override = False
+                if _panic_signals and _vix_thr > 0:
+                    _is_panic, _vix_val = self.market_filter.is_panic_mode()
+                    if _is_panic:
+                        _vix_override = True
+                        self.logger.info(
+                            f"VIX 恐慌模式 ({_vix_val:.1f} >= {_vix_thr:.0f})，"
+                            f"保留 {len(_panic_signals)} 個 panic_rebound 訊號"
+                        )
+                        signals = _panic_signals
+
+                if not _vix_override:
+                    self.logger.info("大盤趨勢偏空，本週期不開新倉")
+                    stbl = Table(title="買入訊號（大盤偏空，僅供參考）", show_header=True)
+                    stbl.add_column("代碼", style="cyan")
+                    stbl.add_column("名稱", style="dim")
+                    stbl.add_column("信心", justify="right")
+                    stbl.add_column("理由", style="dim")
+                    _bear_lines = []
+                    for s in signals:
+                        name = code_to_name.get(s.code, "")
+                        stbl.add_row(s.code, name, f"{s.confidence:.2f}", (s.reason or "")[:40])
+                        self.logger.info(f"[訊號-未執行] {s.code} 信心={s.confidence:.2f} 理由={s.reason}")
+                        _bear_lines.append(f"• {s.code} {name}  信心={s.confidence:.2f}")
+                    console.print(stbl)
+                    self.notifier.notify(
+                        f"🐻 <b>大盤偏空，訊號擱置</b>\n"
+                        "━━━━━━━━━━━━━━━\n"
+                        "0050 MA20 &lt; MA60，多頭趨勢未確立\n"
+                        + "\n".join(_bear_lines),
+                        parse_mode="HTML"
+                    )
+                    signals = []
 
             _bull_entry_only = self.config.get("market_filter", {}).get("bull_entry_only", False)
             if signals and _bull_entry_only and not self._is_bull_market:
@@ -520,6 +538,7 @@ class TradingSystem:
             if signals:
                 self._execute_buy_signals(signals)
 
+            self._manage_park_position()
             self._print_summary()
         except Exception as e:
             self.logger.exception(f"交易週期例外，下週期繼續: {e}")
@@ -669,7 +688,9 @@ class TradingSystem:
             pending = set(self.portfolio._pending_exits)
         codes_to_check = [
             code for code in list(self.portfolio.positions.keys())
-            if code not in pending and not self.exdiv.is_ex_dividend_today(code)
+            if code not in pending
+            and not self.exdiv.is_ex_dividend_today(code)
+            and not self.portfolio.positions[code].is_park   # 停泊倉不設停損停利
         ]
         if not codes_to_check:
             return
@@ -716,6 +737,8 @@ class TradingSystem:
         mkt_ret = self._get_market_return_20d() if rs_min > 0 else 0.0
 
         for code, pos in list(self.portfolio.positions.items()):
+            if pos.is_park:
+                continue   # 停泊倉不加碼
             level    = pos.pyramid_level
             pnl_pct  = pos.pnl_pct
             if level >= 2:
@@ -819,6 +842,144 @@ class TradingSystem:
         close = df["Close"].astype(float)
         base = close.iloc[-21]
         return float((close.iloc[-1] - base) / base) if base > 0 else 0.0
+
+    # ── VIXTWN 閒置資金停泊 ────────────────────────────────────────────────
+
+    def _load_vixtwn(self):
+        import json as _json
+        from pathlib import Path as _Path
+        vixtwn_path = _Path(__file__).parent.parent / "shared" / "data" / "vixtwn.json"
+        try:
+            raw = _json.loads(vixtwn_path.read_text(encoding="utf-8"))
+            entries = raw[0] if raw and raw[0] else []
+            for date_str, val_str in entries:
+                try:
+                    self._vixtwn[date_str] = float(val_str)
+                except (ValueError, TypeError):
+                    pass
+            self.logger.info(f"載入 VIXTWN 資料 {len(self._vixtwn)} 筆（最新: {max(self._vixtwn) if self._vixtwn else '無'}）")
+        except Exception as e:
+            self.logger.warning(f"VIXTWN 資料載入失敗: {e}（停泊功能停用）")
+
+    def _get_vixtwn_today(self) -> "float | None":
+        if not self._vixtwn:
+            return None
+        latest_date = max(self._vixtwn.keys())
+        from datetime import date as _date
+        lag = (_date.today() - _date.fromisoformat(latest_date)).days
+        if lag > 7:
+            self.logger.warning(f"VIXTWN 資料過舊（{latest_date}，落後 {lag} 天），停泊功能暫停")
+            return None
+        return self._vixtwn[latest_date]
+
+    def _manage_park_position(self):
+        """根據 VIXTWN 決定閒置資金停泊標的（0050 或 00631L），並執行買賣。"""
+        mf_cfg = self.config.get("market_filter", {})
+        vix_park_hi = mf_cfg.get("vix_park_hi", 0)
+        vix_park_lo = mf_cfg.get("vix_park_lo", 0)
+        if vix_park_hi <= 0:
+            return
+
+        vix_val = self._get_vixtwn_today()
+        if vix_val is None:
+            return
+
+        # 更新模式（遲滯：只在明確越過門檻時才切換）
+        if vix_val >= vix_park_hi:
+            self._park_mode = "00631L"
+        elif vix_val <= vix_park_lo:
+            self._park_mode = "0050"
+        elif self._park_mode == "none":
+            self._park_mode = "0050"   # 首次初始化預設停泊 0050
+
+        target = self._park_mode
+
+        # 找出目前持有的停泊倉
+        held_park = {c: p for c, p in self.portfolio.positions.items() if p.is_park}
+
+        # 持有的停泊標的錯誤 → 賣出後下一個週期再買
+        for pcode, ppos in held_park.items():
+            if pcode != target:
+                self.logger.info(
+                    f"[停泊] VIXTWN={vix_val:.1f} 模式切換 {pcode}→{target}，賣出停泊倉"
+                )
+                self.notifier.notify(
+                    f"🔄 <b>VIX停泊切換</b> {pcode}→{target}\n"
+                    f"VIXTWN={vix_val:.1f}（{'≥'+str(int(vix_park_hi)) if target=='00631L' else '≤'+str(int(vix_park_lo))}）",
+                    parse_mode="HTML"
+                )
+                if self.portfolio.try_mark_exit(pcode):
+                    self._execute_sell(pcode, ppos, f"VIX停泊切換→{target}")
+                return   # 等賣出確認後下一週期再買
+
+        # 已持有正確標的 → 不動
+        if target in held_park:
+            pos = held_park[target]
+            self.logger.info(f"[停泊] 持有 {target} {pos.quantity}張，VIXTWN={vix_val:.1f}")
+            return
+
+        # 掛單中 → 等待
+        if target in self.portfolio.pending_orders or target in self.portfolio.pending_sells:
+            return
+
+        # 計算可用資金（不足則跳過）
+        avail = self.portfolio.available_capital
+        min_val = self.config["risk"].get("min_order_value", 10000)
+        if avail < min_val:
+            return
+
+        # 取得價格
+        sim = self.config["broker"].get("simulation", False)
+        price = 0.0
+        if sim:
+            df = self.feed.get_kbars(target, lookback_days=5)
+            if df is not None and len(df) > 0:
+                price = float(df["Close"].iloc[-1])
+        else:
+            snap = self.feed.get_snapshot(target)
+            if snap:
+                price = snap.get("close", 0)
+        if price <= 0:
+            self.logger.warning(f"[停泊] 無法取得 {target} 價格，跳過")
+            return
+
+        # 計算張數
+        qty_lots = int(avail / (price * 1000))
+        if qty_lots >= 1:
+            qty, is_odd_lot = qty_lots, False
+        else:
+            qty = int(avail / price)
+            is_odd_lot = True
+        if qty < 1:
+            return
+
+        unit = "股" if is_odd_lot else "張"
+        label = "恐慌反彈停泊正2" if target == "00631L" else "閒置停泊0050"
+        self.logger.info(f"[停泊] 買入 {target} {qty}{unit} @ {price:.2f} | VIXTWN={vix_val:.1f} | {label}")
+        self.notifier.notify(
+            f"🏦 <b>閒置資金停泊</b> {target}\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"VIXTWN={vix_val:.1f}  {label}\n"
+            f"買入 {qty}{unit} @ {price:.2f}  可用 {avail:,.0f}元",
+            parse_mode="HTML"
+        )
+
+        trade = None
+        if not self.dry_run:
+            trade = (self.broker.place_odd_lot_order(target, "Buy", price, qty)
+                     if is_odd_lot else
+                     self.broker.place_limit_order(target, "Buy", price, qty))
+            if trade is None:
+                self.logger.warning(f"[停泊] {target} 下單失敗")
+                return
+
+        po = PendingOrder(
+            code=target, action="Buy", quantity=qty, price=price,
+            stop_loss=0.0, take_profit=0.0,
+            placed_time=datetime.now(), trade_ref=trade, odd_lot=is_odd_lot,
+            rs_score=0.0, is_park=True,
+        )
+        self.portfolio.add_pending(po)
 
     def _evaluate_candidates(self, candidates: list[dict]) -> list:
         signals = []
@@ -1193,13 +1354,23 @@ class TradingSystem:
                 if signal.holding_pct is not None:
                     _m_parts.append(f"外資持股={signal.holding_pct:.1%}")
                 _chip_str = "  ".join(_m_parts) if _m_parts else "無籌碼資料"
-                _occupied = len(self.portfolio.positions) + len(self.portfolio.pending_orders)
+                _occupied = sum(1 for p in self.portfolio.positions.values() if not p.is_park) + len(self.portfolio.pending_orders)
                 _max_pos  = _max_pos_override if _max_pos_override else self.config["risk"].get("max_positions", 5)
+                _capital_short = order_value > self.portfolio.available_capital
                 _skip_reason = (
                     f"倉位已滿（{_occupied}/{_max_pos}）"
                     if _occupied >= _max_pos
                     else f"資金不足（需{order_value:,.0f} 可用{self.portfolio.available_capital:,.0f}）"
                 )
+                # 資金不足但有停泊倉 → 先賣停泊倉，下次週期再進場
+                if _capital_short:
+                    _park_held = [(c, p) for c, p in self.portfolio.positions.items() if p.is_park]
+                    if _park_held:
+                        _pc, _pp = _park_held[0]
+                        self.logger.info(f"[停泊] 賣出 {_pc} 釋放資金以進場 {code}")
+                        if self.portfolio.try_mark_exit(_pc):
+                            self._execute_sell(_pc, _pp, f"釋放資金→{code}")
+                        continue
                 self.logger.info(
                     f"[錯失] {code} {name} {_skip_reason}"
                     f" | RS={signal.rs_score:+.3f} ema_dev={signal.ema_dev:.3f} 信心={signal.confidence:.2f}"
@@ -1283,6 +1454,8 @@ class TradingSystem:
 
     def _write_trade_csv(self, code: str, pos, exit_price: float, exit_date: str):
         """將已完成交易寫入 tech/logs/trades_YYYY.csv（與回測 CSV 欄位對齊）"""
+        if getattr(pos, "is_park", False):
+            return   # 停泊倉不記錄為交易紀錄
         meta = self._trade_meta.get(code, {})
         year = datetime.now().year
         log_dir = PROJECT_ROOT / "logs"

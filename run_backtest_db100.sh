@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差
 .venv/bin/python backtest.py --show-skipped \
-  --start               2026-04-15 \
+  --start               2009-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
   --stop-loss           8 \
@@ -60,4 +60,6 @@
   --rs-pos-low-mult     0.80 \
   --short-util-max      0.08 \
   --rank-w-chip         0.15 \
+  --vix-park-hi         30 \
+  --vix-park-lo         20 \
   "$@"

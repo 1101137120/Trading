@@ -12,6 +12,7 @@ from .breakout import BreakoutStrategy
 from .ema_trend import EmaTrendStrategy
 from .kd_cross import KdCrossStrategy
 from .range_trading import RangeTradingStrategy
+from .panic_rebound import PanicReboundStrategy
 
 logger = logging.getLogger("strategy.engine")
 
@@ -22,6 +23,7 @@ STRATEGY_MAP = {
     "ema_trend": EmaTrendStrategy,
     "kd_cross": KdCrossStrategy,
     "range_trading": RangeTradingStrategy,
+    "panic_rebound": PanicReboundStrategy,
 }
 
 MIN_CONFIDENCE = 0.25

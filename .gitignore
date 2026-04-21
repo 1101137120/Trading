@@ -1,5 +1,6 @@
 # ── 敏感設定（含 API Key / CA 密碼，絕不 commit）──────────────────────────
 tech/config/config.yaml
+tech/config/config.us.yaml
 value/config/config.yaml
 
 # ── 憑證與私鑰 ──────────────────────────────────────────────────────────────

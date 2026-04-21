@@ -385,6 +385,7 @@ def simulate_trades(
     chip_filter: bool = False,               # True=啟用法人雙賣/資券比過高過濾
     chip_margin_max: float = 4.0,           # 資券比上限（0=停用）
     short_util_max: float = 0.0,            # 融券使用率上限（0=停用，例如 0.08=8%）
+    vix_panic_days: "set | None" = None,   # VIX >= 門檻的日期集合；panic_rebound 可繞過大盤偏空封鎖
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -797,18 +798,26 @@ def simulate_trades(
 
         # ── 空倉：大盤過濾 ──
         if market_allow and not market_allow.get(row_date, True):
-            if skipped_out is not None and i + 1 < len(df):
-                sig = (_batch_signals.get(i) if _batch_signals is not None
-                       else engine.evaluate(code, df.iloc[: i + 1].copy()))
-                if sig and sig.action == "Buy":
+            _is_panic_day = vix_panic_days is not None and row_date in vix_panic_days
+            if _is_panic_day or (skipped_out is not None and i + 1 < len(df)):
+                _mf_sig = (_batch_signals.get(i) if _batch_signals is not None
+                           else engine.evaluate(code, df.iloc[:i + 1].copy()))
+            else:
+                _mf_sig = None
+            # panic_rebound 例外：VIX 恐慌日允許繞過大盤偏空封鎖
+            if (_is_panic_day and _mf_sig and
+                    _mf_sig.action == "Buy" and _mf_sig.strategy == "panic_rebound"):
+                pass  # 不 continue，讓訊號繼續往下評估
+            else:
+                if skipped_out is not None and _mf_sig and _mf_sig.action == "Buy" and i + 1 < len(df):
                     _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
                     if _ep > 0:
                         _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
                                              _ep * (1 + take_profit_pct), end, slippage_pct)
                         skipped_out.append({"code": code, "signal_date": row_date,
                                             "skip_reason": "大盤偏空", "entry_price": round(_ep, 2),
-                                            "strategy": sig.strategy, **_fwd})
-            continue
+                                            "strategy": _mf_sig.strategy, **_fwd})
+                continue
 
         # ── 空倉：大盤持續上行過濾（MA20 > MA60）──
         if market_bull_entry and not market_bull.get(row_date, False):
@@ -1235,6 +1244,10 @@ def portfolio_simulation(
     rs_pos_high_mult: float = 1.3,      # 高 RS 倉位乘數
     rs_pos_low_thr: float = 0.0,        # RS < 此值時縮小倉位（0=停用）
     rs_pos_low_mult: float = 0.8,       # 低 RS 倉位乘數
+    vixtwn_daily: "dict[str, float] | None" = None,  # VIXTWN 每日收盤值
+    bench2x_daily_ret: "dict[str, float] | None" = None,  # 00631L 每日報酬
+    vix_park_hi: float = 30.0,          # VIXTWN >= 此值時切換停泊至 00631L
+    vix_park_lo: float = 20.0,          # VIXTWN <= 此值時切回 0050
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1281,12 +1294,13 @@ def portfolio_simulation(
     total_open_cost = 0.0   # 所有持倉的買入成本合計
     _active_trade_ids: dict[str, str] = {}  # code → trade_id of active non-pyramid trade
 
-    # 0050 輪動追蹤
+    # 0050 / 00631L 輪動追蹤
     _mkt_keys: list[str] = sorted(market_daily_ret.keys()) if market_daily_ret else []
     _yr_0050_gain: dict[int, float] = {}
     _total_0050_gain = 0.0
     _prev_entry_date = None
     _parking_records: list[dict] = []   # 每段閒置停泊期間記錄
+    _park_mode = "0050"  # VIXTWN 狀態機："0050" 或 "00631L"
 
     for trade in trades_sorted:
         entry_date = trade["entry_date"]
@@ -1305,6 +1319,14 @@ def portfolio_simulation(
                 # 只在 0050>MA20 時才停泊（market_above_ma 未提供則無條件停泊）
                 if market_above_ma is not None and not market_above_ma.get(_ds, False):
                     continue
+                # VIXTWN 狀態機：決定停泊標的（0050 或 00631L）
+                if vixtwn_daily:
+                    _vix = vixtwn_daily.get(_ds)
+                    if _vix is not None:
+                        if _vix >= vix_park_hi:
+                            _park_mode = "00631L"
+                        elif _vix <= vix_park_lo:
+                            _park_mode = "0050"
                 # 第一個停泊日：扣買入手續費
                 if not _park_buy_paid:
                     _park_fee_buy = max(capital * fee_rate, min_fee)
@@ -1312,7 +1334,11 @@ def portfolio_simulation(
                     _total_0050_gain -= _park_fee_buy
                     total_fees       += _park_fee_buy
                     _park_buy_paid    = True
-                _ret = market_daily_ret[_ds]
+                if (_park_mode == "00631L" and bench2x_daily_ret
+                        and _ds in bench2x_daily_ret):
+                    _ret = bench2x_daily_ret[_ds]
+                else:
+                    _ret = market_daily_ret[_ds]
                 _g   = capital * _ret
                 capital          += _g
                 _total_0050_gain += _g
@@ -1522,6 +1548,14 @@ def portfolio_simulation(
             _ds  = _mkt_keys[_ki]
             if market_above_ma is not None and not market_above_ma.get(_ds, False):
                 continue
+            # VIXTWN 狀態機
+            if vixtwn_daily:
+                _vix = vixtwn_daily.get(_ds)
+                if _vix is not None:
+                    if _vix >= vix_park_hi:
+                        _park_mode = "00631L"
+                    elif _vix <= vix_park_lo:
+                        _park_mode = "0050"
             # 第一個停泊日：扣買入手續費
             if not _park_buy_paid:
                 _park_fee_buy = max(capital * fee_rate, min_fee)
@@ -1529,7 +1563,11 @@ def portfolio_simulation(
                 _total_0050_gain -= _park_fee_buy
                 total_fees       += _park_fee_buy
                 _park_buy_paid    = True
-            _ret = market_daily_ret[_ds]
+            if (_park_mode == "00631L" and bench2x_daily_ret
+                    and _ds in bench2x_daily_ret):
+                _ret = bench2x_daily_ret[_ds]
+            else:
+                _ret = market_daily_ret[_ds]
             _g   = capital * _ret
             capital          += _g
             _total_0050_gain += _g
@@ -1814,6 +1852,13 @@ def main():
     parser.add_argument("--market-atr-max", type=float, default=0.0,
                         help="大盤震盪過濾：0050近10日ATR%%超過此值時停止進場（建議 0.015=1.5%%；0=停用）"
                              "。捕捉0050雖上漲但劇烈震盪的市況，避免個股被洗出。")
+    parser.add_argument("--vix-panic-threshold", type=float, default=0.0,
+                        help="VIX 恐慌門檻：VIX >= 此值的交易日允許 panic_rebound 策略繞過大盤偏空封鎖"
+                             "（建議 30；0=停用）。需搭配 --strategies panic_rebound 使用。")
+    parser.add_argument("--vix-park-hi", type=float, default=30.0,
+                        help="VIXTWN 閒置停泊門檻（高）：VIXTWN >= 此值時閒置資金改停泊 00631L 正2（預設 30）")
+    parser.add_argument("--vix-park-lo", type=float, default=20.0,
+                        help="VIXTWN 閒置停泊門檻（低）：VIXTWN <= 此值時閒置資金切回 0050（預設 20）")
     parser.add_argument("--pyramid-gain", type=float, default=0.0,
                         help="第一次加碼門檻：持倉漲幅達此值時加碼（建議 0.20=20%%；0=停用）")
     parser.add_argument("--pyramid-gain2", type=float, default=0.0,
@@ -2141,6 +2186,30 @@ def main():
     else:
         console.print("[dim]大盤過濾：停用[/dim]")
 
+    # ── 載入 VIX 歷史資料（panic_rebound 策略用）──
+    vix_panic_days = None
+    if getattr(args, "vix_panic_threshold", 0.0) > 0:
+        try:
+            import yfinance as yf
+            _vix_hist = yf.Ticker("^VIX").history(
+                start=(start - __import__("datetime").timedelta(days=5)).isoformat(),
+                end=end.isoformat(),
+            )
+            if not _vix_hist.empty:
+                vix_panic_days = {
+                    (d.date() if hasattr(d, "date") else d)
+                    for d, row in _vix_hist.iterrows()
+                    if row["Close"] >= args.vix_panic_threshold
+                }
+                console.print(
+                    f"[dim]VIX 恐慌過濾：門檻 {args.vix_panic_threshold:.0f}，"
+                    f"共 {len(vix_panic_days)} 個恐慌日[/dim]"
+                )
+            else:
+                console.print("[yellow]VIX 資料為空，panic_rebound 不套用 VIX 日期過濾[/yellow]")
+        except Exception as _e:
+            console.print(f"[yellow]VIX 資料取得失敗: {_e}，panic_rebound 不套用 VIX 過濾[/yellow]")
+
     # ── 載入 00631L（0050正2）K棒，用於 benchmark 比較 ──
     lookback_bench = (end - start).days + 30
     bench2x_df = None
@@ -2158,6 +2227,32 @@ def main():
         bench2x_df = None
     else:
         bench2x_df = adjust_splits(bench2x_df)
+
+    # ── 建立 00631L 日報酬字典（閒置資金停泊 VIXTWN 模式用）──
+    _bench2x_daily_ret: dict[str, float] = {}
+    if bench2x_df is not None:
+        _b2x = bench2x_df.sort_values("ts")
+        _b2x_d = _b2x["ts"].dt.strftime("%Y-%m-%d").values
+        _b2x_c = _b2x["Close"].values.astype(float)
+        for _ii in range(1, len(_b2x_d)):
+            if _b2x_c[_ii - 1] > 0:
+                _bench2x_daily_ret[_b2x_d[_ii]] = float(_b2x_c[_ii] / _b2x_c[_ii - 1] - 1)
+
+    # ── 載入 VIXTWN（台指選擇權波動率指數）──
+    _vixtwn_daily: dict[str, float] = {}
+    _vixtwn_path = Path(__file__).parent / "shared" / "data" / "vixtwn.json"
+    if _vixtwn_path.exists():
+        try:
+            import json as _json
+            _raw = _json.loads(_vixtwn_path.read_text(encoding="utf-8"))
+            _pairs = _raw[0] if isinstance(_raw, list) and _raw and isinstance(_raw[0], list) else _raw
+            for _item in _pairs:
+                if isinstance(_item, (list, tuple)) and len(_item) == 2:
+                    _vixtwn_daily[str(_item[0])[:10]] = float(_item[1])
+            console.print(f"[dim]VIXTWN 資料：{len(_vixtwn_daily)} 筆（"
+                          f"{min(_vixtwn_daily)} ~ {max(_vixtwn_daily)}）[/dim]")
+        except Exception as _e:
+            console.print(f"[yellow]VIXTWN 載入失敗: {_e}[/yellow]")
 
     loss_cooldown = args.loss_cooldown
 
@@ -2365,6 +2460,7 @@ def main():
                 chip_filter=args.chip_filter,
                 chip_margin_max=args.chip_margin_max,
                 short_util_max=args.short_util_max,
+                vix_panic_days=vix_panic_days,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -2498,6 +2594,10 @@ def main():
         rs_pos_high_mult=args.rs_pos_high_mult,
         rs_pos_low_thr=args.rs_pos_low_thr,
         rs_pos_low_mult=args.rs_pos_low_mult,
+        vixtwn_daily=_vixtwn_daily if _vixtwn_daily else None,
+        bench2x_daily_ret=_bench2x_daily_ret if _bench2x_daily_ret else None,
+        vix_park_hi=args.vix_park_hi,
+        vix_park_lo=args.vix_park_lo,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()

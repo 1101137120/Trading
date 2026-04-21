@@ -21,6 +21,9 @@ market_filter:
   max_20d_gain: 0.10  # 0050近20日漲幅超過10%視為過熱，暫停開倉（0=停用）
   max_10d_gain: 0.07  # 0050近10日漲幅超過7%視為過熱（0=停用）
   max_atr_pct: 0.015  # 0050 ATR%超過1.5%視為震盪過激，暫停開倉（0=停用）
+  # VIX 恐慌反彈：VIX >= 此值時允許 panic_rebound 策略繞過大盤偏空封鎖
+  # 關稅戰/系統性恐慌時用，0 = 停用（建議 30，極端恐慌考慮 35）
+  vix_panic_threshold: 0  # 建議值 30
 
 # ── 風控 ──────────────────────────────────────────────────────────────────
 risk:
@@ -93,6 +96,8 @@ entry_filter:
 # 建議至少保留 ema_trend + kd_cross，這兩組在回測中訊號最多、表現最穩。
 strategies:
   active: ["momentum", "breakout", "mean_reversion", "ema_trend", "kd_cross"]
+  # panic_rebound 預設不啟用；搭配 vix_panic_threshold 使用
+  # active: ["ema_trend", "kd_cross", "panic_rebound"]
 
   # 動能策略：RSI 脫離超賣 + MACD 柱狀翻正
   momentum:
@@ -131,6 +136,16 @@ strategies:
     adx_min: 20            # ADX 低於此值視為橫盤，不進場（0 = 停用）
     max_ema_dev: 0.08      # 收盤距 EMA20 乖離率上限，超過視為追高不進場（0 = 停用）
     min_atr_pct: 2.0       # ATR% 下限，低於此值視為死魚股不進場（0 = 停用）
+
+  # 恐慌反彈策略：RSI < 25 + 跌破布林下軌 + 爆量（恐慌賣盤宣洩）
+  # 搭配 market_filter.vix_panic_threshold 使用，VIX 高時才實際進場
+  panic_rebound:
+    rsi_period: 14
+    rsi_threshold: 25    # 比 mean_reversion 更深的超賣（建議 22~28）
+    bb_period: 20
+    bb_std: 2.0
+    vol_spike: 1.5       # 當日量 >= 5日均量 × 此倍數才進場（恐慌爆量確認）
+    lookback_days: 30
 
   # KD 黃金交叉：K 從超賣區上穿 D + RSI 回升（短線反彈）
   kd_cross:

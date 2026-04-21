@@ -16,6 +16,7 @@ Schema：
   df = load_kbars("2330", "2022-01-01", "2026-03-28")
   codes = load_universe("2024-06-01", top_n=60)
 """
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -31,12 +32,26 @@ DB_PATH = Path(__file__).resolve().parent.parent / "data" / "stocks.db"
 # ──────────────────────────────────────────────
 
 @contextmanager
-def get_conn(db_path: Path = DB_PATH, read_only: bool = False):
+def get_conn(db_path: Path = DB_PATH, read_only: bool = False,
+             retries: int = 6, retry_delay: float = 5.0):
     """DuckDB 連線 context manager，離開時自動 commit / rollback / close。
     read_only=True 允許多程序同時讀取（backtest 並發用）。
+    retries: 遇到鎖衝突時最多重試次數（預設 6 次 × 5 秒 = 最多等 30 秒）
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = duckdb.connect(str(db_path), read_only=read_only)
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            conn = duckdb.connect(str(db_path), read_only=read_only)
+            break
+        except duckdb.IOException as e:
+            last_err = e
+            if "Conflicting lock" in str(e) and attempt < retries:
+                time.sleep(retry_delay)
+                continue
+            raise
+    else:
+        raise last_err
     try:
         yield conn
         if not read_only:

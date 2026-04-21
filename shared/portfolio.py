@@ -29,6 +29,7 @@ class PendingOrder:
     chase_count: int = 0       # 已追單次數
     odd_lot: bool = False      # True = 零股（股），False = 整張（張）
     rs_score: float = 0.0      # 進場當時的相對強弱分數（用於移動停損加成）
+    is_park: bool = False      # True = VIX 停泊倉（0050 或 00631L），不計入 max_positions
 
     @property
     def order_value(self) -> float:
@@ -52,6 +53,7 @@ class Position:
     odd_lot: bool = False          # True = 零股（股），False = 整張（張）
     rs_score: float = 0.0          # 進場當時的相對強弱分數（用於移動停損加成）
     pyramid_level: int = 0         # 已加碼次數（0=未加碼，1=第一次，2=第二次）
+    is_park: bool = False          # True = VIX 停泊倉（0050 或 00631L），不計入 max_positions
 
     @property
     def _lot_multiplier(self) -> int:
@@ -235,7 +237,7 @@ class Portfolio:
             code=code, direction=po.action, quantity=fill_qty, entry_price=fill_price,
             entry_time=datetime.now(), stop_loss=po.stop_loss, take_profit=po.take_profit,
             current_price=fill_price, trade_ref=po.trade_ref, odd_lot=po.odd_lot,
-            rs_score=po.rs_score,
+            rs_score=po.rs_score, is_park=po.is_park,
         )
         self.add_position(pos)
         unit = "股" if po.odd_lot else "張"
@@ -316,7 +318,8 @@ class Portfolio:
             return False
         max_pos  = max_positions_override if max_positions_override > 0 else self.risk_cfg["max_positions"]
         max_pct  = max_pct_override if max_pct_override > 0 else self.risk_cfg["max_position_pct"]
-        occupied = len(self.positions) + len(self.pending_orders)
+        # 停泊倉（is_park）不計入持倉上限
+        occupied = sum(1 for p in self.positions.values() if not p.is_park) + len(self.pending_orders)
         if occupied >= max_pos:
             return False
         if order_value > self.available_capital:
@@ -356,7 +359,7 @@ class Portfolio:
                  "stop_loss": p.stop_loss, "take_profit": p.take_profit,
                  "current_price": p.current_price, "odd_lot": p.odd_lot,
                  "trailing_active": p.trailing_active, "highest_price": p.highest_price,
-                 "pyramid_level": p.pyramid_level}
+                 "pyramid_level": p.pyramid_level, "is_park": p.is_park}
                 for p in self.positions.values()
             ],
             "pending_orders": [
@@ -397,6 +400,7 @@ class Portfolio:
                     highest_price=d.get("highest_price", 0.0),
                     odd_lot=d.get("odd_lot", False),
                     pyramid_level=d.get("pyramid_level", 0),
+                    is_park=d.get("is_park", False),
                 )
                 positions[d["code"]] = pos
             pending = {}
