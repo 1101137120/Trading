@@ -43,7 +43,7 @@ from tech.strategies.engine import StrategyEngine
 from shared.standalone_feed import fetch_kbars
 from shared.news_feed import get_stock_news
 from shared.ai_analyst import analyze_news
-from shared.db import bulk_load_institutional
+from shared.db_selector import bulk_load_institutional
 from shared.chip_analysis import should_skip_chip as _should_skip_chip
 from shared.position_sizing import calc_position_pct as _calc_position_pct
 

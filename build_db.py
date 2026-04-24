@@ -38,7 +38,7 @@ from shared.db import (
     set_meta, get_meta, get_latest_date, get_all_stocks,
     rebuild_universe_snapshots, rebuild_indexes, db_stats,
     upsert_institutional_net, upsert_margin_balance, upsert_foreign_holding,
-    get_latest_inst_date,
+    get_latest_inst_date, update_stock_industry,
 )
 from shared.institutional_feed import (
     fetch_institutional_net, fetch_margin_balance, fetch_foreign_holding,
@@ -191,6 +191,51 @@ def _roc_to_ce(roc_str: str) -> str | None:
         return f"{year:04d}-{month:02d}-{day:02d}"
     except Exception:
         return None
+
+
+# ──────────────────────────────────────────────
+# 產業別
+# ──────────────────────────────────────────────
+
+def fetch_industry_map() -> dict:
+    """
+    從 TWSE / TPEX 取得全市場產業別代碼。
+    回傳 {code: industry_str}，例如 {"2330": "24", "2881": "17"}
+    """
+    result = {}
+    # 上市（TSE）
+    try:
+        resp = requests.get(
+            "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
+            timeout=20, verify=False,
+        )
+        for row in resp.json():
+            code = str(row.get("公司代號", "")).strip()
+            ind  = str(row.get("產業別", "")).strip()
+            if _is_regular_stock(code) and ind:
+                result[code] = ind
+        console.print(f"[dim]TSE 產業別：{len(result)} 筆[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]TSE 產業別取得失敗：{e}[/yellow]")
+
+    # 上櫃（OTC）
+    otc_count = 0
+    try:
+        resp = requests.get(
+            "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+            timeout=20, verify=False,
+        )
+        for row in resp.json():
+            code = str(row.get("SecuritiesCompanyCode", "")).strip()
+            ind  = str(row.get("SecuritiesIndustryCode", "")).strip()
+            if _is_regular_stock(code) and ind:
+                result[code] = ind
+                otc_count += 1
+        console.print(f"[dim]OTC 產業別：{otc_count} 筆[/dim]")
+    except Exception as e:
+        console.print(f"[yellow]OTC 產業別取得失敗：{e}[/yellow]")
+
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -411,6 +456,14 @@ def cmd_build(start: str, update_only: bool, rebuild_univ_only: bool, no_deliste
                 conn,
             )
         conn.commit()
+
+        # 產業別
+        console.print("\n[dim]更新產業別...[/dim]")
+        industry_map = fetch_industry_map()
+        if industry_map:
+            update_stock_industry(conn, industry_map)
+            conn.commit()
+            console.print(f"  產業別更新：[bold]{len(industry_map)}[/bold] 筆")
 
         listed_count   = len(listed_tse) + len(listed_otc)
         delisted_count = len(delisted_tse) + len(delisted_otc)

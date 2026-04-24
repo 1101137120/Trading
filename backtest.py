@@ -26,9 +26,19 @@ from rich.console import Console
 from rich.table import Table
 
 from shared.standalone_feed import fetch_tse_daily_all, fetch_kbars
-from shared.db import (
-    DB_PATH, get_conn as _db_conn, load_kbars as _db_load_kbars,
+from shared.db_selector import (
+    default_db_path as _default_db_path,
+    db_available as _db_available,
+    load_kbars as _db_load_kbars,
     bulk_load_kbars as _db_bulk_load,
+    bulk_load_institutional as _bulk_inst,
+    get_stock_rows as _get_stock_rows,
+    has_dividend_data as _has_dividend_data,
+    load_dividends_from_db as _load_dividends_from_db,
+    fetch_close_panel as _fetch_close_panel,
+    fetch_universe_data as _fetch_universe_data,
+    fetch_code_close_history as _fetch_code_close_history,
+    resolve_db_backend as _resolve_db_backend,
 )
 from tech.strategies.engine import StrategyEngine
 
@@ -152,6 +162,8 @@ def build_breadth_map(
     db_codes: list[str] | None = None,
     db_start: str | None = None,
     db_end: str | None = None,
+    db_path: str | None = None,
+    db_backend: str = "auto",
     return_ratio: bool = False,
 ) -> dict:
     """
@@ -168,15 +180,11 @@ def build_breadth_map(
         return {}
 
     # ── 快速路徑：從 DB 直接撈 close，一次 pivot ──
-    if db_codes and db_start and db_end and DB_PATH.exists():
+    if db_codes and db_start and db_end and _db_available(db_backend, db_path):
         try:
-            ph = ", ".join("?" * len(db_codes))
-            with _db_conn(DB_PATH, read_only=True) as _conn:
-                raw = _conn.execute(
-                    f"SELECT date, code, close FROM daily_prices "
-                    f"WHERE code IN ({ph}) AND date>=? AND date<=? ORDER BY date",
-                    db_codes + [db_start, db_end],
-                ).df()
+            raw = _fetch_close_panel(
+                db_codes, db_start, db_end, db_backend=db_backend, db_path=db_path
+            )
             raw["date"] = pd.to_datetime(raw["date"])
             wide = raw.pivot_table(index="date", columns="code", values="close", aggfunc="last")
             wide = wide.sort_index().astype(float)
@@ -360,6 +368,7 @@ def simulate_trades(
     market_max_20d_gain: float = 0.0,
     market_max_10d_gain: float = 0.0,
     market_atr_max: float = 0.0,
+    market_rs_min: float = -999.0,
     time_stop_days: int = 0,
     time_stop_min_pct: float = 0.05,
     early_exit_days: int = 0,
@@ -386,6 +395,11 @@ def simulate_trades(
     chip_margin_max: float = 4.0,           # 資券比上限（0=停用）
     short_util_max: float = 0.0,            # 融券使用率上限（0=停用，例如 0.08=8%）
     vix_panic_days: "set | None" = None,   # VIX >= 門檻的日期集合；panic_rebound 可繞過大盤偏空封鎖
+    vol_surge_fail_days: int = 0,          # 暴量反轉早出：進場後幾天內檢查（0=停用）
+    vol_surge_fail_pct: float = 0.03,      # 暴量反轉早出：虧損達此比例觸發（預設 3%）
+    vol_surge_entry_min: float = 2.0,      # 暴量反轉早出：進場時 vol_surge 需高於此值才啟用
+    dev_surge_max_dev: float = 0.0,        # 高乖離無量過濾：乖離率超過此值時需量確認（0=停用）
+    dev_surge_min_surge: float = 1.5,      # 高乖離無量過濾：乖離率過高時需達到此倍均量（預設 1.5×）
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -653,6 +667,13 @@ def simulate_trades(
                 if max_hold_days > 0 and hold >= max_hold_days:
                     exit_price  = current_price * (1 - _eff_exit_slip)
                     exit_reason = "到期出場"
+                elif (vol_surge_fail_days > 0
+                      and position.get("vol_surge_score", 1.0) >= vol_surge_entry_min
+                      and hold <= vol_surge_fail_days
+                      and pnl_pct_cur <= -vol_surge_fail_pct):
+                    # 暴量進場後快速反跌 → 假突破/出貨，早出止損
+                    exit_price  = current_price * (1 - _eff_exit_slip)
+                    exit_reason = "暴量反轉"
                 elif (early_exit_days > 0 and hold >= early_exit_days
                       and pnl_pct_cur < 0 and _mkt_dates):
                     # 早出場：持倉 N 天仍虧損且跑輸大盤超過門檻 → 廢訊號，不必等時間停損
@@ -745,6 +766,7 @@ def simulate_trades(
                     "foreign_net": position.get("foreign_net"),
                     "trust_net": position.get("trust_net"),
                     "chip_score": position.get("chip_score", 0.5),
+                    "vol_surge_score": position.get("vol_surge_score", 1.0),
                 })
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
@@ -870,6 +892,28 @@ def simulate_trades(
                                                 "entry_price": round(_ep, 2),
                                                 "strategy": sig.strategy, **_fwd})
                 continue
+
+        # ── 空倉：大盤20日報酬下限過濾 ──
+        if market_rs_min > -999.0 and _mkt_dates:
+            _mp = bisect.bisect_right(_mkt_dates, row_date) - 1
+            if _mp >= 20:
+                _mc_now  = _mkt_closes[_mp]
+                _mc_past = _mkt_closes[_mp - 20]
+                _mkt_20d = (_mc_now - _mc_past) / _mc_past * 100 if _mc_past > 0 else 999.0
+                if _mkt_20d < market_rs_min:
+                    if skipped_out is not None and i + 1 < len(df):
+                        sig = (_batch_signals.get(i) if _batch_signals is not None
+                               else engine.evaluate(code, df.iloc[: i + 1].copy()))
+                        if sig and sig.action == "Buy":
+                            _ep = float(df["Open"].iloc[i + 1]) * (1 + slippage_pct)
+                            if _ep > 0:
+                                _fwd = _forward_scan(df, i + 1, _ep, _ep * (1 - stop_loss_pct),
+                                                     _ep * (1 + take_profit_pct), end, slippage_pct)
+                                skipped_out.append({"code": code, "signal_date": row_date,
+                                                    "skip_reason": f"大盤20d負報酬({_mkt_20d:.1f}%)",
+                                                    "entry_price": round(_ep, 2),
+                                                    "strategy": sig.strategy, **_fwd})
+                    continue
 
         # ── 空倉：大盤震盪過濾（ATR%）──
         if market_atr_max > 0 and market_atr.get(row_date, 0) > market_atr_max:
@@ -1029,6 +1073,23 @@ def simulate_trades(
             _ema20_now = _close_ser.ewm(span=20, adjust=False).mean().iloc[-1]
             ema_dev_at_entry = ((current_price - _ema20_now) / _ema20_now) if _ema20_now > 0 else 0.0
 
+            # 暴量分數：訊號日成交量 ÷ 20日均量（1.0=正常量）
+            _vol_ser = df["Volume"].astype(float)
+            _vol_avg20 = _vol_ser.iloc[max(0, i - 19): i].mean() if i > 0 else 0.0
+            _vol_today = _vol_ser.iloc[i]
+            vol_surge_score = (_vol_today / _vol_avg20) if _vol_avg20 > 0 else 1.0
+
+            # 高乖離無量過濾：乖離率過高但量能不足 → 跳過
+            if (dev_surge_max_dev > 0
+                    and ema_dev_at_entry > dev_surge_max_dev
+                    and vol_surge_score < dev_surge_min_surge):
+                if skipped_out is not None and i + 1 < len(df):
+                    skipped_out.append({"code": code, "signal_date": row_date,
+                                        "skip_reason": f"高乖無量(dev={ema_dev_at_entry:.1%},surge={vol_surge_score:.2f}x)",
+                                        "entry_price": round(entry_price, 2),
+                                        "rs_score": round(rs_score, 4)})
+                continue
+
             # 市場廣度原始比例（訊號日）
             _mkt_breadth_entry = breadth_ratio.get(row_date, float("nan")) if breadth_ratio else float("nan")
 
@@ -1070,6 +1131,7 @@ def simulate_trades(
                 "margin_short_ratio":   _chip.get("margin_short_ratio"),
                 "foreign_streak":       _chip.get("foreign_streak", 0),
                 "chip_score":           _calc_chip_score(_chip),
+                "vol_surge_score":      round(vol_surge_score, 2),
             }
 
     return trades
@@ -1147,6 +1209,7 @@ def _trade_rank_score(
     rank_w_rs_sweet: float = 0.0,
     rank_w_breadth: float = 0.0,
     rank_w_chip: float = 0.0,
+    rank_w_vol_surge: float = 0.0,
     rank_rs_center: float = 0.05,
     rank_rs_span: float = 0.25,
     rank_rs_sweet_spot: float = 0.20,
@@ -1173,6 +1236,9 @@ def _trade_rank_score(
         breadth_raw, sweet_spot=rank_breadth_sweet_spot, tolerance=rank_breadth_tolerance, default=0.5
     )
     chip_score_val = _safe_float(trade.get("chip_score", 0.5))
+    # vol_surge_score: 今日量 / 20日均量，上限 5× → 歸一化到 0~1
+    _raw_surge = _safe_float(trade.get("vol_surge_score", 1.0))
+    vol_surge_score_val = _clamp01(_raw_surge / 5.0)
 
     mode = (rank_mode or "confidence").lower()
     if mode == "confidence":
@@ -1186,7 +1252,8 @@ def _trade_rank_score(
     w_rs_sweet = max(0.0, rank_w_rs_sweet)
     w_breadth = max(0.0, rank_w_breadth)
     w_chip = max(0.0, rank_w_chip)
-    total_w = w_conf + w_rs + w_dev + w_rs_sweet + w_breadth + w_chip
+    w_vol_surge = max(0.0, rank_w_vol_surge)
+    total_w = w_conf + w_rs + w_dev + w_rs_sweet + w_breadth + w_chip + w_vol_surge
     if total_w <= 0:
         return conf
     return (
@@ -1196,6 +1263,7 @@ def _trade_rank_score(
         + w_rs_sweet * rs_sweet_score
         + w_breadth * breadth_score
         + w_chip * chip_score_val
+        + w_vol_surge * vol_surge_score_val
     ) / total_w
 
 
@@ -1226,6 +1294,7 @@ def portfolio_simulation(
     rank_w_rs_sweet: float = 0.0,
     rank_w_breadth: float = 0.0,
     rank_w_chip: float = 0.0,
+    rank_w_vol_surge: float = 0.0,
     rank_rs_center: float = 0.05,
     rank_rs_span: float = 0.25,
     rank_rs_sweet_spot: float = 0.20,
@@ -1272,6 +1341,7 @@ def portfolio_simulation(
                                               rank_w_rs_sweet=rank_w_rs_sweet,
                                               rank_w_breadth=rank_w_breadth,
                                               rank_w_chip=rank_w_chip,
+                                              rank_w_vol_surge=rank_w_vol_surge,
                                               rank_rs_center=rank_rs_center,
                                               rank_rs_span=rank_rs_span,
                                               rank_rs_sweet_spot=rank_rs_sweet_spot,
@@ -1519,6 +1589,7 @@ def portfolio_simulation(
             rank_w_rs_sweet=rank_w_rs_sweet,
             rank_w_breadth=rank_w_breadth,
             rank_w_chip=rank_w_chip,
+            rank_w_vol_surge=rank_w_vol_surge,
             rank_rs_center=rank_rs_center,
             rank_rs_span=rank_rs_span,
             rank_rs_sweet_spot=rank_rs_sweet_spot,
@@ -1831,7 +1902,11 @@ def main():
     parser = argparse.ArgumentParser(description="策略回測（TWSE 歷史 K 棒）")
     parser.add_argument("--start",      default="2025-03-01", help="回測起始日 YYYY-MM-DD")
     parser.add_argument("--end",        default=date.today().strftime("%Y-%m-%d"), help="回測結束日")
+    parser.add_argument("--universe-start", default=None,
+                        help="Universe 選股最早從哪年算（預設同 --start）；可設 2017-01-01 排除只在更早期出現的老股")
     parser.add_argument("--stocks",     type=int, default=50, help="最多回測幾檔（依成交量排序）")
+    parser.add_argument("--surge-pool-size", type=int, default=0,
+                        help="相對暴量池大小（0=停用；建議 20~60）")
     parser.add_argument("--min-price",  type=float, default=10.0)
     parser.add_argument("--max-price",  type=float, default=1000.0)
     parser.add_argument("--min-volume", type=int,   default=2000, help="最低日均量（張）")
@@ -1854,6 +1929,8 @@ def main():
                         help="排除 ETF（代碼 00 開頭），預設開啟")
     parser.add_argument("--include-etf", action="store_true",
                         help="強制納入 ETF（覆蓋 --exclude-etf 預設）")
+    parser.add_argument("--exclude-industry", default=None,
+                        help="排除產業別代碼（逗號分隔），例如 17,01,03 排除金融/水泥/塑膠")
     parser.add_argument("--market-filter", action="store_true", default=True,
                         help="啟用大盤過濾（0050 > MA20 才開倉），預設開啟")
     parser.add_argument("--no-market-filter", action="store_true",
@@ -1899,6 +1976,8 @@ def main():
     parser.add_argument("--market-atr-max", type=float, default=0.0,
                         help="大盤震盪過濾：0050近10日ATR%%超過此值時停止進場（建議 0.015=1.5%%；0=停用）"
                              "。捕捉0050雖上漲但劇烈震盪的市況，避免個股被洗出。")
+    parser.add_argument("--market-rs-min", type=float, default=-999.0,
+                        help="大盤20日報酬下限：0050近20日報酬低於此值時禁止開倉（建議 0=負報酬時停進；-999=停用）")
     parser.add_argument("--vix-panic-threshold", type=float, default=0.0,
                         help="VIX 恐慌門檻：VIX >= 此值的交易日允許 panic_rebound 策略繞過大盤偏空封鎖"
                              "（建議 30；0=停用）。需搭配 --strategies panic_rebound 使用。")
@@ -2004,6 +2083,20 @@ def main():
                         help="EMA20 乖離率下限：進場時收盤距 EMA20 低於此值視為無動能跳過（建議 0.03=3%%；None=用 config）")
     parser.add_argument("--max-ema-dev", type=float, default=None,
                         help="EMA20 乖離率上限：超過此值視為過熱跳過（建議 0.10=10%%；None=停用）")
+    parser.add_argument("--ema-aligned-max", type=int, default=None,
+                        help="多頭排列連續天數上限：超過此值視為陳舊訊號跳過（建議 15~25；None=停用）")
+    parser.add_argument("--rank-w-vol-surge", type=float, default=None,
+                        help="暴量分數權重：訊號日成交量/20日均量 歸一化後加入排名（建議 0.10~0.20；None=停用）")
+    parser.add_argument("--vol-surge-fail-days", type=int, default=0,
+                        help="暴量反轉早出：進場後幾天內若虧損即早出（0=停用；建議 3~7）")
+    parser.add_argument("--vol-surge-fail-pct", type=float, default=0.03,
+                        help="暴量反轉早出：虧損比例門檻（預設 0.03=3%%）")
+    parser.add_argument("--vol-surge-entry-min", type=float, default=2.0,
+                        help="暴量反轉早出：進場時 vol_surge 需高於此倍數才啟用（預設 2.0=2倍均量）")
+    parser.add_argument("--dev-surge-max-dev", type=float, default=0.0,
+                        help="高乖離無量過濾：乖離率超過此值時需量確認才能進場（0=停用；建議 0.05=5%%）")
+    parser.add_argument("--dev-surge-min-surge", type=float, default=1.5,
+                        help="高乖離無量過濾：乖離率過高時所需最低暴量倍數（預設 1.5×）")
     parser.add_argument("--signal-day-max-gain", type=float, default=None,
                         help="信號日單日漲幅上限：超過此值視為假突破跳過（建議 0.05=5%%；None=停用）")
     # ── 動態倉位（EMA 乖離率分層）──
@@ -2035,6 +2128,10 @@ def main():
                         help="從 yfinance 抓取歷史配息資料並存入 DB（一次性預建，完成後退出）")
     parser.add_argument("--no-db", action="store_true",
                         help="強制使用 API 模式，忽略本地 DB（預設：DB 存在時自動使用）")
+    parser.add_argument("--db-backend", type=str, choices=["auto", "duckdb", "pg"], default="auto",
+                        help="資料庫後端：auto / duckdb / pg（預設 auto）")
+    parser.add_argument("--db-path", type=str, default=None,
+                        help="DB 路徑或 PostgreSQL DSN；未指定時依 --db-backend / 環境變數決定")
     parser.add_argument("--show-skipped", action="store_true", default=False,
                         help="顯示被過濾掉但假設持有會高報酬的標的（大盤/廣度/RS/冷卻過濾）")
     parser.add_argument("--output-csv", type=str, default="backtest_result.csv",
@@ -2042,26 +2139,19 @@ def main():
     parser.add_argument("--skipped-csv", type=str, default="",
                         help="將跳過訊號（含倉位已滿）存入此 CSV；需同時加 --show-skipped")
     args = parser.parse_args()
+    db_path = args.db_path or _default_db_path(args.db_backend)
+    db_backend = _resolve_db_backend(args.db_backend, db_path)
 
     start = datetime.strptime(args.start, "%Y-%m-%d").date()
     end   = datetime.strptime(args.end,   "%Y-%m-%d").date()
 
     # ── --fetch-dividends：一次性抓取配息資料後退出 ──
     if args.fetch_dividends:
-        from shared.dividend_cache import build_dividends_db
-        DB_PATH_DIV = "data/stocks.db"
-        import duckdb as _ddb_div
-        _con_div = _ddb_div.connect(DB_PATH_DIV, read_only=True)
-        _stock_rows = _con_div.execute("SELECT code, market FROM stocks").fetchall()
-        _con_div.close()
-        _all_codes  = [r[0] for r in _stock_rows]
-        _all_markets = {r[0]: r[1] for r in _stock_rows}
-        console.print(f"[cyan]開始抓取 {len(_all_codes)} 支股票配息資料（從 yfinance）...[/cyan]")
-        n = build_dividends_db(
-            DB_PATH_DIV, _all_codes, _all_markets,
-            start_year=start.year, end_year=end.year,
+        _stock_rows = _get_stock_rows(db_backend=db_backend, db_path=db_path)
+        console.print(
+            f"[yellow]目前 --fetch-dividends 只保留讀取切換；寫入流程尚未統一。"
+            f"目前 `{db_backend}` stocks 表有 {len(_stock_rows)} 檔，可先略過此旗標。[/yellow]"
         )
-        console.print(f"[green]配息資料建置完成：{n} 筆存入 DB[/green]")
         return
 
     # ── 載入設定 ──
@@ -2078,6 +2168,10 @@ def main():
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_ema_dev"] = args.min_ema_dev
     if args.max_ema_dev is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["max_ema_dev"] = args.max_ema_dev
+    if args.ema_aligned_max is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["ema_aligned_max"] = args.ema_aligned_max
+    if args.rank_w_vol_surge is not None:
+        cfg.setdefault("portfolio", {})["rank_w_vol_surge"] = args.rank_w_vol_surge
     if args.signal_day_max_gain is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["signal_day_max_gain"] = args.signal_day_max_gain
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
@@ -2115,70 +2209,49 @@ def main():
 
     exclude_etf   = args.exclude_etf and not args.include_etf
     use_dynamic_pool = args.dynamic_pool and not args.no_dynamic_pool
-    use_db        = DB_PATH.exists() and not args.no_db
+    use_db        = _db_available(db_backend, db_path) and not args.no_db
     # TSE-only：CLI flag 優先，否則從 config screener.exchanges 讀（與實盤一致）
     cfg_exchanges = base_cfg.get("screener", {}).get("exchanges", ["TSE", "OTC"])
     tse_only = args.tse_only or (cfg_exchanges == ["TSE"])
     etf_note      = "（已排除 ETF）" if exclude_etf else "（含 ETF）"
     etf_note      = etf_note + "（僅上市TSE）" if tse_only else etf_note
     universe_size = args.stocks * args.universe_mult if use_dynamic_pool else args.stocks
+    surge_size    = args.surge_pool_size * args.universe_mult if use_dynamic_pool else args.surge_pool_size
 
     # ════════════════════════════════════════════
     # 股票池 + K 棒（DB 模式 vs API 模式）
     # ════════════════════════════════════════════
     if use_db:
         # ── DB 模式：從 universe_snapshots 取歷史宇宙（含已下市）──
-        console.print(f"\n[dim]DB 模式：讀取 {DB_PATH.name}...[/dim]")
+        console.print(f"\n[dim]DB 模式：讀取 {db_backend}（{db_path}）...[/dim]")
         start_str = start.strftime("%Y-%m-%d")
         end_str   = end.strftime("%Y-%m-%d")
 
-        with _db_conn(read_only=True) as _conn:
-            # 取回測期間曾進前 universe_size 名的所有股票
-            tse_clause = " AND s.market='TSE'" if tse_only else ""
-            rows = _conn.execute(
-                "SELECT DISTINCT u.code, s.name, s.market "
-                "FROM universe_snapshots u "
-                "LEFT JOIN stocks s ON u.code=s.code "
-                "WHERE u.date>=? AND u.date<=? AND u.vol_rank<=? "
-                + ("AND (s.code IS NULL OR s.code NOT LIKE '00%')" if exclude_etf else "")
-                + tse_clause,
-                (start_str, end_str, universe_size),
-            ).fetchall()
+        universe_start_str = args.universe_start or start_str
 
-            # 若有指定 min/max price，從 daily_prices 取回測期間平均收盤做篩選
-            if args.min_price > 0 or args.max_price < 9999:
-                price_rows = _conn.execute(
-                    "SELECT code, AVG(close) as avg_close "
-                    "FROM daily_prices "
-                    "WHERE date>=? AND date<=? "
-                    "GROUP BY code",
-                    (start_str, end_str),
-                ).fetchall()
-                avg_price = {r[0]: r[1] for r in price_rows}
-                rows = [
-                    r for r in rows
-                    if args.min_price <= avg_price.get(r[0], 999) <= args.max_price
-                ]
-
-            # 取歷史動態池（universe_snapshots 中 rank <= stocks 的每日快照）
-            tse_pool_clause = (
-                " AND code IN (SELECT code FROM stocks WHERE market='TSE')"
-                if tse_only else ""
-            )
-            pool_rows = _conn.execute(
-                "SELECT date, code FROM universe_snapshots "
-                "WHERE date>=? AND date<=? AND vol_rank<=? "
-                + ("AND code NOT LIKE '00%'" if exclude_etf else "")
-                + tse_pool_clause,
-                (start_str, end_str, args.stocks),
-            ).fetchall()
+        exclude_industry = [x.strip() for x in args.exclude_industry.split(",")] if args.exclude_industry else None
+        rows, pool_rows = _fetch_universe_data(
+            universe_start=universe_start_str,
+            end=end_str,
+            universe_size=universe_size,
+            top_n=args.stocks,
+            surge_universe_size=surge_size,
+            surge_top_n=args.surge_pool_size,
+            exclude_etf=exclude_etf,
+            tse_only=tse_only,
+            min_price=args.min_price,
+            max_price=args.max_price,
+            db_backend=db_backend,
+            db_path=db_path,
+            exclude_industry=exclude_industry,
+        )
 
         pool = [{"code": r[0], "name": r[1] or "", "market": r[2] or ""} for r in rows]
 
         # 建立動態池（直接從 DB 快照，不需重算）
         dynamic_pool_db: dict[date, set] = {}
         for d_str, code in pool_rows:
-            d = datetime.strptime(d_str, "%Y-%m-%d").date()
+            d = pd.to_datetime(d_str).date()
             dynamic_pool_db.setdefault(d, set()).add(code)
 
         n_ever_delisted = sum(1 for r in rows if r[1] is None)
@@ -2186,7 +2259,8 @@ def main():
             f"Universe: [bold]{len(pool)}[/bold] 支"
             + (f"（含 {n_ever_delisted} 支曾下市）" if n_ever_delisted else "")
             + f" → 每日動態取前 [bold]{args.stocks}[/bold] 支 "
-            f"[dim]{etf_note}（DB 宇宙快照，{len(dynamic_pool_db)} 個交易日）[/dim]"
+            + (f"+ 相對暴量 [bold]{args.surge_pool_size}[/bold] 支 " if args.surge_pool_size > 0 else "")
+            + f"[dim]{etf_note}（DB 宇宙快照，{len(dynamic_pool_db)} 個交易日）[/dim]"
         )
     else:
         # ── API 模式：今日快照（原始行為）──
@@ -2220,6 +2294,8 @@ def main():
                 "0050",
                 (start - __import__("datetime").timedelta(days=args.market_ma + 90)).strftime("%Y-%m-%d"),
                 end.strftime("%Y-%m-%d"),
+                db_backend=db_backend,
+                db_path=db_path,
                 read_only=True,
             )
         if market_df is None:
@@ -2265,6 +2341,8 @@ def main():
             "00631L",
             (start - __import__("datetime").timedelta(days=30)).strftime("%Y-%m-%d"),
             end.strftime("%Y-%m-%d"),
+            db_backend=db_backend,
+            db_path=db_path,
             read_only=True,
         )
     if bench2x_df is None:
@@ -2338,7 +2416,10 @@ def main():
         db_start = (start - __import__("datetime").timedelta(days=lookback_needed)).strftime("%Y-%m-%d")
         all_codes = [s["code"] for s in pool]
         console.print(f"[dim]批量讀取 {len(all_codes)} 支股票 K 棒...[/dim]")
-        db_bulk = _db_bulk_load(all_codes, db_start, end.strftime("%Y-%m-%d"))
+        db_bulk = _db_bulk_load(
+            all_codes, db_start, end.strftime("%Y-%m-%d"),
+            db_backend=db_backend, db_path=db_path
+        )
         db_hits = len(db_bulk)
         console.print(f"[dim]DB 批量讀取完成：{db_hits} 支[/dim]")
 
@@ -2404,6 +2485,8 @@ def main():
                 db_codes=_breadth_codes if use_db else None,
                 db_start=_breadth_start if use_db else None,
                 db_end=_breadth_end if use_db else None,
+                db_backend=db_backend,
+                db_path=db_path if use_db else None,
             )
             breadth_ratio_map = build_breadth_map(
                 all_kbars, ema_period=20, min_ratio=args.breadth_min,
@@ -2411,6 +2494,8 @@ def main():
                 db_codes=_breadth_codes if use_db else None,
                 db_start=_breadth_start if use_db else None,
                 db_end=_breadth_end if use_db else None,
+                db_backend=db_backend,
+                db_path=db_path if use_db else None,
                 return_ratio=True,
             )
         blocked = sum(1 for v in breadth_map.values() if not v)
@@ -2420,13 +2505,11 @@ def main():
     # ── 配息資料載入（若 DB 有 dividends 表且未停用）──
     _all_dividends: dict = {}
     if not args.no_dividend_adjust and use_db:
-        from shared.dividend_cache import load_dividends_from_db, has_dividend_data
-        _db_path_div = "data/stocks.db"
-        if has_dividend_data(_db_path_div):
-            _all_dividends = load_dividends_from_db(
-                _db_path_div,
+        if _has_dividend_data(db_backend=db_backend, db_path=db_path):
+            _all_dividends = _load_dividends_from_db(
                 list(all_kbars.keys()),
                 start=start, end=end,
+                db_backend=db_backend, db_path=db_path,
             )
             console.print(
                 f"[dim]配息調整：載入 {sum(len(v) for v in _all_dividends.values())} 筆"
@@ -2440,12 +2523,14 @@ def main():
     # ── 籌碼資料批次載入（法人/融資/外資，供籌碼過濾與 rank 使用）──
     _all_chip_data: dict = {}
     if use_db:  # 有 DB 時一律載入籌碼，供分析與過濾使用
-        from shared.db import bulk_load_institutional as _bulk_inst
         _inst_start = start.strftime("%Y-%m-%d")
         _inst_end   = end.strftime("%Y-%m-%d")
         _inst_codes = list(all_kbars.keys())
         console.print(f"[dim]籌碼資料：載入 {len(_inst_codes)} 檔 {_inst_start}~{_inst_end}...[/dim]")
-        _all_chip_data = _bulk_inst(_inst_codes, _inst_start, _inst_end)
+        _all_chip_data = _bulk_inst(
+            _inst_codes, _inst_start, _inst_end,
+            db_backend=db_backend, db_path=db_path
+        )
         console.print(f"[dim]籌碼資料：{len(_all_chip_data)} 檔有資料[/dim]")
 
     # ── 第二輪：逐檔回測 ──
@@ -2508,6 +2593,12 @@ def main():
                 chip_margin_max=args.chip_margin_max,
                 short_util_max=args.short_util_max,
                 vix_panic_days=vix_panic_days,
+                vol_surge_fail_days=args.vol_surge_fail_days if hasattr(args, "vol_surge_fail_days") else 0,
+                vol_surge_fail_pct=args.vol_surge_fail_pct if hasattr(args, "vol_surge_fail_pct") else 0.03,
+                vol_surge_entry_min=args.vol_surge_entry_min if hasattr(args, "vol_surge_entry_min") else 2.0,
+                dev_surge_max_dev=args.dev_surge_max_dev if hasattr(args, "dev_surge_max_dev") else 0.0,
+                dev_surge_min_surge=args.dev_surge_min_surge if hasattr(args, "dev_surge_min_surge") else 1.5,
+                market_rs_min=args.market_rs_min if hasattr(args, "market_rs_min") else -999.0,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -2537,12 +2628,9 @@ def main():
     _mkt_bull_dates: dict[str, bool] = {}  # True = 0050 MA20 > MA60（牛市）
     try:
         if use_db:
-            import duckdb as _ddb_pre
-            _con_pre = _ddb_pre.connect("data/stocks.db", read_only=True)
-            _mkt_pre = _con_pre.execute(
-                "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
-            ).df()
-            _con_pre.close()
+            _mkt_pre = _fetch_code_close_history(
+                "0050", db_backend=db_backend, db_path=db_path
+            )
             _mkt_pre_d = [str(d)[:10] for d in _mkt_pre["date"].values]
             # 原始收盤價（未調整）供停泊交易記錄顯示用
             _mkt_raw_c = _mkt_pre["close"].values.astype(float)
@@ -2626,6 +2714,7 @@ def main():
         rank_w_rs_sweet=args.rank_w_rs_sweet,
         rank_w_breadth=args.rank_w_breadth,
         rank_w_chip=args.rank_w_chip,
+        rank_w_vol_surge=args.rank_w_vol_surge if args.rank_w_vol_surge is not None else 0.0,
         rank_rs_center=args.rank_rs_center,
         rank_rs_span=args.rank_rs_span,
         rank_rs_sweet_spot=args.rank_rs_sweet_spot,
@@ -2941,17 +3030,14 @@ def main():
     # 7. 年度績效表（已實現 + 未實現 mark-to-market）
     # ════════════════════════════════════════
     if not taken_df.empty:
-        import duckdb as _duckdb
         console.rule("[bold]年度績效[/bold]")
 
         # 取得 0050 年度報酬率（年初→年末收盤）
         _mkt_yr_ret: dict[int, float] = {}
         try:
-            _con2 = _duckdb.connect("data/stocks.db", read_only=True)
-            _mkt_yr = _con2.execute(
-                "SELECT date, close FROM daily_prices WHERE code='0050' ORDER BY date"
-            ).df()
-            _con2.close()
+            _mkt_yr = _fetch_code_close_history(
+                "0050", db_backend=db_backend, db_path=db_path
+            )
             _mkt_yr["date"] = pd.to_datetime(_mkt_yr["date"])
             for _yr in range(2007, 2030):
                 _yr_data = _mkt_yr[_mkt_yr["date"].dt.year == _yr].sort_values("date")
@@ -3155,6 +3241,8 @@ def main():
         "market_atr_max":       args.market_atr_max,
         "min_atr_pct":          args.min_atr_pct,
         "min_ema_dev":          args.min_ema_dev,
+        "ema_aligned_max":      args.ema_aligned_max,
+        "rank_w_vol_surge":     args.rank_w_vol_surge,
         "dev_low_thr":          args.dev_low_thr,
         "dev_high_thr":         args.dev_high_thr,
         "dev_low_pct":          args.dev_low_pct,

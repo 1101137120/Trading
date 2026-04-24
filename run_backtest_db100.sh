@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差
+# DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差（預設用 stocks_v2）
 .venv/bin/python backtest.py --show-skipped \
+  --db-backend          duckdb \
+  --db-path             data/stocks_v2.db \
   --start               2009-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
@@ -10,14 +12,14 @@
   --trail-stop-rs-bonus 0.05 \
   --trail-activation    0.02 \
   --max-positions       6 \
-  --position-pct        0.2 \
+  --position-pct        0.16 \
   --stocks              80 \
   --max-price           2000 \
-  --min-rs              0.07 \
+  --min-rs              0.13 \
   --max-rs              0.40 \
   --rank-mode           hybrid \
   --rank-w-conf         0.00 \
-  --rank-w-rs           0.26 \
+  --rank-w-rs           0.41 \
   --rank-w-dev          0.20 \
   --rank-w-rs-sweet     0.29 \
   --rank-rs-center      0.05 \
@@ -52,13 +54,15 @@
   --pyramid-rs-min      0.05 \
   --pyramid-alloc       0.50 \
   --market-bull-entry  \
-  --market-dd-threshold    0.15 \
+  --market-dd-threshold    0.10 \
   --market-dd-max-positions 2 \
   --rs-pos-high-thr     0.15 \
   --rs-pos-high-mult    1.80 \
   --rs-pos-low-thr      0.07 \
   --rs-pos-low-mult     0.80 \
+  --short-util-max      0.08 \
   --rank-w-chip         0.15 \
+  --rank-w-vol-surge    0.00 \
   --vix-park-hi         30 \
   --vix-park-lo         20 \
   "$@"

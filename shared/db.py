@@ -75,9 +75,11 @@ def init_schema(conn: duckdb.DuckDBPyConnection):
             name          VARCHAR,
             market        VARCHAR,
             listed_date   VARCHAR,
-            delisted_date VARCHAR
+            delisted_date VARCHAR,
+            industry      VARCHAR
         )
     """)
+    conn.execute("ALTER TABLE stocks ADD COLUMN IF NOT EXISTS industry VARCHAR")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS daily_prices (
             code    VARCHAR NOT NULL,
@@ -94,13 +96,19 @@ def init_schema(conn: duckdb.DuckDBPyConnection):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_dp_code ON daily_prices(code)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS universe_snapshots (
-            date       VARCHAR NOT NULL,
-            code       VARCHAR NOT NULL,
-            avg_vol_5d DOUBLE,
-            vol_rank   INTEGER,
+            date            VARCHAR NOT NULL,
+            code            VARCHAR NOT NULL,
+            avg_vol_5d      DOUBLE,
+            avg_vol_60d     DOUBLE,
+            vol_surge_ratio DOUBLE,
+            vol_rank        INTEGER,
+            vol_surge_rank  INTEGER,
             PRIMARY KEY (date, code)
         )
     """)
+    conn.execute("ALTER TABLE universe_snapshots ADD COLUMN IF NOT EXISTS avg_vol_60d DOUBLE")
+    conn.execute("ALTER TABLE universe_snapshots ADD COLUMN IF NOT EXISTS vol_surge_ratio DOUBLE")
+    conn.execute("ALTER TABLE universe_snapshots ADD COLUMN IF NOT EXISTS vol_surge_rank INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_univ_date ON universe_snapshots(date)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS institutional_net (
@@ -326,6 +334,12 @@ def upsert_stock(
     )
 
 
+def update_stock_industry(conn: duckdb.DuckDBPyConnection, industry_map: dict):
+    """批次更新 stocks.industry。industry_map = {code: industry_code_str}"""
+    rows = [(v, k) for k, v in industry_map.items()]
+    conn.executemany("UPDATE stocks SET industry=? WHERE code=?", rows)
+
+
 def upsert_kbars(code: str, df: pd.DataFrame, conn: duckdb.DuckDBPyConnection):
     """
     將 K 棒批次寫入 DB（upsert，可重複執行）。
@@ -546,7 +560,9 @@ def rebuild_universe_snapshots(conn: duckdb.DuckDBPyConnection, vol_window: int 
     print("重建宇宙快照（universe_snapshots）...")
     conn.execute("DELETE FROM universe_snapshots")
     conn.execute(f"""
-        INSERT INTO universe_snapshots (date, code, avg_vol_5d, vol_rank)
+        INSERT INTO universe_snapshots (
+            date, code, avg_vol_5d, avg_vol_60d, vol_surge_ratio, vol_rank, vol_surge_rank
+        )
         WITH rolling AS (
             SELECT
                 date, code,
@@ -554,12 +570,32 @@ def rebuild_universe_snapshots(conn: duckdb.DuckDBPyConnection, vol_window: int 
                     PARTITION BY code
                     ORDER BY date
                     ROWS BETWEEN {vol_window - 1} PRECEDING AND CURRENT ROW
-                ) AS avg_vol_5d
+                ) AS avg_vol_5d,
+                AVG(volume) OVER (
+                    PARTITION BY code
+                    ORDER BY date
+                    ROWS BETWEEN 59 PRECEDING AND CURRENT ROW
+                ) AS avg_vol_60d
             FROM daily_prices
         )
         SELECT
-            date, code, avg_vol_5d,
-            RANK() OVER (PARTITION BY date ORDER BY avg_vol_5d DESC)::INTEGER AS vol_rank
+            date,
+            code,
+            avg_vol_5d,
+            avg_vol_60d,
+            CASE
+                WHEN avg_vol_60d IS NULL OR avg_vol_60d <= 0 THEN NULL
+                ELSE avg_vol_5d / avg_vol_60d
+            END AS vol_surge_ratio,
+            RANK() OVER (PARTITION BY date ORDER BY avg_vol_5d DESC)::INTEGER AS vol_rank,
+            RANK() OVER (
+                PARTITION BY date
+                ORDER BY
+                    CASE
+                        WHEN avg_vol_60d IS NULL OR avg_vol_60d <= 0 THEN NULL
+                        ELSE avg_vol_5d / avg_vol_60d
+                    END DESC
+            )::INTEGER AS vol_surge_rank
         FROM rolling
     """)
     conn.commit()

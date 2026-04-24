@@ -28,6 +28,7 @@ class EmaTrendStrategy(BaseStrategy):
         self.max_ema_dev = cfg.get("max_ema_dev", 0.0)  # 收盤距 EMA20 乖離率上限（0=停用）
         self.min_atr_pct = cfg.get("min_atr_pct", 0.0)  # ATR% 下限，過低視為死魚股（0=停用）
         self.signal_day_max_gain = cfg.get("signal_day_max_gain", 0.0)  # 信號日單日漲幅上限（0=停用）；大紅棒假突破過濾
+        self.ema_aligned_max = cfg.get("ema_aligned_max", 0)  # 多頭排列連續天數上限（0=停用）；超過視為陳舊訊號跳過
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.ema_slow + self.adx_period + 5
@@ -53,6 +54,18 @@ class EmaTrendStrategy(BaseStrategy):
         # 最新一根：價格需站上 EMA20
         if price <= em_now:
             return None
+
+        # 多頭排列新鮮度：連續對齊天數不能超過上限（避免陳舊高乖離訊號）
+        if self.ema_aligned_max > 0:
+            streak = 0
+            for k in range(len(ef)):
+                j = len(ef) - 1 - k
+                if ef.iloc[j] > em.iloc[j] > es.iloc[j]:
+                    streak += 1
+                else:
+                    break
+            if streak > self.ema_aligned_max:
+                return None
 
         # ADX 計算（同時用於過濾與信心評分）
         adx_val = None
@@ -135,6 +148,13 @@ class EmaTrendStrategy(BaseStrategy):
         vol_ma5 = volume.rolling(5).mean().shift(1).values
         close_v = close.values
 
+        # 多頭排列連續天數（streak）陣列
+        import numpy as np
+        aligned = np.array([ef_arr[j] > em_arr[j] > es_arr[j] for j in range(len(ef_arr))])
+        streak_arr = np.zeros(len(close_v), dtype=int)
+        for j in range(len(close_v)):
+            streak_arr[j] = (streak_arr[j - 1] + 1) if (j > 0 and aligned[j]) else (1 if aligned[j] else 0)
+
         confirm_bars = 5
         result: dict[int, Signal] = {}
         for i in range(self.ema_slow + confirm_bars, len(df)):
@@ -146,6 +166,9 @@ class EmaTrendStrategy(BaseStrategy):
                     ok = False
                     break
             if not ok:
+                continue
+            # 新鮮度過濾：排列持續超過上限 → 陳舊訊號跳過
+            if self.ema_aligned_max > 0 and streak_arr[i] > self.ema_aligned_max:
                 continue
             price  = close_v[i]
             em_now = em_arr[i]
