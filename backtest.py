@@ -1218,6 +1218,8 @@ def _trade_rank_score(
     rank_dev_tolerance: float = 0.03,
     rank_breadth_sweet_spot: float = 0.60,
     rank_breadth_tolerance: float = 0.12,
+    rank_vol_surge_sweet_spot: float = 0.75,
+    rank_vol_surge_tolerance: float = 0.50,
 ) -> float:
     conf = _clamp01(_safe_float(trade.get("confidence", 0.0)))
     rs_raw = _safe_float(trade.get("rs_score", 0.0))
@@ -1236,9 +1238,12 @@ def _trade_rank_score(
         breadth_raw, sweet_spot=rank_breadth_sweet_spot, tolerance=rank_breadth_tolerance, default=0.5
     )
     chip_score_val = _safe_float(trade.get("chip_score", 0.5))
-    # vol_surge_score: 今日量 / 20日均量，上限 5× → 歸一化到 0~1
+    # vol_surge_score: sweet spot 計分（低量進場較佳，0.75x 最高分）
     _raw_surge = _safe_float(trade.get("vol_surge_score", 1.0))
-    vol_surge_score_val = _clamp01(_raw_surge / 5.0)
+    vol_surge_score_val = _sweet_spot_score(
+        _raw_surge, sweet_spot=rank_vol_surge_sweet_spot,
+        tolerance=rank_vol_surge_tolerance, default=0.5
+    )
 
     mode = (rank_mode or "confidence").lower()
     if mode == "confidence":
@@ -1303,6 +1308,8 @@ def portfolio_simulation(
     rank_dev_tolerance: float = 0.03,
     rank_breadth_sweet_spot: float = 0.60,
     rank_breadth_tolerance: float = 0.12,
+    rank_vol_surge_sweet_spot: float = 0.75,
+    rank_vol_surge_tolerance: float = 0.50,
     market_dd_threshold: float = 0.0,        # 0050 回撤超過此值時縮倉（0=停用）
     market_dd_max_positions: int = 2,        # 大盤深度回撤時最大持倉數
     market_dd_by_date: dict | None = None,   # {date_str: drawdown_pct}
@@ -1350,6 +1357,8 @@ def portfolio_simulation(
                                               rank_dev_tolerance=rank_dev_tolerance,
                                               rank_breadth_sweet_spot=rank_breadth_sweet_spot,
                                               rank_breadth_tolerance=rank_breadth_tolerance,
+                                              rank_vol_surge_sweet_spot=rank_vol_surge_sweet_spot,
+                                              rank_vol_surge_tolerance=rank_vol_surge_tolerance,
                                           ),
                                           -x.get("confidence", 0),
                                           -x.get("rs_score", 0)))
@@ -1598,6 +1607,8 @@ def portfolio_simulation(
             rank_dev_tolerance=rank_dev_tolerance,
             rank_breadth_sweet_spot=rank_breadth_sweet_spot,
             rank_breadth_tolerance=rank_breadth_tolerance,
+            rank_vol_surge_sweet_spot=rank_vol_surge_sweet_spot,
+            rank_vol_surge_tolerance=rank_vol_surge_tolerance,
         )
 
         taken.append({
@@ -2066,6 +2077,10 @@ def main():
                         help="hybrid 排序：市場廣度甜蜜區中心（預設 0.60）")
     parser.add_argument("--rank-breadth-tolerance", type=float, default=0.12,
                         help="hybrid 排序：市場廣度甜蜜區容忍帶（預設 0.12）")
+    parser.add_argument("--rank-vol-surge-sweet-spot", type=float, default=0.75,
+                        help="hybrid 排序：量能甜蜜區中心（預設 0.75×；低量進場期望值最高）")
+    parser.add_argument("--rank-vol-surge-tolerance", type=float, default=0.50,
+                        help="hybrid 排序：量能甜蜜區容忍帶（預設 0.50；超出此範圍得分趨近 0）")
     parser.add_argument("--time-stop-days", type=int, default=0,
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
@@ -2723,6 +2738,8 @@ def main():
         rank_dev_tolerance=args.rank_dev_tolerance,
         rank_breadth_sweet_spot=args.rank_breadth_sweet_spot,
         rank_breadth_tolerance=args.rank_breadth_tolerance,
+        rank_vol_surge_sweet_spot=args.rank_vol_surge_sweet_spot,
+        rank_vol_surge_tolerance=args.rank_vol_surge_tolerance,
         idle_0050=not args.no_idle_0050,
         swap_days_max=args.swap_days,
         kbars_lookup=all_kbars if args.swap_days > 0 else None,

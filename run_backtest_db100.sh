@@ -19,7 +19,7 @@
   --max-rs              0.40 \
   --rank-mode           hybrid \
   --rank-w-conf         0.00 \
-  --rank-w-rs           0.41 \
+  --rank-w-rs           0.31 \
   --rank-w-dev          0.20 \
   --rank-w-rs-sweet     0.29 \
   --rank-rs-center      0.05 \
@@ -62,7 +62,9 @@
   --rs-pos-low-mult     0.80 \
   --short-util-max      0.08 \
   --rank-w-chip         0.15 \
-  --rank-w-vol-surge    0.00 \
+  --rank-w-vol-surge    0.10 \
+  --rank-vol-surge-sweet-spot 0.75 \
+  --rank-vol-surge-tolerance  0.50 \
   --vix-park-hi         30 \
   --vix-park-lo         20 \
   "$@"
