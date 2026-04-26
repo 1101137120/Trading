@@ -22,7 +22,7 @@
   --rank-w-rs           0.31 \
   --rank-w-dev          0.20 \
   --rank-w-rs-sweet     0.29 \
-  --rank-rs-center      0.05 \
+  --rank-rs-center      0.12 \
   --rank-rs-span        0.25 \
   --rank-rs-sweet-spot  0.20 \
   --rank-rs-sweet-tolerance 0.10 \
@@ -41,7 +41,7 @@
   --slippage            0.002 \
   --max-vol-pct         0.03 \
   --min-atr-pct         3.0 \
-  --min-ema-dev         0.03 \
+  --min-ema-dev         0.04 \
   --dev-low-thr         0.03 \
   --dev-high-thr        0.05 \
   --dev-low-pct         0.10 \
