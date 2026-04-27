@@ -11,8 +11,8 @@
   --trail-stop-bull     0.22 \
   --trail-stop-rs-bonus 0.05 \
   --trail-activation    0.02 \
-  --max-positions       6 \
-  --position-pct        0.16 \
+  --max-positions       5 \
+  --position-pct        0.20 \
   --stocks              80 \
   --max-price           2000 \
   --min-rs              0.13 \
