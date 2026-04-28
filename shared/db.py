@@ -436,10 +436,16 @@ def upsert_foreign_holding(rows: list[dict], conn: duckdb.DuckDBPyConnection):
 
 
 def get_latest_inst_date(conn: duckdb.DuckDBPyConnection) -> Optional[str]:
-    """institutional_net 表中最新的日期，無資料回傳 None"""
-    row = conn.execute(
-        "SELECT MAX(date) FROM institutional_net"
-    ).fetchone()
+    """三大法人/融資融券/外資持股 三表中最小的最新日期，確保所有表都補齊"""
+    row = conn.execute("""
+        SELECT MIN(d) FROM (
+            SELECT MAX(date) AS d FROM institutional_net
+            UNION ALL
+            SELECT MAX(date) AS d FROM margin_balance
+            UNION ALL
+            SELECT MAX(date) AS d FROM foreign_holding
+        )
+    """).fetchone()
     return row[0] if row and row[0] else None
 
 
