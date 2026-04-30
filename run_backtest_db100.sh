@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差（預設用 stocks_v2）
+# DB 版 top 100 — 使用歷史宇宙快照，無存活者偏差（stocks.db）
 .venv/bin/python backtest.py --show-skipped \
   --db-backend          duckdb \
-  --db-path             data/stocks_v2.db \
+  --db-path             data/stocks.db \
   --start               2009-01-01 \
   --capital             1000000 \
   --strategies          ema_trend \
@@ -67,4 +67,6 @@
   --rank-vol-surge-tolerance  0.50 \
   --vix-park-hi         30 \
   --vix-park-lo         20 \
+  --swap-rs-min-diff    0.10 \
+  --swap-max-pnl        0.02 \
   "$@"

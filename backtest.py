@@ -1314,8 +1314,11 @@ def portfolio_simulation(
     market_dd_max_positions: int = 2,        # 大盤深度回撤時最大持倉數
     market_dd_by_date: dict | None = None,   # {date_str: drawdown_pct}
     idle_0050: bool = True,              # False = 關閉閒置資金停泊 0050
-    swap_days_max: int = 0,              # 汰舊換新（預留，未實作）
-    kbars_lookup: "dict | None" = None, # 換倉用 K 棒查詢（預留）
+    swap_days_max: int = 0,              # 換倉：持倉天數上限（0=不限）
+    kbars_lookup: "dict | None" = None, # 換倉用 K 棒查詢
+    swap_rs_min_diff: float = 0.0,      # 換倉 RS 差值閾值（0=停用）
+    swap_max_pnl: float = 0.05,         # 換倉最大允許持倉未實現損益（超過此值不換倉）
+    mkt_close_dict: "dict[str, float] | None" = None,  # 換倉用大盤收盤價字典
     rs_pos_high_thr: float = 0.0,       # RS >= 此值時擴大倉位（0=停用）
     rs_pos_high_mult: float = 1.3,      # 高 RS 倉位乘數
     rs_pos_low_thr: float = 0.0,        # RS < 此值時縮小倉位（0=停用）
@@ -1502,7 +1505,112 @@ def portfolio_simulation(
                 if _mkt_dd >= market_dd_threshold:
                     _eff_max = min(_eff_max, market_dd_max_positions)
             if len(active) >= _eff_max:
-                continue
+                # ── 換倉：新訊號 RS 顯著高於最弱持倉當日 RS 時替換 ──
+                _swapped = False
+                if (swap_rs_min_diff > 0
+                        and kbars_lookup is not None
+                        and mkt_close_dict is not None):
+                    _new_rs = trade.get("rs_score", 0.0)
+                    _sig_date = trade.get("signal_date")
+                    _ref_ds = str(_sig_date)[:10] if _sig_date else str(entry_date)[:10]
+                    _mc_keys = sorted(mkt_close_dict.keys())
+                    _mi_sw = bisect.bisect_right(_mc_keys, _ref_ds) - 1
+                    _lb = 20
+                    _best_swap_pos = None
+                    _best_swap_rs = float("inf")
+                    for _ap in active:
+                        if _ap.get("is_pyramid", False):
+                            continue
+                        if swap_days_max > 0:
+                            if (entry_date - _ap["entry_date"]).days > swap_days_max:
+                                continue
+                        _ap_df = kbars_lookup.get(_ap["code"])
+                        if _ap_df is None:
+                            continue
+                        try:
+                            _ap_idx = int((_ap_df["ts"] <= pd.Timestamp(_ref_ds)).sum()) - 1
+                            if _ap_idx < _lb:
+                                continue
+                            _ap_cur  = float(_ap_df["Close"].iloc[_ap_idx])
+                            _ap_past = float(_ap_df["Close"].iloc[_ap_idx - _lb])
+                            if _ap_past <= 0:
+                                continue
+                            _ap_sret = (_ap_cur - _ap_past) / _ap_past
+                        except Exception:
+                            continue
+                        # 不換出已賺錢的持倉（保護獲利中的倉位）
+                        _ap_epx = _ap.get("entry_price", 0.0)
+                        if _ap_epx > 0 and (_ap_cur - _ap_epx) / _ap_epx > swap_max_pnl:
+                            continue
+                        if _mi_sw >= _lb:
+                            _mc_now  = mkt_close_dict[_mc_keys[_mi_sw]]
+                            _mc_past = mkt_close_dict[_mc_keys[_mi_sw - _lb]]
+                            _mkt_ret_sw = (_mc_now - _mc_past) / _mc_past if _mc_past > 0 else 0.0
+                        else:
+                            _mkt_ret_sw = 0.0
+                        _cur_rs = _ap_sret - _mkt_ret_sw
+                        if _cur_rs < _best_swap_rs:
+                            _best_swap_rs = _cur_rs
+                            _best_swap_pos = _ap
+                    if (_best_swap_pos is not None
+                            and _new_rs >= _best_swap_rs + swap_rs_min_diff):
+                        # 強制平倉最弱持倉
+                        _sw_code = _best_swap_pos["code"]
+                        _sw_df   = kbars_lookup.get(_sw_code)
+                        _sw_qty  = _best_swap_pos["qty"]
+                        _sw_unit = _best_swap_pos["unit_size"]
+                        _sw_odd  = _best_swap_pos.get("is_odd_lot", False)
+                        _sw_epx  = _best_swap_pos["entry_price"]
+                        _sw_xpx  = 0.0
+                        if _sw_df is not None:
+                            try:
+                                _sw_ri = int((_sw_df["ts"] <= pd.Timestamp(entry_date)).sum()) - 1
+                                if _sw_ri >= 0:
+                                    _sw_row_d = str(_sw_df["ts"].iloc[_sw_ri])[:10]
+                                    if _sw_row_d == str(entry_date)[:10]:
+                                        _sw_xpx = float(_sw_df["Open"].iloc[_sw_ri])
+                                    else:
+                                        _sw_xpx = float(_sw_df["Close"].iloc[_sw_ri])
+                            except Exception:
+                                pass
+                        if _sw_xpx > 0:
+                            _sw_sell  = _sw_qty * _sw_unit * _sw_xpx
+                            _sw_fsell = max(_sw_sell * fee_rate, min_fee)
+                            _sw_txr   = tax_etf_rate if is_etf_code(_sw_code) else tax_stock_rate
+                            _sw_tax   = _sw_sell * _sw_txr
+                            _sw_odpen = _sw_sell * odd_lot_penalty_pct if _sw_odd else 0.0
+                            _sw_xcash = _sw_sell - _sw_fsell - _sw_odpen - _sw_tax
+                            capital         += _sw_xcash
+                            total_open_cost -= _best_swap_pos["cost"]
+                            total_fees      += _sw_fsell + _sw_odpen
+                            total_taxes     += _sw_tax
+                            _sw_ti = _best_swap_pos.get("taken_idx", -1)
+                            if 0 <= _sw_ti < len(taken):
+                                _sw_gross = _sw_qty * _sw_unit * (_sw_xpx - _sw_epx)
+                                _sw_fb    = taken[_sw_ti].get("fee_buy", 0)
+                                _sw_net   = _sw_gross - _sw_fb - _sw_fsell - _sw_odpen - _sw_tax
+                                _sw_hold  = (entry_date - _best_swap_pos["entry_date"]).days
+                                taken[_sw_ti].update({
+                                    "exit_price":        round(_sw_xpx, 2),
+                                    "exit_date":         entry_date,
+                                    "hold_days":         _sw_hold,
+                                    "result":            "換倉",
+                                    "pnl_pct":           round((_sw_xpx - _sw_epx) / _sw_epx * 100, 2) if _sw_epx > 0 else 0.0,
+                                    "gross_pnl_dollars": round(_sw_gross, 0),
+                                    "net_pnl_dollars":   round(_sw_net, 0),
+                                    "pnl_dollars":       round(_sw_net, 0),
+                                    "fee_sell":          round(_sw_fsell + _sw_odpen, 0),
+                                    "tax":               round(_sw_tax, 0),
+                                    "fee_tax_total":     round(_sw_fb + _sw_fsell + _sw_odpen + _sw_tax, 0),
+                                    "div_cash":          0,
+                                    "accumulated_div":   0.0,
+                                })
+                            active = [p for p in active if p is not _best_swap_pos]
+                            if _active_trade_ids.get(_sw_code) == _best_swap_pos.get("trade_id", ""):
+                                del _active_trade_ids[_sw_code]
+                            _swapped = True
+                if not _swapped:
+                    continue
 
         alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
                                dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult,
@@ -1629,11 +1737,18 @@ def portfolio_simulation(
             "parent_trade_id": _parent_trade_id,
         })
         active.append({
-            "exit_date": trade["exit_date"],
-            "exit_cash": cost + gross_pnl_dollars + div_cash - fee_sell - odd_lot_sell_pen - tax,
-            "cost": cost,
-            "code": trade["code"],
-            "trade_id": _this_trade_id,
+            "exit_date":  trade["exit_date"],
+            "exit_cash":  cost + gross_pnl_dollars + div_cash - fee_sell - odd_lot_sell_pen - tax,
+            "cost":       cost,
+            "code":       trade["code"],
+            "trade_id":   _this_trade_id,
+            "entry_date": entry_date,
+            "qty":        qty,
+            "unit_size":  unit_size,
+            "is_odd_lot": is_odd_lot,
+            "entry_price": price,
+            "taken_idx":  len(taken) - 1,
+            "is_pyramid": is_pyramid,
         })
 
     # 最後一筆進場到最後出場：繼續累積 0050 閒置收益
@@ -1955,7 +2070,11 @@ def main():
     parser.add_argument("--no-idle-0050", action="store_true", default=False,
                         help="關閉閒置資金停泊 0050（閒置資金維持現金）")
     parser.add_argument("--swap-days", type=int, default=0,
-                        help="汰舊換新：持倉天數 <= 此值的最低 rank 持倉可被新訊號換掉（0=停用，建議 5）")
+                        help="換倉：持倉天數上限（0=不限，需搭配 --swap-rs-min-diff 使用）")
+    parser.add_argument("--swap-rs-min-diff", type=float, default=0.0,
+                        help="換倉 RS 差值閾值：新訊號當日 RS 超過最弱持倉當日 RS 此值則換倉（0=停用，建議 0.10）")
+    parser.add_argument("--swap-max-pnl", type=float, default=0.05,
+                        help="換倉最大允許持倉未實現損益（超過此值不換倉，保護獲利倉位；預設 0.05=5%%）")
     parser.add_argument("--rs-pos-high-thr", type=float, default=0.0,
                         help="RS >= 此值時擴大倉位（0=停用，建議 0.15）")
     parser.add_argument("--rs-pos-high-mult", type=float, default=1.3,
@@ -2690,6 +2809,17 @@ def main():
     except Exception:
         pass
 
+    # 換倉用大盤收盤價字典（供 portfolio_simulation 計算持倉當日 RS）
+    _mkt_close_dict: dict[str, float] = {}
+    if _mkt_daily_ret:
+        try:
+            if use_db:
+                _mkt_close_dict = dict(zip(_mkt_pre_d, _mkt_pre_c.tolist()))
+            elif market_df is not None:
+                _mkt_close_dict = {str(k): float(v) for k, v in zip(_mdf_d, _mdf_c.tolist())}
+        except Exception:
+            pass
+
     # lag1：停泊訊號用前一日的 MA20 判斷（避免 lookahead）
     _mkt_above_ma_lag1: dict[str, bool] = {}
     if _mkt_above_ma:
@@ -2742,7 +2872,10 @@ def main():
         rank_vol_surge_tolerance=args.rank_vol_surge_tolerance,
         idle_0050=not args.no_idle_0050,
         swap_days_max=args.swap_days,
-        kbars_lookup=all_kbars if args.swap_days > 0 else None,
+        kbars_lookup=all_kbars if (args.swap_days > 0 or args.swap_rs_min_diff > 0) else None,
+        swap_rs_min_diff=args.swap_rs_min_diff,
+        swap_max_pnl=args.swap_max_pnl,
+        mkt_close_dict=_mkt_close_dict if args.swap_rs_min_diff > 0 else None,
         rs_pos_high_thr=args.rs_pos_high_thr,
         rs_pos_high_mult=args.rs_pos_high_mult,
         rs_pos_low_thr=args.rs_pos_low_thr,
@@ -3233,8 +3366,9 @@ def main():
         "stop_loss":            args.stop_loss,
         "trail_stop":           args.trail_stop,
         "trail_activation":     args.trail_activation,
-        "trail_stop_bull":      args.trail_stop_bull,
-        "trail_stop_rs_bonus":  args.trail_stop_rs_bonus,
+        "trail_stop_bull":          args.trail_stop_bull,
+        "trail_stop_bull_min_gain": getattr(args, "trail_stop_bull_min_gain", None),
+        "trail_stop_rs_bonus":      args.trail_stop_rs_bonus,
         "max_positions":        args.max_positions,
         "position_pct":         args.position_pct,
         "stocks":               args.stocks,
@@ -3271,6 +3405,9 @@ def main():
         "pyramid_gain2":        args.pyramid_gain2,
         "pyramid_rs_min":       args.pyramid_rs_min,
         "pyramid_alloc":        args.pyramid_alloc,
+        "swap_rs_min_diff":     args.swap_rs_min_diff,
+        "swap_max_pnl":         args.swap_max_pnl,
+        "swap_days":            args.swap_days,
     }
 
     # ── 自動時間戳路徑（--output-csv 預設值時才自動命名）──
