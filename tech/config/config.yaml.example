@@ -16,52 +16,58 @@ broker:
 market_filter:
   enabled: true
   proxy_code: "0050"
-  ma_period: 10   # 建議 10（快）或 20（穩）；牛市/V型反彈偏好 10
-  breadth_min: 0.50 # 市場廣度門檻：候選股中站上EMA20比例需>=此值才開倉（0=停用；建議0.4~0.5）
-  max_20d_gain: 0.10  # 0050近20日漲幅超過10%視為過熱，暫停開倉（0=停用）
-  max_10d_gain: 0.07  # 0050近10日漲幅超過7%視為過熱（0=停用）
-  max_atr_pct: 0.015  # 0050 ATR%超過1.5%視為震盪過激，暫停開倉（0=停用）
-  # VIX 恐慌反彈：VIX >= 此值時允許 panic_rebound 策略繞過大盤偏空封鎖
-  # 關稅戰/系統性恐慌時用，0 = 停用（建議 30，極端恐慌考慮 35）
-  vix_panic_threshold: 0  # 建議值 30
+  ma_period: 20        # 建議 20（穩）；牛市偏好 10（快）
+  bull_entry_only: false  # true=只有牛市（MA20>MA60）才允許進場（更嚴格）
+  breadth_min: 0.50    # 市場廣度下限：候選股站上EMA20比例需>=此值（0=停用）
+  breadth_max: 0.82    # 市場廣度上限：比例超過此值視為過熱暫停（0=停用）
+  max_20d_gain: 0.10   # 0050近20日漲幅超過10%視為過熱，暫停開倉（0=停用）
+  max_10d_gain: 0.07   # 0050近10日漲幅超過7%視為過熱（0=停用）
+  max_atr_pct: 0.015   # 0050 ATR%超過1.5%視為震盪過激，暫停開倉（0=停用）
+  vix_panic_threshold: 0   # VIX >= 此值允許 panic_rebound 繞過偏空封鎖（0=停用；建議30）
+  vix_park_hi: 30      # VIXTWN >= 此值時閒置資金停泊 00631L（0=停用）
+  vix_park_lo: 20      # VIXTWN <= 此值時切回停泊 0050
 
 # ── 風控 ──────────────────────────────────────────────────────────────────
 risk:
-  max_positions: 5          # 同時最多持幾檔，超過則等待既有部位出場再進新倉
-  bull_max_positions: 0     # 牛市（0050 MA20>MA60）時放寬至此數；0=不放寬
-  max_position_pct: 0.20    # 單檔最多佔總資金比例（避免重押一檔）
-  stop_loss_pct: 0.05       # 停損：買入後跌 5% 出場（注意：隔日跳空可能超過此值）
-  # 停利設定說明：
-  #   停利 15%：交易次數多、勝率略高，但牛市容易太早出場。
-  #   停利 25%：讓趨勢跑更久，每筆期望值從 +4.82% 提升至 +8.76%（回測數據）。
+  max_positions: 4           # 同時最多持幾檔，超過則等待既有部位出場再進新倉
+  bull_max_positions: 0      # 牛市（0050 MA20>MA60）時放寬至此數；0=不放寬
+  max_position_pct: 0.25     # 單檔最多佔總資金比例
+  stop_loss_pct: 0.08        # 固定停損比例；stop_atr_mult > 0 時改用 ATR 動態停損
+  stop_atr_mult: 3.5         # ATR 動態停損倍數（0=停用，使用固定 stop_loss_pct）
   take_profit_pct: 0.25
-  max_daily_loss_pct: 0.03  # 當日總虧損達 3% 時停止開新倉（日內熔斷）
-  min_order_value: 10000    # 單筆最低委託金額（元）
-  max_order_value: 500000   # 單筆最高委託金額（元），防止異常大單
+  max_daily_loss_pct: 0.03
+  min_order_value: 10000
+  max_order_value: 500000
   consecutive_loss_pause:
-    count: 3           # 連續虧損幾次後暫停開倉
-    pause_minutes: 60  # 暫停時間（分鐘）
-  # 移動停利：獲利達 activation_pct 後啟動，之後從最高點回落 trail_pct 才出場。
-  # 適合趨勢行情，讓獲利單繼續跑；若行情急漲急跌則可能過早出場。
+    count: 3
+    pause_minutes: 60
   trailing_stop:
-    activation_pct: 0.10   # 獲利達 10% 後啟動移動停損（配合停利 25% 調高）
-    trail_pct: 0.05         # 從最高點回落 5% 出場
-    trail_stop_bull_pct: 0.18  # 牛市（MA20>MA60）時改用此值，讓趨勢跑更遠；0=不區分
-    trail_stop_rs_bonus: 0.05  # RS強勢個股（RS>0.1）額外放寬空間；0=停用
-  time_stop_days: 20        # 時間停損：持倉超過N天且漲幅未達門檻強制出場（0=停用）
-  time_stop_min_pct: 0.05   # 時間停損最低漲幅門檻（5%），搭配 time_stop_days 使用
-  max_sell_retries: 5      # 賣出失敗達此次數後停止自動重試，需人工確認
-  loss_cooldown_days: 5    # 個股停損出場後冷卻天數，期間不再進場；0 = 停用
+    activation_pct: 0.02     # 獲利達 2% 後啟動移動停損
+    trail_pct: 0.15          # 從最高點回落 15% 出場
+    trail_stop_bull_pct: 0.20  # 牛市（MA20>MA60）時改用此值（0=不區分）
+    trail_stop_rs_bonus: 0.05  # RS強勢個股（RS>0.1）額外放寬（0=停用）
+  time_stop_days: 20         # 持倉超過N天且漲幅未達門檻強制出場（0=停用）
+  time_stop_min_pct: 0.05    # 時間停損最低漲幅門檻
+  max_sell_retries: 5
+  loss_cooldown_days: 5      # 停損出場後冷卻天數（0=停用）
+  # 大盤深度回撤縮倉
+  market_dd_threshold: 0.10  # 0050 從高點回撤 >= 此值時縮倉（0=停用）
+  market_dd_max_positions: 2 # 大盤回撤時持倉上限
   # EMA 乖離動態倉位（0=停用）
-  dev_low_thr:  0.03   # 乖離率低於此值縮倉（距EMA過近，動能弱）
-  dev_high_thr: 0.05   # 乖離率高於此值放大倉位（強動能）
-  dev_low_pct:  0.15   # 低乖離縮至 max_position_pct × 此值
-  dev_high_mult: 1.4   # 高乖離放大至 max_position_pct × 此值（上限50%）
+  dev_low_thr:  0.03
+  dev_high_thr: 0.05
+  dev_low_pct:  0.10
+  dev_high_mult: 1.4
+  # RS 個股動態倉位（0=停用）
+  rs_pos_high_thr:  0.15     # RS >= 此值放大倉位
+  rs_pos_high_mult: 1.80     # 高 RS 倉位乘數
+  rs_pos_low_thr:   0.07     # RS <= 此值縮小倉位
+  rs_pos_low_mult:  0.80     # 低 RS 倉位乘數
   order_chase:
-    enabled: true          # 掛單未成交時自動追單
-    after_minutes: 5       # 掛出幾分鐘後仍 Active 才追
-    max_pct: 0.015         # 最高追至原始下單價 + 1.5%，超過則放棄
-    max_retries: 1         # 最多追幾次
+    enabled: true
+    after_minutes: 5
+    max_pct: 0.015
+    max_retries: 1
 
 # ── 贏家加碼 ──────────────────────────────────────────────────────────────
 pyramid:
@@ -74,14 +80,38 @@ pyramid:
 screener:
   exchanges: ["TSE", "OTC"]
   min_price: 10.0
-  max_price: 1000.0
+  max_price: 2000.0
   min_volume: 1000
   min_avg_volume_5d: 2000
-  max_stocks: 50
-  max_evaluate: 30         # 策略評估最多跑幾檔（依成交量排序）
-  exclude_etf: true        # 排除 ETF（代碼 00 開頭），避免除息/分割干擾技術訊號
-  exclude_disposed: true   # 排除處置股（day_trade=No），撮合受限掛單難成交
-  max_avg_daily_range_pct: 0  # 排除日均振幅 > 此值(%)的高波動股；0 = 停用
+  max_stocks: 80
+  max_evaluate: 30
+  exclude_etf: true
+  exclude_disposed: true
+  max_avg_daily_range_pct: 0
+  min_rs_entry: 0.13       # 進場最低 RS（個股20日報酬 - 0050）；0=停用
+  max_rs_entry: 0.40       # 進場最高 RS（趨勢末段過濾）；0=停用
+
+# ── 排名系統（hybrid 模式對齊回測）────────────────────────────────────────────
+rank:
+  w_conf:     0.00    # 信心值權重（多策略共識加成）
+  w_rs:       0.41    # RS 強度權重（個股相對 0050 強度，最重要）
+  w_dev:      0.20    # EMA20 乖離率權重（進場位置質量）
+  w_rs_sweet: 0.19    # RS 甜蜜點加分（RS 在甜蜜點附近最高分）
+  w_chip:     0.25    # 籌碼評分權重（short_util 低 + 外資買 → 高分）
+  w_breadth:  0.00    # 市場廣度權重（live 端固定 0.5，建議留 0）
+  rs_center:      0.12  # RS 線性分的起算點（低於此分較少加分）
+  rs_span:        0.25  # RS 線性分的跨度
+  rs_sweet_spot:  0.20  # RS 甜蜜點中心值
+  rs_sweet_tol:   0.10  # RS 甜蜜點容差（±此值內滿分）
+  dev_sweet_spot: 0.05  # EMA乖離甜蜜點（5% 最佳）
+  dev_tol:        0.03  # EMA乖離容差
+  min_rank_score: 0.38  # 進場最低排名分數門檻；低於此分跳過（0=停用）
+
+# ── 籌碼過濾 ──────────────────────────────────────────────────────────────────
+chip_filter:
+  enabled: true
+  margin_short_ratio_max: 4.0   # 資券比超過此值跳過（0=停用）
+  short_util_max: 0.08          # 融券使用率超過此值跳過（0=停用）
 
 # ── 進場過濾 ────────────────────────────────────────────────────────────────
 # 開盤跳空過濾：開盤價 vs 昨收漲幅超過閾值視為「噴出」，延遲進場。

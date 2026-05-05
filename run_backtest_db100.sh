@@ -8,7 +8,7 @@
   --strategies          ema_trend \
   --stop-loss           8 \
   --trail-stop          0.15 \
-  --trail-stop-bull     0.22 \
+  --trail-stop-bull     0.20 \
   --trail-stop-rs-bonus 0.05 \
   --trail-activation    0.02 \
   --max-positions       4 \
@@ -19,9 +19,9 @@
   --max-rs              0.40 \
   --rank-mode           hybrid \
   --rank-w-conf         0.00 \
-  --rank-w-rs           0.31 \
+  --rank-w-rs           0.41 \
   --rank-w-dev          0.20 \
-  --rank-w-rs-sweet     0.29 \
+  --rank-w-rs-sweet     0.19 \
   --rank-rs-center      0.12 \
   --rank-rs-span        0.25 \
   --rank-rs-sweet-spot  0.20 \
@@ -61,12 +61,12 @@
   --rs-pos-low-thr      0.07 \
   --rs-pos-low-mult     0.80 \
   --short-util-max      0.08 \
-  --rank-w-chip         0.15 \
-  --rank-w-vol-surge    0.10 \
+  --rank-w-chip         0.25 \
+  --rank-w-vol-surge    0.00 \
   --rank-vol-surge-sweet-spot 0.75 \
   --rank-vol-surge-tolerance  0.50 \
   --vix-park-hi         30 \
   --vix-park-lo         20 \
-  --swap-rs-min-diff    0.10 \
-  --swap-max-pnl        0.02 \
+  --stop-atr-mult           3.5 \
+  --min-rank-score          0.38 \
   "$@"

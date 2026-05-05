@@ -1083,6 +1083,22 @@ class TradingSystem:
                 sig.foreign_streak     = chip.get("foreign_streak", 0)
                 sig.trust_streak       = chip.get("trust_streak", 0)
                 sig.short_util         = chip.get("short_util")
+                # ATR 動態停損（stop_atr_mult > 0 時啟用）
+                _atr_mult = self.config.get("risk", {}).get("stop_atr_mult", 0.0)
+                if _atr_mult > 0 and len(df) >= 15 and "High" in df.columns and "Low" in df.columns:
+                    _hi = df["High"].astype(float).values
+                    _lo = df["Low"].astype(float).values
+                    _cl = df["Close"].astype(float).values
+                    _tr_vals = [_hi[0] - _lo[0]]
+                    for _i in range(1, len(_cl)):
+                        _tr_vals.append(max(
+                            _hi[_i] - _lo[_i],
+                            abs(_hi[_i] - _cl[_i - 1]),
+                            abs(_lo[_i] - _cl[_i - 1]),
+                        ))
+                    _atr14 = sum(_tr_vals[-14:]) / min(14, len(_tr_vals))
+                    if _atr14 > 0:
+                        sig.atr_stop = float(sig.price - _atr14 * _atr_mult)
                 signals.append(sig)
 
         # rank_score 排序（conf 30% + rs 40% + ema_dev 15% + chip 15%）
@@ -1098,14 +1114,14 @@ class TradingSystem:
         # rank 參數從 config 讀取，對齊 backtest hybrid 模式
         _rk = self.config.get("rank", {})
         _w_conf      = _rk.get("w_conf",      0.00)
-        _w_rs        = _rk.get("w_rs",        0.26)
+        _w_rs        = _rk.get("w_rs",        0.41)
         _w_dev       = _rk.get("w_dev",       0.20)
-        _w_rs_sweet  = _rk.get("w_rs_sweet",  0.29)
-        _w_breadth   = _rk.get("w_breadth",   0.10)
-        _w_chip      = _rk.get("w_chip",      0.15)
+        _w_rs_sweet  = _rk.get("w_rs_sweet",  0.19)
+        _w_breadth   = _rk.get("w_breadth",   0.00)
+        _w_chip      = _rk.get("w_chip",      0.25)
         _rs_sweet_spot  = _rk.get("rs_sweet_spot",  0.20)
         _rs_sweet_tol   = _rk.get("rs_sweet_tol",   0.10)
-        _rs_center      = _rk.get("rs_center",      0.05)
+        _rs_center      = _rk.get("rs_center",      0.12)
         _rs_span        = _rk.get("rs_span",         0.25)
         _dev_sweet_spot = _rk.get("dev_sweet_spot",  0.05)
         _dev_tol        = _rk.get("dev_tol",         0.03)
@@ -1134,6 +1150,13 @@ class TradingSystem:
         for s in signals:
             s.rank_score = _rank(s)
         signals.sort(key=lambda s: s.rank_score, reverse=True)
+        _min_rank = _rk.get("min_rank_score", 0.0)
+        if _min_rank > 0 and signals:
+            _before = len(signals)
+            signals = [s for s in signals if s.rank_score >= _min_rank]
+            _cut = _before - len(signals)
+            if _cut:
+                self.logger.info(f"min_rank_score={_min_rank:.2f} 過濾 {_cut} 個低質訊號")
         self.logger.info(
             f"評估 {evaluated} 檔 | 已持倉跳過 {skipped_pos} | "
             f"漲停跳過 {skipped_limit} | RS 不足跳過 {skipped_rs} | "
@@ -1388,8 +1411,14 @@ class TradingSystem:
                 continue
             if not is_odd_lot and not self.risk.is_valid_order(price, qty):
                 continue
-            stop_loss = self.risk.calc_stop_loss(price)
+            # ATR 動態停損：signal.atr_stop > 0 且合理時使用，否則 fallback 固定 pct
+            if signal.atr_stop > 0 and signal.atr_stop < price * 0.95:
+                stop_loss = self.risk.round_to_tick(signal.atr_stop)
+            else:
+                stop_loss = self.risk.calc_stop_loss(price)
             take_profit = self.risk.calc_take_profit(price)
+            _sl_pct = (price - stop_loss) / price if price > 0 else 0
+            _sl_mode = "[ATR]" if (signal.atr_stop > 0 and signal.atr_stop < price * 0.95) else ""
             unit = "股" if is_odd_lot else "張"
             self.logger.info(f"[BUY] {code} {qty}{unit} @ {price} | 信心={signal.confidence:.2f} | {'零股' if is_odd_lot else '整張'}")
 
@@ -1444,7 +1473,7 @@ class TradingSystem:
                 f"📈 <b>{mode}開倉委託</b> {code} {self._code_to_name.get(code,'')}\n"
                 "━━━━━━━━━━━━━━━\n"
                 f"💰 價格: {price:.2f} | 數量: {qty}{unit}({lot_note}) | 倉位: {_effective_pct:.0%}\n"
-                f"🛑 停損: {stop_loss:.2f} ({self.config['risk'].get('stop_loss_pct',0.08):.0%}) | 移停啟動: +{self.config['risk'].get('trailing_stop',{}).get('activation_pct',0.02):.0%}\n"
+                f"🛑 停損: {stop_loss:.2f} ({_sl_pct:.1%}{_sl_mode}) | 移停啟動: +{self.config['risk'].get('trailing_stop',{}).get('activation_pct',0.02):.0%}\n"
                 f"📊 RS={signal.rs_score:+.3f} | EMA乖離={signal.ema_dev:.2%} | 信心={signal.confidence:.2f} | 排名={signal.rank_score:.3f}\n"
                 f"🌐 廣度={self._current_breadth:.0%}{_msr_line}"
                 f"{_chip_line}\n"

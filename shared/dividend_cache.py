@@ -143,6 +143,8 @@ def load_dividends_from_db(
             if "dividends" not in tables:
                 return result
 
+            if not codes:
+                return result
             ph = ",".join(["?" for _ in codes])
             query = f"SELECT code, ex_date, cash_div FROM dividends WHERE code IN ({ph})"
             params: list = list(codes)

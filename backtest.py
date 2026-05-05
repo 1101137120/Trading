@@ -41,6 +41,7 @@ from shared.db_selector import (
     resolve_db_backend as _resolve_db_backend,
 )
 from tech.strategies.engine import StrategyEngine
+from tech.strategies.base import Signal as _ReentrySignal
 
 console = Console(record=True)
 logging.basicConfig(level=logging.WARNING)
@@ -384,6 +385,7 @@ def simulate_trades(
     pyramid_ema_period: int = 10,       # EMA 拉回方式：使用哪條 EMA
     pyramid_pullback_pct: float = 0.03, # EMA 拉回方式：距離 EMA 多近才觸發（3%以內）
     pyramid_use_ema: bool = False,      # True=用 EMA 拉回；False=用漲幅門檻
+    pyramid_max_times: int = 2,         # EMA 拉回模式最多加碼幾次（預設 2，不限設 0）
     market_bull_entry: bool = False,   # True=只在 0050 MA20>MA60 時才開倉
     skipped_out: list = None,
     fee_rate: float = 0.001425,
@@ -400,6 +402,14 @@ def simulate_trades(
     vol_surge_entry_min: float = 2.0,      # 暴量反轉早出：進場時 vol_surge 需高於此值才啟用
     dev_surge_max_dev: float = 0.0,        # 高乖離無量過濾：乖離率超過此值時需量確認（0=停用）
     dev_surge_min_surge: float = 1.5,      # 高乖離無量過濾：乖離率過高時需達到此倍均量（預設 1.5×）
+    stop_atr_mult: float = 0.0,           # ATR 動態停損倍數（0=停用，用固定 stop_loss_pct；建議 2.0~3.0）
+    trail_step_gains: "list[float] | None" = None,  # 保留（舊梯度，目前停用）
+    trail_step_pcts:  "list[float] | None" = None,
+    trail_ema_exit_gain: float = 0.0,    # 大贏家 EMA 停利啟動獲利門檻（0=停用，e.g. 1.0=100%）
+    trail_ema_exit_period: int = 20,     # 大贏家 EMA 停利使用的 EMA 週期（預設 EMA20）
+    trail_ema_exit_rs_thr: float = 0.15, # RS 超過此值的強勢股跳過 EMA 停利，保留原 trail
+    reentry_proven_win_gain: float = 0.0, # 大贏家再進場：曾獲利超此值才標記（0=停用，e.g. 1.0=100%）
+    reentry_ema_period: int = 20,         # 大贏家再進場：站回此 EMA 才補訊號（預設 EMA20）
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -526,6 +536,27 @@ def simulate_trades(
     # None = 不支援批次（退回逐日）；{} = 支援但本檔無訊號
     _batch_signals = engine.evaluate_batch(code, df)
 
+    # 大贏家再進場：預先計算 EMA 陣列
+    _reentry_ema_arr = None
+    if reentry_proven_win_gain > 0 and reentry_ema_period > 0:
+        _reentry_ema_arr = df["Close"].astype(float).ewm(
+            span=reentry_ema_period, adjust=False
+        ).mean().values
+    _proven_winner = False  # 本股曾出現大贏，可用 EMA 再進場
+
+    # ATR 動態停損：預先計算 ATR14 陣列（Wilder EMA）
+    _atr14_arr = None
+    if stop_atr_mult > 0 and "High" in df.columns and "Low" in df.columns:
+        _hi = df["High"].astype(float)
+        _lo = df["Low"].astype(float)
+        _cl = df["Close"].astype(float)
+        _tr = pd.concat([
+            _hi - _lo,
+            (_hi - _cl.shift(1)).abs(),
+            (_lo - _cl.shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        _atr14_arr = _tr.ewm(span=14, adjust=False).mean().values
+
     for i in range(len(df)):
         row_date = df["ts"].iloc[i].date()
 
@@ -576,33 +607,32 @@ def simulate_trades(
                         and pnl_pct_cur >= trail_activation_pct):
                     position["trail_activated_idx"] = i
 
-                # 贏家加碼偵測（最多兩次）
+                # 贏家加碼偵測
                 _pyr_level = position.get("pyramid_level", 0)
-                if _pyr_level < 2 and i + 1 < len(df):
+                _pyr_cap = pyramid_max_times if (pyramid_use_ema and pyramid_max_times > 0) else 2
+                if _pyr_level < _pyr_cap and i + 1 < len(df):
                     trigger = False
-                    is_second = (_pyr_level == 1)
 
-                    if not is_second:
-                        # 第一次加碼
-                        if pyramid_use_ema:
-                            if pnl_pct_cur >= pyramid_min_gain:
-                                _close_so_far = df["Close"].astype(float).iloc[: i + 1]
-                                _ema_now = _close_so_far.ewm(
-                                    span=pyramid_ema_period, adjust=False
-                                ).mean().iloc[-1]
-                                if _ema_now > 0:
-                                    _dev = (current_price - _ema_now) / _ema_now
-                                    if 0 <= _dev <= pyramid_pullback_pct:
-                                        trigger = True
-                        elif pyramid_gain_pct > 0:
-                            if pnl_pct_cur >= pyramid_gain_pct:
-                                trigger = True
-                    else:
-                        # 第二次加碼：漲幅門檻 + RS 確認
-                        if pyramid_gain2_pct > 0 and pnl_pct_cur >= pyramid_gain2_pct:
+                    if pyramid_use_ema:
+                        # EMA 回檔模式：每次回踩月線都可觸發，不限第幾次
+                        if pnl_pct_cur >= pyramid_min_gain:
+                            _close_so_far = df["Close"].astype(float).iloc[: i + 1]
+                            _ema_now = _close_so_far.ewm(
+                                span=pyramid_ema_period, adjust=False
+                            ).mean().iloc[-1]
+                            if _ema_now > 0:
+                                _dev = (current_price - _ema_now) / _ema_now
+                                if 0 <= _dev <= pyramid_pullback_pct:
+                                    trigger = True
+                    elif _pyr_level == 0 and pyramid_gain_pct > 0:
+                        # 固定漲幅第一次加碼
+                        if pnl_pct_cur >= pyramid_gain_pct:
+                            trigger = True
+                    elif _pyr_level == 1 and pyramid_gain2_pct > 0:
+                        # 固定漲幅第二次加碼（含 RS 確認）
+                        if pnl_pct_cur >= pyramid_gain2_pct:
                             trigger = True
                             if pyramid_rs_min > 0 and _mkt_dates:
-                                # 計算個股近20日 RS vs 0050
                                 _lookback = 20
                                 _stock_closes = df["Close"].astype(float)
                                 if i >= _lookback:
@@ -610,7 +640,6 @@ def simulate_trades(
                                         (_stock_closes.iloc[i] - _stock_closes.iloc[i - _lookback])
                                         / _stock_closes.iloc[i - _lookback]
                                     ) if _stock_closes.iloc[i - _lookback] > 0 else 0.0
-                                    # 找對應 0050 近20個交易日報酬
                                     _rd = row_date
                                     _rd_idx = next(
                                         (k for k, d in enumerate(_mkt_dates) if d >= _rd),
@@ -624,11 +653,11 @@ def simulate_trades(
                                         _mkt_ret_now = 0.0
                                     _rs_now = _stk_ret - _mkt_ret_now
                                     if _rs_now < pyramid_rs_min:
-                                        trigger = False  # RS 不足，跳過第二次加碼
+                                        trigger = False
 
                     if trigger:
                         position["pyramid_level"] = _pyr_level + 1
-                        _key = "pyramid" if _pyr_level == 0 else "pyramid2"
+                        _key = "pyramid" if _pyr_level == 0 else f"pyramid{_pyr_level + 1}"
                         position[f"{_key}_date"]  = df["ts"].iloc[i + 1].date()
                         nxt_open = float(df["Open"].iloc[i + 1])
                         position[f"{_key}_price"] = nxt_open * (1 + slippage_pct)
@@ -652,10 +681,26 @@ def simulate_trades(
                         rs = position.get("rs_score", 0.0)
                         if trail_stop_rs_bonus > 0 and rs > 0.1:
                             eff_trail += trail_stop_rs_bonus
-                        trail_floor = position["peak_price"] * (1 - eff_trail)
-                        if current_price <= trail_floor:
-                            exit_price  = current_price * (1 - _eff_exit_slip)
-                            exit_reason = "追蹤停利"
+                        # 大贏家 EMA 停利：獲利超門檻後改用 EMA 跌破出場
+                        # 強勢股（RS > trail_ema_exit_rs_thr）保留原 trail，不受 EMA 停利干擾
+                        _ema_exit_triggered = False
+                        if (trail_ema_exit_gain > 0
+                                and pnl_pct_cur >= trail_ema_exit_gain
+                                and trail_ema_exit_period > 0
+                                and rs <= trail_ema_exit_rs_thr):
+                            _close_so_far = df["Close"].astype(float).iloc[: i + 1]
+                            _ema_exit = _close_so_far.ewm(
+                                span=trail_ema_exit_period, adjust=False
+                            ).mean().iloc[-1]
+                            if current_price < _ema_exit:
+                                exit_price  = current_price * (1 - _eff_exit_slip)
+                                exit_reason = "EMA停利"
+                                _ema_exit_triggered = True
+                        if not _ema_exit_triggered:
+                            trail_floor = position["peak_price"] * (1 - eff_trail)
+                            if current_price <= trail_floor:
+                                exit_price  = current_price * (1 - _eff_exit_slip)
+                                exit_reason = "追蹤停利"
                 elif current_price >= position["target"]:
                     # 固定停利（僅在未使用追蹤停利時有效）
                     exit_price  = current_price * (1 - _eff_exit_slip)
@@ -815,6 +860,11 @@ def simulate_trades(
                         "pyramid_level": 1 if _pkey == "pyramid" else 2,
                     })
 
+                # 大贏家標記：本次出場獲利夠大，下次允許 EMA 再進場
+                if (reentry_proven_win_gain > 0
+                        and not position.get("is_pyramid", False)
+                        and pnl_pct >= reentry_proven_win_gain):
+                    _proven_winner = True
                 position = None
             continue  # 持倉中不找新訊號
 
@@ -967,10 +1017,24 @@ def simulate_trades(
 
         # ── 空倉：評估策略訊號（優先用批次預算，None 代表不支援才逐日計算）──
         if _batch_signals is not None:
-            sig = _batch_signals.get(i)   # 支援批次，直接查表（可能 None = 無訊號）
+            sig = _batch_signals.get(i)
         else:
             df_slice = df.iloc[: i + 1].copy()
             sig = engine.evaluate(code, df_slice)
+
+        # 大贏家 EMA 再進場：曾 100%+ 出場的股票，站回 EMA20 即可補訊號
+        if (sig is None or sig.action != "Buy") and _proven_winner and _reentry_ema_arr is not None and i > 0:
+            _ema_now  = _reentry_ema_arr[i]
+            _ema_prev = _reentry_ema_arr[i - 1]
+            _c_now    = float(df["Close"].iloc[i])
+            _c_prev   = float(df["Close"].iloc[i - 1])
+            if _c_prev < _ema_prev and _c_now >= _ema_now:  # 昨收在 EMA 下，今收站回 EMA 上
+                sig = _ReentrySignal(
+                    code=code, action="Buy", price=_c_now,
+                    confidence=0.6, reason="proven_winner_ema_reclaim",
+                    strategy="ema_reentry",
+                )
+
         if sig and sig.action == "Buy":
             # 次日開盤進場（避免訊號日收盤 lookahead bias）
             if i + 1 >= len(df):
@@ -983,7 +1047,12 @@ def simulate_trades(
 
             _eff_entry_slip = _vol_slippage(slippage_pct, next_vol)
             entry_price = next_open * (1 + _eff_entry_slip)
-            stop   = entry_price * (1 - stop_loss_pct)
+            if (stop_atr_mult > 0 and _atr14_arr is not None
+                    and i < len(_atr14_arr) and _atr14_arr[i] > 0):
+                _dyn_sl = (_atr14_arr[i] / entry_price) * stop_atr_mult
+                stop = entry_price * (1 - _dyn_sl)
+            else:
+                stop = entry_price * (1 - stop_loss_pct)
             target = entry_price * (1 + take_profit_pct)
 
             # 開盤跳空過濾：次日開盤跳空 >= threshold 視為噴出，跳過進場
@@ -1327,6 +1396,7 @@ def portfolio_simulation(
     bench2x_daily_ret: "dict[str, float] | None" = None,  # 00631L 每日報酬
     vix_park_hi: float = 30.0,          # VIXTWN >= 此值時切換停泊至 00631L
     vix_park_lo: float = 20.0,          # VIXTWN <= 此值時切回 0050
+    min_rank_score: float = 0.0,        # 進場最低 rank_score 門檻（0=停用）
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1611,6 +1681,27 @@ def portfolio_simulation(
                             _swapped = True
                 if not _swapped:
                     continue
+
+        # 最低 rank_score 門檻：分數太低的訊號直接跳過，不佔倉位
+        if not is_pyramid and min_rank_score > 0:
+            _entry_rs = _trade_rank_score(
+                trade, rank_mode=_rank_mode,
+                rank_w_conf=rank_w_conf, rank_w_rs=rank_w_rs,
+                rank_w_dev=rank_w_dev, rank_w_rs_sweet=rank_w_rs_sweet,
+                rank_w_breadth=rank_w_breadth, rank_w_chip=rank_w_chip,
+                rank_w_vol_surge=rank_w_vol_surge,
+                rank_rs_center=rank_rs_center, rank_rs_span=rank_rs_span,
+                rank_rs_sweet_spot=rank_rs_sweet_spot,
+                rank_rs_sweet_tolerance=rank_rs_sweet_tolerance,
+                rank_dev_sweet_spot=rank_dev_sweet_spot,
+                rank_dev_tolerance=rank_dev_tolerance,
+                rank_breadth_sweet_spot=rank_breadth_sweet_spot,
+                rank_breadth_tolerance=rank_breadth_tolerance,
+                rank_vol_surge_sweet_spot=rank_vol_surge_sweet_spot,
+                rank_vol_surge_tolerance=rank_vol_surge_tolerance,
+            )
+            if _entry_rs < min_rank_score:
+                continue
 
         alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
                                dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult,
@@ -2131,6 +2222,8 @@ def main():
                         help="EMA 拉回模式：距 EMA 多近觸發加碼（預設 0.03=3%%以內）")
     parser.add_argument("--pyramid-alloc", type=float, default=0.5,
                         help="加碼倉位比例，相對於原始倉位（預設 0.5=半倉）")
+    parser.add_argument("--pyramid-max-times", type=int, default=2,
+                        help="EMA 回檔模式最多加碼幾次（預設 2；設 0 不限次數）")
     parser.add_argument("--bull-max-positions", type=int, default=0,
                         help="牛市（0050 MA20>MA60）時允許的最大持倉數（0=與 max-positions 相同）")
     parser.add_argument("--loss-cooldown", type=int, default=0,
@@ -2233,6 +2326,26 @@ def main():
                         help="高乖離無量過濾：乖離率過高時所需最低暴量倍數（預設 1.5×）")
     parser.add_argument("--signal-day-max-gain", type=float, default=None,
                         help="信號日單日漲幅上限：超過此值視為假突破跳過（建議 0.05=5%%；None=停用）")
+    parser.add_argument("--stop-atr-mult", type=float, default=0.0,
+                        help="ATR 動態停損倍數（0=停用，用 --stop-loss 固定值；建議 2.0~3.0）")
+    parser.add_argument("--trail-step-gains", type=float, nargs="+", default=None,
+                        metavar="PCT",
+                        help="獲利梯度收緊觸發點（漲幅），e.g. 0.5 1.0 2.0（50%%/100%%/200%%）")
+    parser.add_argument("--trail-step-pcts", type=float, nargs="+", default=None,
+                        metavar="PCT",
+                        help="獲利梯度收緊對應追蹤停利幅度，e.g. 0.15 0.10 0.08（必須與 --trail-step-gains 等長）")
+    parser.add_argument("--trail-ema-exit-gain", type=float, default=0.0,
+                        help="大贏家 EMA 停利啟動門檻（0=停用；e.g. 1.0=獲利100%%後改用 EMA 跌破出場）")
+    parser.add_argument("--trail-ema-exit-period", type=int, default=20,
+                        help="大贏家 EMA 停利使用的 EMA 週期（預設 20）")
+    parser.add_argument("--trail-ema-exit-rs-thr", type=float, default=0.15,
+                        help="RS 超過此值的強勢股跳過 EMA 停利，保留原 trail（預設 0.15）")
+    parser.add_argument("--reentry-proven-win-gain", type=float, default=0.0,
+                        help="大贏家再進場：曾獲利超此值的股票，之後站回 EMA 即可再進（0=停用，e.g. 1.0=100%%）")
+    parser.add_argument("--reentry-ema-period", type=int, default=20,
+                        help="大贏家再進場使用的 EMA 週期（預設 20）")
+    parser.add_argument("--min-rank-score", type=float, default=0.0,
+                        help="進場最低 rank_score 門檻（0=停用；低於此分數的訊號直接跳過，e.g. 0.45）")
     # ── 動態倉位（EMA 乖離率分層）──
     parser.add_argument("--dev-low-thr",   type=float, default=0.03,
                         help="乖離率縮倉門檻：低於此值用 dev-low-pct 倉位（預設 0.03=3%%；0=停用）")
@@ -2720,6 +2833,7 @@ def main():
                 pyramid_ema_period=args.pyramid_ema_period,
                 pyramid_pullback_pct=args.pyramid_pullback,
                 pyramid_use_ema=args.pyramid_ema,
+                pyramid_max_times=args.pyramid_max_times,
                 market_bull_entry=args.market_bull_entry,
                 skipped_out=all_skipped_signals,
                 chip_df=_all_chip_data.get(code) if _all_chip_data else None,
@@ -2733,6 +2847,14 @@ def main():
                 dev_surge_max_dev=args.dev_surge_max_dev if hasattr(args, "dev_surge_max_dev") else 0.0,
                 dev_surge_min_surge=args.dev_surge_min_surge if hasattr(args, "dev_surge_min_surge") else 1.5,
                 market_rs_min=args.market_rs_min if hasattr(args, "market_rs_min") else -999.0,
+                stop_atr_mult=args.stop_atr_mult if hasattr(args, "stop_atr_mult") else 0.0,
+                trail_step_gains=args.trail_step_gains if hasattr(args, "trail_step_gains") else None,
+                trail_step_pcts=args.trail_step_pcts  if hasattr(args, "trail_step_pcts")  else None,
+                trail_ema_exit_gain=args.trail_ema_exit_gain if hasattr(args, "trail_ema_exit_gain") else 0.0,
+                trail_ema_exit_period=args.trail_ema_exit_period if hasattr(args, "trail_ema_exit_period") else 20,
+                trail_ema_exit_rs_thr=args.trail_ema_exit_rs_thr if hasattr(args, "trail_ema_exit_rs_thr") else 0.15,
+                reentry_proven_win_gain=args.reentry_proven_win_gain if hasattr(args, "reentry_proven_win_gain") else 0.0,
+                reentry_ema_period=args.reentry_ema_period if hasattr(args, "reentry_ema_period") else 20,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -2884,6 +3006,7 @@ def main():
         bench2x_daily_ret=_bench2x_daily_ret if _bench2x_daily_ret else None,
         vix_park_hi=args.vix_park_hi,
         vix_park_lo=args.vix_park_lo,
+        min_rank_score=args.min_rank_score if hasattr(args, "min_rank_score") else 0.0,
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
@@ -3393,6 +3516,7 @@ def main():
         "min_atr_pct":          args.min_atr_pct,
         "min_ema_dev":          args.min_ema_dev,
         "ema_aligned_max":      args.ema_aligned_max,
+        "stop_atr_mult":        args.stop_atr_mult,
         "rank_w_vol_surge":     args.rank_w_vol_surge,
         "dev_low_thr":          args.dev_low_thr,
         "dev_high_thr":         args.dev_high_thr,
@@ -3611,6 +3735,20 @@ def main():
 
         reason_str = "  ".join(f"{k}:{v}" for k, v in reason_counts.items())
 
+        _pyr_info = "停用"
+        if args.pyramid_ema:
+            _pyr_info = (f"EMA{args.pyramid_ema_period} pullback≤{args.pyramid_pullback*100:.0f}%"
+                         f" min+{args.pyramid_min_gain*100:.0f}% alloc{args.pyramid_alloc*100:.0f}%"
+                         f" max×{args.pyramid_max_times}")
+        elif args.pyramid_gain:
+            _pyr_info = (f"+{args.pyramid_gain*100:.0f}%/+{args.pyramid_gain2*100:.0f}%"
+                         f" alloc{args.pyramid_alloc*100:.0f}%")
+        _rank_info = (f"rs={args.rank_w_rs} dev={args.rank_w_dev} rs_sweet={args.rank_w_rs_sweet}"
+                      f" chip={args.rank_w_chip}"
+                      f" vol_surge={args.rank_w_vol_surge if args.rank_w_vol_surge is not None else 0.0}")
+        _dd_info = (f"門檻{args.market_dd_threshold*100:.0f}% 縮至{args.market_dd_max_positions}檔"
+                    if args.market_dd_threshold > 0 else "停用")
+
         log_lines = [
             f"## {_dt.now().strftime('%Y-%m-%d %H:%M')}",
             f"",
@@ -3621,12 +3759,19 @@ def main():
             f"| 策略 | {', '.join(active_strats)} |",
             f"| 停損 | {args.stop_loss}% |",
             f"| 追蹤停利 | {trail_info} |",
+            f"| trail-rs-bonus | +{args.trail_stop_rs_bonus*100:.0f}% |",
             f"| 廣度過濾 | {breadth_info} |",
             f"| 大盤過濾 | MA{args.market_ma}{'＋MA20>MA60' if args.market_bull_entry else ''} |",
-            f"| min-rs | {args.min_rs} |",
+            f"| 大盤縮倉 | {_dd_info} |",
+            f"| min-rs / max-rs | {args.min_rs} / {args.max_rs} |",
+            f"| min-ema-dev | {args.min_ema_dev} |",
+            f"| min-atr-pct | {args.min_atr_pct} |",
             f"| 時間停損 | {args.time_stop_days}天 / 最低{args.time_stop_min_pct*100:.0f}% |",
             f"| 每筆倉位 | {args.position_pct*100:.0f}%，最多{max_pos}筆 |",
-            f"| 股票數 | {args.stocks} |",
+            f"| 股票數 / 最高價 | {args.stocks} / {args.max_price} |",
+            f"| 加碼 | {_pyr_info} |",
+            f"| 排名權重 | {_rank_info} |",
+            f"| VIX停泊 | hi={args.vix_park_hi} lo={args.vix_park_lo} |",
             f"",
             f"**績效總覽**",
             f"| 項目 | 值 |",
