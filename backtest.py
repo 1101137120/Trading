@@ -856,6 +856,8 @@ def simulate_trades(
                         "rs_score": position.get("rs_score", 0.0),
                         "ema_dev": position.get("ema_dev", 0.0),
                         "day_volume": position.get("day_volume", 0),
+                        "chip_score": position.get("chip_score", 0.5),
+                        "rank_score": position.get("rank_score", 0.0),
                         "is_pyramid": True,
                         "pyramid_level": 1 if _pkey == "pyramid" else 2,
                     })
