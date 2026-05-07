@@ -235,13 +235,13 @@ def fetch_universe_data(
                     "SELECT DISTINCT u.code, s.name, s.market "
                     "FROM universe_snapshots u "
                     "LEFT JOIN stocks s ON u.code=s.code "
-                    "WHERE u.trade_date>=%s AND u.trade_date<=%s "
+                    "WHERE u.trade_date>=%s "
                     "AND (u.vol_rank<=%s "
                     + ("OR u.vol_surge_rank<=%s " if (surge_universe_size > 0 and has_surge_rank) else "")
                     + ") "
                     + ("AND (s.code IS NULL OR s.code NOT LIKE '00%%')" if exclude_etf else "")
                     + tse_clause + ind_clause,
-                    ([universe_start, end, universe_size]
+                    ([universe_start, universe_size]
                      + ([surge_universe_size] if (surge_universe_size > 0 and has_surge_rank) else [])
                      + ind_params),
                 )
@@ -290,13 +290,13 @@ def fetch_universe_data(
                 "SELECT DISTINCT u.code, s.name, s.market "
                 "FROM universe_snapshots u "
                 "LEFT JOIN stocks s ON u.code=s.code "
-                "WHERE u.date>=? AND u.date<=? "
+                "WHERE u.date>=? "
                 "AND (u.vol_rank<=? "
                 + ("OR u.vol_surge_rank<=? " if (surge_universe_size > 0 and has_surge_rank) else "")
                 + ") "
                 + ("AND (s.code IS NULL OR s.code NOT LIKE '00%')" if exclude_etf else "")
                 + tse_clause + ind_clause,
-                ([universe_start, end, universe_size]
+                ([universe_start, universe_size]
                  + ([surge_universe_size] if (surge_universe_size > 0 and has_surge_rank) else [])
                  + ind_params),
             ).fetchall()

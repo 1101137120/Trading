@@ -2308,6 +2308,8 @@ def main():
                              "與 live entry_filter.gap_up_threshold 對應。")
     parser.add_argument("--min-atr-pct", type=float, default=None,
                         help="ATR%% 下限：進場時 ATR/price 低於此值視為低波動廢訊號跳過（建議 2.0~4.0；None=用 config）")
+    parser.add_argument("--max-atr-pct", type=float, default=None,
+                        help="ATR%% 上限：進場時 ATR/price 高於此值視為極端波動跳過（建議 5.0~7.0；None=停用）")
     parser.add_argument("--min-ema-dev", type=float, default=None,
                         help="EMA20 乖離率下限：進場時收盤距 EMA20 低於此值視為無動能跳過（建議 0.03=3%%；None=用 config）")
     parser.add_argument("--max-ema-dev", type=float, default=None,
@@ -2413,6 +2415,8 @@ def main():
     cfg = make_backtest_config(base_cfg, args.strategies)
     if args.min_atr_pct is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_atr_pct"] = args.min_atr_pct
+    if args.max_atr_pct is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["max_atr_pct"] = args.max_atr_pct
     if args.min_ema_dev is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_ema_dev"] = args.min_ema_dev
     if args.max_ema_dev is not None:
@@ -3516,6 +3520,7 @@ def main():
         "market_max_10d_gain":  args.market_max_10d_gain,
         "market_atr_max":       args.market_atr_max,
         "min_atr_pct":          args.min_atr_pct,
+        "max_atr_pct":          args.max_atr_pct,
         "min_ema_dev":          args.min_ema_dev,
         "ema_aligned_max":      args.ema_aligned_max,
         "stop_atr_mult":        args.stop_atr_mult,
@@ -3768,6 +3773,7 @@ def main():
             f"| min-rs / max-rs | {args.min_rs} / {args.max_rs} |",
             f"| min-ema-dev | {args.min_ema_dev} |",
             f"| min-atr-pct | {args.min_atr_pct} |",
+            f"| max-atr-pct | {args.max_atr_pct} |",
             f"| 時間停損 | {args.time_stop_days}天 / 最低{args.time_stop_min_pct*100:.0f}% |",
             f"| 每筆倉位 | {args.position_pct*100:.0f}%，最多{max_pos}筆 |",
             f"| 股票數 / 最高價 | {args.stocks} / {args.max_price} |",

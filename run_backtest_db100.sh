@@ -49,10 +49,10 @@
   --market-max-20d-gain 0.10 \
   --market-max-10d-gain 0.07 \
   --market-atr-max      0.015 \
-  --pyramid-gain        0.20 \
-  --pyramid-gain2       0.40 \
+  --pyramid-gain        0.15 \
+  --pyramid-gain2       0.35 \
   --pyramid-rs-min      0.05 \
-  --pyramid-alloc       0.50 \
+  --pyramid-alloc       0.60 \
   --market-bull-entry  \
   --market-dd-threshold    0.10 \
   --market-dd-max-positions 2 \

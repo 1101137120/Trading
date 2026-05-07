@@ -27,6 +27,7 @@ class EmaTrendStrategy(BaseStrategy):
         self.min_ema_dev = cfg.get("min_ema_dev", 0.0)  # 收盤距 EMA20 乖離率下限（0=停用）；太貼近無動能
         self.max_ema_dev = cfg.get("max_ema_dev", 0.0)  # 收盤距 EMA20 乖離率上限（0=停用）
         self.min_atr_pct = cfg.get("min_atr_pct", 0.0)  # ATR% 下限，過低視為死魚股（0=停用）
+        self.max_atr_pct = cfg.get("max_atr_pct", 0.0)  # ATR% 上限，過高為極端波動股（0=停用）
         self.signal_day_max_gain = cfg.get("signal_day_max_gain", 0.0)  # 信號日單日漲幅上限（0=停用）；大紅棒假突破過濾
         self.ema_aligned_max = cfg.get("ema_aligned_max", 0)  # 多頭排列連續天數上限（0=停用）；超過視為陳舊訊號跳過
 
@@ -74,10 +75,13 @@ class EmaTrendStrategy(BaseStrategy):
             if self.adx_min > 0 and (pd.isna(adx_val) or adx_val < self.adx_min):
                 return None
 
-        # ATR% 下限過濾：波動太小的死魚股（金融等）跳過
-        if self.min_atr_pct > 0 and "High" in df.columns and "Low" in df.columns:
+        # ATR% 範圍過濾：太低為死魚股，太高為極端波動股
+        if (self.min_atr_pct > 0 or self.max_atr_pct > 0) and "High" in df.columns and "Low" in df.columns:
             atr_val = atr(df["High"].astype(float), df["Low"].astype(float), close).iloc[-1]
-            if price > 0 and (atr_val / price) * 100 < self.min_atr_pct:
+            atr_pct = (atr_val / price) * 100 if price > 0 else 0
+            if self.min_atr_pct > 0 and atr_pct < self.min_atr_pct:
+                return None
+            if self.max_atr_pct > 0 and atr_pct > self.max_atr_pct:
                 return None
 
         # 乖離率過濾：過貼（無動能）或過遠（追高）皆跳過
@@ -141,7 +145,7 @@ class EmaTrendStrategy(BaseStrategy):
             adx_arr = adx(high, low, close, self.adx_period).values
 
         atr_arr = None
-        if self.min_atr_pct > 0 and high is not None and low is not None:
+        if (self.min_atr_pct > 0 or self.max_atr_pct > 0) and high is not None and low is not None:
             atr_arr = atr(high, low, close).values
 
         # 量能 5 日滾動均量（iloc[-6:-1] 對應 rolling(5).mean().shift(1)）
@@ -185,8 +189,12 @@ class EmaTrendStrategy(BaseStrategy):
             # ATR%
             if atr_arr is not None:
                 av = atr_arr[i]
-                if price > 0 and not pd.isna(av) and (av / price) * 100 < self.min_atr_pct:
-                    continue
+                if not pd.isna(av) and price > 0:
+                    atr_pct = (av / price) * 100
+                    if self.min_atr_pct > 0 and atr_pct < self.min_atr_pct:
+                        continue
+                    if self.max_atr_pct > 0 and atr_pct > self.max_atr_pct:
+                        continue
             # 乖離率
             if em_now > 0:
                 dev = (price - em_now) / em_now
