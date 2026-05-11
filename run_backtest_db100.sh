@@ -37,7 +37,7 @@
   --time-stop-min-pct   0.05 \
   --breadth-filter \
   --breadth-min         0.50 \
-  --breadth-max         0.82 \
+  --breadth-max         1.00 \
   --slippage            0.002 \
   --max-vol-pct         0.03 \
   --min-atr-pct         3.0 \
@@ -67,6 +67,6 @@
   --rank-vol-surge-tolerance  0.50 \
   --vix-park-hi         30 \
   --vix-park-lo         20 \
-  --stop-atr-mult           3.5 \
+  --stop-atr-mult           2.5 \
   --min-rank-score          0.38 \
   "$@"
