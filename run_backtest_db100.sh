@@ -8,8 +8,8 @@
   --strategies          ema_trend \
   --stop-loss           8 \
   --trail-stop          0.15 \
-  --trail-stop-bull     0.20 \
-  --trail-stop-rs-bonus 0.05 \
+  --trail-stop-bull     0.18 \
+  --trail-stop-rs-bonus 0.08 \
   --trail-activation    0.02 \
   --max-positions       4 \
   --position-pct        0.25 \
@@ -45,7 +45,7 @@
   --dev-low-thr         0.03 \
   --dev-high-thr        0.05 \
   --dev-low-pct         0.10 \
-  --dev-high-mult       1.4 \
+  --dev-high-mult       1.6 \
   --market-max-20d-gain 0.10 \
   --market-max-10d-gain 0.07 \
   --market-atr-max      0.015 \
@@ -57,7 +57,7 @@
   --market-dd-threshold    0.10 \
   --market-dd-max-positions 2 \
   --rs-pos-high-thr     0.15 \
-  --rs-pos-high-mult    1.80 \
+  --rs-pos-high-mult    2.00 \
   --rs-pos-low-thr      0.07 \
   --rs-pos-low-mult     0.80 \
   --short-util-max      0.08 \
