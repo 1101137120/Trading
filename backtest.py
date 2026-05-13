@@ -374,6 +374,7 @@ def simulate_trades(
     time_stop_min_pct: float = 0.05,
     early_exit_days: int = 0,
     early_exit_lag: float = 0.03,
+    d10_exit_pct: float = 0.0,             # D10 早出場：第10交易日虧損超過此比例強制出場（0=停用）
     breadth_allow: dict = None,
     breadth_ratio: dict = None,
     slippage_pct: float = 0.002,
@@ -719,6 +720,13 @@ def simulate_trades(
                     # 暴量進場後快速反跌 → 假突破/出貨，早出止損
                     exit_price  = current_price * (1 - _eff_exit_slip)
                     exit_reason = "暴量反轉"
+                elif (d10_exit_pct > 0
+                      and (i - position["entry_idx"]) == 10
+                      and pnl_pct_cur < -d10_exit_pct
+                      and position["trail_activated_idx"] == -1):
+                    # D10 早出場：第10交易日仍深度虧損（追蹤停利未啟動）→ 進場錯誤，直接出
+                    exit_price  = current_price * (1 - _eff_exit_slip)
+                    exit_reason = "D10停損"
                 elif (early_exit_days > 0 and hold >= early_exit_days
                       and pnl_pct_cur < 0 and _mkt_dates):
                     # 早出場：持倉 N 天仍虧損且跑輸大盤超過門檻 → 廢訊號，不必等時間停損
@@ -796,8 +804,12 @@ def simulate_trades(
                     "pnl_at_day10": _d10_pnl,
                     "pnl_at_day20": _d20_pnl,
                     "ema_dev_at_exit": _ema_dev_at_exit,
-                    "market_breadth_at_entry": position.get("market_breadth_at_entry", ""),
-                    "market_rs_at_entry": position.get("market_rs_at_entry", ""),
+                    "signal_date":              position.get("signal_date", ""),
+                    "market_breadth_at_entry":  position.get("market_breadth_at_entry", ""),
+                    "market_rs_at_entry":        position.get("market_rs_at_entry", ""),
+                    "market_10d_gain_at_entry":  position.get("market_10d_gain_at_entry", ""),
+                    "market_dd_at_entry":        position.get("market_dd_at_entry", ""),
+                    "adx_at_entry":              position.get("adx_at_entry", 0.0),
                     "hold_days": hold,
                     "result": exit_reason,
                     "strategy": position["strategy"],
@@ -1164,16 +1176,27 @@ def simulate_trades(
             # 市場廣度原始比例（訊號日）
             _mkt_breadth_entry = breadth_ratio.get(row_date, float("nan")) if breadth_ratio else float("nan")
 
-            # 0050 近20日報酬（訊號日，與 RS 計算對應的大盤端）
+            # 0050 近20日/10日報酬、從高點回撤（訊號日）
             _lookback_rs = 20
             _mkt_rs_entry = float("nan")
+            _mkt_10d_entry = float("nan")
+            _mkt_dd_entry  = float("nan")
             if _mkt_dates:
                 _sig_mpos = bisect.bisect_right(_mkt_dates, row_date) - 1
-                if _sig_mpos >= _lookback_rs:
-                    _mc_now  = _mkt_closes[_sig_mpos]
-                    _mc_past = _mkt_closes[_sig_mpos - _lookback_rs]
-                    if _mc_past > 0:
-                        _mkt_rs_entry = round((_mc_now - _mc_past) / _mc_past * 100, 2)
+                if _sig_mpos >= 0:
+                    _mc_now = _mkt_closes[_sig_mpos]
+                    if _sig_mpos >= _lookback_rs:
+                        _mc_past20 = _mkt_closes[_sig_mpos - _lookback_rs]
+                        if _mc_past20 > 0:
+                            _mkt_rs_entry = round((_mc_now - _mc_past20) / _mc_past20 * 100, 2)
+                    if _sig_mpos >= 10:
+                        _mc_past10 = _mkt_closes[_sig_mpos - 10]
+                        if _mc_past10 > 0:
+                            _mkt_10d_entry = round((_mc_now - _mc_past10) / _mc_past10 * 100, 2)
+                    _win_start = max(0, _sig_mpos - 259)
+                    _peak_so_far = max(_mkt_closes[_win_start:_sig_mpos + 1])
+                    if _peak_so_far > 0:
+                        _mkt_dd_entry = round((_peak_so_far - _mc_now) / _peak_so_far * 100, 2)
 
             position = {
                 "entry_date": next_date,
@@ -1193,8 +1216,12 @@ def simulate_trades(
                 "ema_dev": ema_dev_at_entry,
                 "mkt_close_at_entry": mkt_close_at_entry,
                 "accumulated_div": 0.0,       # 持倉期間累計配息（NT/股）
-                "market_breadth_at_entry": round(_mkt_breadth_entry, 4) if _mkt_breadth_entry == _mkt_breadth_entry else "",
-                "market_rs_at_entry": _mkt_rs_entry if _mkt_rs_entry == _mkt_rs_entry else "",
+                "signal_date":               row_date,
+                "market_breadth_at_entry":   round(_mkt_breadth_entry, 4) if _mkt_breadth_entry == _mkt_breadth_entry else "",
+                "market_rs_at_entry":        _mkt_rs_entry  if _mkt_rs_entry  == _mkt_rs_entry  else "",
+                "market_10d_gain_at_entry":  _mkt_10d_entry if _mkt_10d_entry == _mkt_10d_entry else "",
+                "market_dd_at_entry":        _mkt_dd_entry  if _mkt_dd_entry  == _mkt_dd_entry  else "",
+                "adx_at_entry":              round(float(sig.adx_val), 1) if hasattr(sig, "adx_val") else 0.0,
                 "foreign_net":          _chip.get("foreign_net"),
                 "trust_net":            _chip.get("trust_net"),
                 "margin_balance":       _chip.get("margin_balance"),
@@ -1815,6 +1842,7 @@ def portfolio_simulation(
         taken.append({
             **trade,
             "rank_score": round(rank_score, 4),
+            "n_positions_at_entry": len(active),
             "lots": lots,
             "odd_lot": is_odd_lot,
             "cost": round(cost, 0),
@@ -2299,6 +2327,8 @@ def main():
                         help="時間停損天數：持倉超過 N 天仍未達最低漲幅就出場（0=停用）")
     parser.add_argument("--time-stop-min-pct", type=float, default=0.05,
                         help="時間停損最低漲幅門檻（預設 0.05 = 5%%），搭配 --time-stop-days 使用")
+    parser.add_argument("--d10-exit-pct", type=float, default=0.0,
+                        help="D10早出場：第10交易日仍虧損超過此比例且追蹤停損未啟動則出場（0=停用；建議 0.03）")
     parser.add_argument("--early-exit-days", type=int, default=0,
                         help="動態提早出場：持倉 N 天仍虧且跑輸大盤超過門檻則出場（0=停用，建議 10）")
     parser.add_argument("--early-exit-lag", type=float, default=0.03,
@@ -2824,6 +2854,7 @@ def main():
                 time_stop_min_pct=args.time_stop_min_pct,
                 early_exit_days=args.early_exit_days,
                 early_exit_lag=args.early_exit_lag,
+                d10_exit_pct=getattr(args, "d10_exit_pct", 0.0),
                 breadth_allow=breadth_map,
                 breadth_ratio=breadth_ratio_map,
                 slippage_pct=args.slippage,
@@ -3045,6 +3076,32 @@ def main():
     # ════════════════════════════════════════
     # 1. 績效總覽
     # ════════════════════════════════════════
+    # 0050 買進持有同期含息總報酬（供總覽顯示）
+    _mkt_bnh_total: float | None = None
+    try:
+        _bnh_df = _fetch_code_close_history("0050", db_backend=db_backend, db_path=db_path)
+        _bnh_df["date"] = pd.to_datetime(_bnh_df["date"])
+        _bnh_all = _bnh_df[_bnh_df["date"] >= pd.to_datetime(args.start)].sort_values("date")
+        _bnh_end = _bnh_df[_bnh_df["date"] <= pd.to_datetime(args.end)].sort_values("date")
+        if not _bnh_all.empty and not _bnh_end.empty:
+            _bnh_sp = float(_bnh_all.iloc[0]["close"])
+            _bnh_ep = float(_bnh_end.iloc[-1]["close"])
+            _bnh_u  = psim["initial_capital"] / _bnh_sp
+            _bnh_div = 0.0
+            try:
+                _div_df2 = _fetch_dividend_data(["0050"], db_backend=db_backend, db_path=db_path)
+                if _div_df2 is not None and not _div_df2.empty:
+                    _d0 = _div_df2[_div_df2["code"] == "0050"].copy()
+                    _d0["ex_date"] = pd.to_datetime(_d0["ex_date"])
+                    _d0 = _d0[(_d0["ex_date"] >= pd.to_datetime(args.start)) &
+                               (_d0["ex_date"] <= pd.to_datetime(args.end))]
+                    _bnh_div = float(_d0["cash_div"].sum()) * _bnh_u
+            except Exception:
+                pass
+            _mkt_bnh_total = _bnh_u * _bnh_ep + _bnh_div
+    except Exception:
+        pass
+
     cap_clr = "green" if psim["total_return_pct"] >= 0 else "red"
     _bt_years = (end - start).days / 365.25
     _cagr = (
@@ -3062,6 +3119,12 @@ def main():
                f"[bold {cap_clr}]{psim['total_return_pct']:+.2f}%[/bold {cap_clr}]")
     ov.add_row("年化報酬(CAGR)",
                f"[bold {cap_clr}]{_cagr*100:+.2f}%[/bold {cap_clr}]")
+    if _mkt_bnh_total is not None and _bt_years > 0:
+        _bnh_ret  = (_mkt_bnh_total / psim["initial_capital"] - 1) * 100
+        _bnh_cagr = ((_mkt_bnh_total / psim["initial_capital"]) ** (1 / _bt_years) - 1) * 100
+        ov.add_row("0050持有（同期）",
+                   f"{_mkt_bnh_total:>14,.0f} 元  "
+                   f"[dim](CAGR {_bnh_cagr:+.2f}%  總報酬 {_bnh_ret:+.2f}%  含息，不含2014減資退款)[/dim]")
     ov.add_row("最大回撤",      f"[red]-{psim['max_drawdown_pct']:.2f}%[/red]")
     if _eq_metrics["sharpe"] is not None:
         _sh = _eq_metrics["sharpe"]
@@ -3413,6 +3476,15 @@ def main():
             for _y_tmp, _s in _entry_dates_by_yr.items():
                 _yr_signal_days[_y_tmp] = len(_s)
 
+        # 0050持有欄：用年度報酬率複利累計（避開2014減資退款的價格斷層）
+        _bnh_cap_running = psim["initial_capital"]
+        _bnh_cap_by_yr: dict[int, float] = {}
+        for _y_tmp2 in sorted(_all_years):
+            _r = _mkt_yr_ret.get(_y_tmp2)
+            if _r is not None:
+                _bnh_cap_running *= (1 + _r / 100)
+            _bnh_cap_by_yr[_y_tmp2] = _bnh_cap_running
+
         yr_tbl = Table(show_header=True, box=None, padding=(0, 2))
         yr_tbl.add_column("年度",        style="bold", justify="center")
         yr_tbl.add_column("個股損益",    justify="right")
@@ -3423,6 +3495,7 @@ def main():
         yr_tbl.add_column("0050",        justify="right")
         yr_tbl.add_column("Alpha",       justify="right")
         yr_tbl.add_column("累計資金",    justify="right")
+        yr_tbl.add_column("0050持有",    justify="right")
         yr_tbl.add_column("勝率",        justify="right")
         yr_tbl.add_column("閒置天",      justify="right")
 
@@ -3451,6 +3524,8 @@ def main():
             _all_d  = _yr_all_days.get(_y, 0)
             _sig_d  = _yr_signal_days.get(_y, 0)
             _idle_d = _all_d - _sig_d if _all_d else 0
+            _bnh_yr_val = _bnh_cap_by_yr.get(_y)
+            _bnh_yr_str = f"[dim]{_bnh_yr_val:,.0f}[/dim]" if _bnh_yr_val is not None else "[dim]—[/dim]"
             yr_tbl.add_row(
                 str(_y),
                 f"[{'green' if _real>=0 else 'red'}]{_real:+,.0f}[/]",
@@ -3461,6 +3536,7 @@ def main():
                 _mkt_str,
                 _alpha_str,
                 f"{_cap:,.0f}",
+                _bnh_yr_str,
                 f"[dim]{_wr_str}[/dim]",
                 f"[dim]{_idle_d}/{_all_d}[/dim]",
             )

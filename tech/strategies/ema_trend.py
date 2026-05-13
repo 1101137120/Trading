@@ -122,6 +122,7 @@ class EmaTrendStrategy(BaseStrategy):
                 f"乖離{dev:.1%}"
             ),
             strategy=self.name,
+            adx_val=round(float(adx_val), 1) if adx_val is not None and not pd.isna(adx_val) else 0.0,
         )
 
     def signals_for_df(self, code: str, df: pd.DataFrame) -> dict[int, "Signal"]:
@@ -228,6 +229,7 @@ class EmaTrendStrategy(BaseStrategy):
                         f"EMA{self.ema_slow}={es_now:.2f} "
                         f"乖離{dev_val:.1%}"),
                 strategy=self.name,
+                adx_val=round(float(adx_val), 1) if adx_val is not None and not pd.isna(adx_val) else 0.0,
             )
         return result
 

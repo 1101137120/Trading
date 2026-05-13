@@ -27,6 +27,7 @@ class Signal:
     short_util: float | None = None       # 融券使用率（short_balance / short_limit）
     rank_score: float = 0.0              # hybrid 排名分數（進場時記錄）
     atr_stop: float = 0.0               # ATR 動態停損價（0=使用固定 stop_loss_pct）
+    adx_val: float = 0.0                # ADX 強度值（ema_trend 填入，其他策略留 0）
 
 
 class BaseStrategy(ABC):
