@@ -30,7 +30,7 @@ from rich.table import Table
 
 from shared.logger import setup_logger
 from shared.broker import Broker
-from shared.market_schedule import is_trading_hours, is_trading_day
+from shared.market_schedule import is_trading_hours, is_trading_day, get_holidays
 from shared.portfolio import Portfolio, Position, PendingOrder
 from shared.risk import RiskManager
 from shared.feed import MarketDataFeed
@@ -709,6 +709,8 @@ class TradingSystem:
             reason = self.risk.check_exit_conditions(pos, open_price=open_price, is_bull=is_bull)
             if reason is None and self.risk.check_time_stop(pos):
                 reason = "time_stop"
+            if reason is None and self.risk.check_d10_exit(pos, get_holidays(self.config)):
+                reason = "d10_exit"
             if reason and self.portfolio.try_mark_exit(code):
                 self._execute_sell(code, pos, reason)
 

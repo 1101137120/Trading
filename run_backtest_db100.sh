@@ -66,7 +66,7 @@
   --rank-vol-surge-sweet-spot 0.75 \
   --rank-vol-surge-tolerance  0.50 \
   --vix-park-hi         30 \
-  --vix-park-lo         20 \
+  --vix-park-lo         14 \
   --stop-atr-mult           2.5 \
   --min-rank-score          0.38 \
   --d10-exit-pct            0.03 \

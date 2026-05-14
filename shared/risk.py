@@ -2,9 +2,22 @@
 風險管理模組：計算停損停利價位、部位大小
 """
 import logging
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 logger = logging.getLogger("risk")
+
+
+def _count_trading_days(entry_dt: datetime, holidays: set[str]) -> int:
+    """計算 entry_dt 到今天（不含今天）的交易日數，排除週末與假日。"""
+    d = entry_dt.date()
+    today = date.today()
+    count = 0
+    cur = d + timedelta(days=1)
+    while cur <= today:
+        if cur.weekday() < 5 and cur.isoformat() not in holidays:
+            count += 1
+        cur += timedelta(days=1)
+    return count
 
 
 class RiskManager:
@@ -81,6 +94,18 @@ class RiskManager:
             if position.should_take_profit:
                 return "take_profit"
         return None
+
+    def check_d10_exit(self, position, holidays: set[str] | None = None) -> bool:
+        """D10早出場：第10交易日起若虧損>閾值且追蹤停損未啟動，強制出場。"""
+        pct = self.cfg.get("d10_exit_pct", 0.0)
+        if pct <= 0 or position.trailing_active:
+            return False
+        if holidays is None:
+            holidays = set()
+        held = _count_trading_days(position.entry_time, holidays)
+        if held < 10:
+            return False
+        return position.pnl_pct < -pct
 
     def check_time_stop(self, position) -> bool:
         """時間停損：持倉超過 N 天且漲幅未達門檻，強制出場（避免資金被死股佔用）。"""
