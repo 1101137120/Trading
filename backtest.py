@@ -1440,6 +1440,10 @@ def portfolio_simulation(
     vix_park_hi: float = 30.0,          # VIXTWN >= 此值時切換停泊至 00631L
     vix_park_lo: float = 20.0,          # VIXTWN <= 此值時切回 0050
     min_rank_score: float = 0.0,        # 進場最低 rank_score 門檻（0=停用）
+    regime_rs_thr_strong: float = 0.0,  # 0050 20日報酬 > 此值 → 強勢市況，放寬門檻（0=停用）
+    regime_rs_thr_weak: float = 0.0,    # 0050 20日報酬 < 此值 → 弱勢市況，收緊門檻（0=停用）
+    regime_score_strong: float = 0.36,  # 強勢市況時的 min_rank_score
+    regime_score_weak: float = 0.41,    # 弱勢市況時的 min_rank_score
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1727,6 +1731,16 @@ def portfolio_simulation(
 
         # 最低 rank_score 門檻：分數太低的訊號直接跳過，不佔倉位
         if not is_pyramid and min_rank_score > 0:
+            # 市況自適應：依 0050 近20日報酬動態調整門檻
+            _eff_min_rs = min_rank_score
+            if regime_rs_thr_strong > 0 or regime_rs_thr_weak > 0:
+                _mkt_rs_raw = trade.get("market_rs_at_entry", "")
+                if _mkt_rs_raw != "" and str(_mkt_rs_raw) != "nan":
+                    _mkt_rs_dec = float(_mkt_rs_raw) / 100  # % → decimal
+                    if regime_rs_thr_strong > 0 and _mkt_rs_dec > regime_rs_thr_strong:
+                        _eff_min_rs = regime_score_strong
+                    elif regime_rs_thr_weak > 0 and _mkt_rs_dec < regime_rs_thr_weak:
+                        _eff_min_rs = regime_score_weak
             _entry_rs = _trade_rank_score(
                 trade, rank_mode=_rank_mode,
                 rank_w_conf=rank_w_conf, rank_w_rs=rank_w_rs,
@@ -1743,7 +1757,7 @@ def portfolio_simulation(
                 rank_vol_surge_sweet_spot=rank_vol_surge_sweet_spot,
                 rank_vol_surge_tolerance=rank_vol_surge_tolerance,
             )
-            if _entry_rs < min_rank_score:
+            if _entry_rs < _eff_min_rs:
                 continue
 
         alloc = _resolve_alloc(capital, trade.get("ema_dev", 0.0), position_pct,
@@ -2402,6 +2416,14 @@ def main():
                         help="大贏家再進場使用的 EMA 週期（預設 20）")
     parser.add_argument("--min-rank-score", type=float, default=0.0,
                         help="進場最低 rank_score 門檻（0=停用；低於此分數的訊號直接跳過，e.g. 0.45）")
+    parser.add_argument("--regime-rs-thr-strong", type=float, default=0.0,
+                        help="市況自適應：0050 近20日報酬 > 此值視為強勢市況，放寬至 regime-score-strong（0=停用）")
+    parser.add_argument("--regime-rs-thr-weak",   type=float, default=0.0,
+                        help="市況自適應：0050 近20日報酬 < 此值視為弱勢市況，收緊至 regime-score-weak（0=停用）")
+    parser.add_argument("--regime-score-strong",  type=float, default=0.36,
+                        help="強勢市況時的 min_rank_score（預設 0.36）")
+    parser.add_argument("--regime-score-weak",    type=float, default=0.41,
+                        help="弱勢市況時的 min_rank_score（預設 0.41）")
     # ── 動態倉位（EMA 乖離率分層）──
     parser.add_argument("--dev-low-thr",   type=float, default=0.03,
                         help="乖離率縮倉門檻：低於此值用 dev-low-pct 倉位（預設 0.03=3%%；0=停用）")
@@ -3073,6 +3095,10 @@ def main():
         vix_park_hi=args.vix_park_hi,
         vix_park_lo=args.vix_park_lo,
         min_rank_score=args.min_rank_score if hasattr(args, "min_rank_score") else 0.0,
+        regime_rs_thr_strong=getattr(args, "regime_rs_thr_strong", 0.0),
+        regime_rs_thr_weak=getattr(args, "regime_rs_thr_weak", 0.0),
+        regime_score_strong=getattr(args, "regime_score_strong", 0.36),
+        regime_score_weak=getattr(args, "regime_score_weak", 0.41),
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()
