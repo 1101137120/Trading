@@ -1,0 +1,146 @@
+# 回測優化紀錄 — 無效嘗試彙整
+
+> **用途**：每次新的優化對話開始前必讀。避免重複測試已知無效的方向。  
+> **基準**：CAGR **+39.67%** / MDD **-40.56%** / Sharpe **0.77**（2009-01-01 起，stocks=80, ema_slow=40, vix_park hi=30/lo=14）  
+> **最後更新**：2026-05-14
+
+---
+
+## 一、已確認無效（CAGR 或 MDD 雙雙惡化）
+
+### 1. 進場過濾類
+
+| 參數 | 測試值 | 結果 | 原因 |
+|------|--------|------|------|
+| `min_rs_weak` + `breadth_rs_thr` | weak=0.20/thr=0.60 | CAGR +30.55%, MDD -54.76% ❌ | 廣度 0.5-0.6 的「普通市況」佔比高，刪掉太多有效訊號 |
+| `min_rs_weak` + `breadth_rs_thr` | weak=0.25/thr=0.60 | CAGR +30.85%, MDD -57.15% ❌ | 同上，更嚴格更差 |
+| `min_rank_score` 固定放寬 | 0.33 | CAGR +33.86%, MDD -49.22% ❌ | 0.33-0.38 之間的訊號是弱訊號，降門檻引進拖累 |
+| 動態 `min_rank_score` lo/hi | lo=0.33/hi=0.42, thr=3 | CAGR +36.20%, MDD -49.62% ❌ | 訊號稀少日降門檻 = 市況差時硬進場，反效果 |
+| 動態 `min_rank_score` lo/hi | lo=0.33/hi=0.42, thr=4 | CAGR +33.83%, MDD -49.62% ❌ | 同上 |
+| `max_rs_entry` 放寬 | 0.50（原 0.40） | CAGR +37.71%, MDD -38.30% | CAGR 下降 -1%, 效果不顯著 |
+| `rs_pos_high_mult` 加大 | 2.50（原 2.00） | CAGR +37.64%, MDD -40.51% | 基本無效，強勢倉位變大未帶來額外 alpha |
+| `--rs-accel`（近5日 RS 日均 > 近20日 RS 日均） | 修正後版本 | CAGR +15.82%, MDD -34.05%, 248訊號 ❌ | 過濾掉 74% 訊號；ema_trend 適合穩定趨勢股，不是剛爆發的加速股，概念錯誤 |
+
+### 2. 出場類
+
+| 參數 | 測試值 | 結果 | 原因 |
+|------|--------|------|------|
+| `time_stop_days` 縮短 | 15 天 | CAGR +27.22%, MDD -44.23% ❌ | 切太早，許多好倉位未成熟就出場 |
+| `time_stop_days` 縮短 | 12 天 | CAGR +21.98%, MDD -49.87% ❌ | 更差，平均獲利從 43% 跌至 31% |
+| 大贏家追蹤停損收緊 | 各種獲利門檻收緊 trail | CAGR 均下降 ❌ | 4763/8046/1519 等大贏家需要寬 trail 才能跑到 +400-500% |
+
+### 3. 縮倉/停泊類
+
+| 參數 | 測試值 | 結果 | 原因 |
+|------|--------|------|------|
+| `market_dd_threshold` 提前縮倉 | 7%, max_pos=1 | CAGR +29.20%, MDD -39.59% ❌ | MDD 只縮 1%，CAGR 犧牲 10%；市場回撤 7% 時仍有強勢個股 |
+| `market_dd_threshold` 提前縮倉 | 5%, max_pos=1 | CAGR +28.66%, MDD -39.13% ❌ | 同上，更激進更差 |
+| VIX 中段分級縮倉 | vix_mid_thr=20/22, max=3 | CAGR -0.8% 至持平，MDD 無改善 | MDD 由已持有倉位決定，不由新進場數量決定 |
+
+### 4. 候選池類
+
+| 參數 | 測試值 | 結果 | 原因 |
+|------|--------|------|------|
+| `max_stocks` 擴大 | 100 | CAGR +32.50%, MDD -33.78% | CAGR 跌 6%，MDD 雖改善但 Calmar 未提升 |
+| `stocks=120` + `min_rank_score=0.42` | 組合 | CAGR +33.46%, MDD -39.45% ❌ | 加嚴門檻抵消擴大池的優勢，兩者相消 |
+
+### 5. 換倉 (Swap) 類
+
+| 參數 | 測試值 | 結果 | 原因 |
+|------|--------|------|------|
+| `swap_rs_min_diff` | 0.10, swap_days=15 | CAGR +33.72%, MDD -45.30% ❌ | 頻繁輪換切掉正在醞釀的好倉位 |
+| `swap_rs_min_diff` | 0.15, swap_days=15 | CAGR +37.43%, MDD -44.68% ❌ | 較少輪換仍然有害 |
+
+### 6. 加碼 (Pyramid) 類
+
+| 參數 | 測試值 | 結果 | 原因 |
+|------|--------|------|------|
+| 更早加碼 | gain=10%/25%, alloc=60% | CAGR +36.57%, MDD -39.81% ❌ | 10% 時趨勢未完全確認，加碼後失敗案例增加 |
+| 更早加碼 + 加重 | gain=10%/25%, alloc=80% | CAGR +37.42%, MDD -40.53% ❌ | 同上，加重更差 |
+| 加重不提早 | gain=15%/35%, alloc=80% | CAGR +38.66%, MDD -40.01% | 幾乎持平（差 0.06%），視為無效 |
+
+### 7. 多策略共識類
+
+| 策略組合 | 設定 | 結果 | 原因 |
+|----------|------|------|------|
+| `ema_trend + kd_cross` | 僅純共識（min_signals=2） | CAGR +3.57%, 21筆 ❌ | 兩策略同日同股同時觸發的機率極低，樣本不足 |
+| `kd_cross` 單獨 | 各種嘗試 | CAGR 均下降 ❌ | kd_cross 訊號品質不如 ema_trend |
+
+### 8. EMA 慢線週期類
+
+| 參數 | 測試值 | 結果 | 原因 |
+|------|--------|------|------|
+| `--ema-slow` | 30 | CAGR +39.39%, MDD **-43.00%** ❌ | MDD 惡化超過 2%，略遜於 ema_slow=40 |
+| `--ema-slow` | **40** ✅ | CAGR **+39.67%**, MDD -40.56% | **新基準**！比 ema_slow=60 多 +0.95% CAGR，MDD 持平 |
+| `--ema-slow` | 50 | CAGR +38.41%, MDD -40.56% | 略低於基準，不值得採用 |
+| `--ema-slow` | 80 | CAGR +35.27%, MDD -41.34% ❌ | 顯著下降，過長的確認週期過濾掉好訊號 |
+
+> ema_slow=60 為舊基準（+38.72%），ema_slow=40 為新基準（+39.67%）。已更新 run_backtest_db100.sh 和下方參數區塊。
+
+---
+
+## 二、MDD 有改善但 CAGR 代價過高
+
+這些方向**不能提高 CAGR**，但若接受 CAGR 下降換取更平穩曲線，可考慮。
+
+| 方向 | 最佳結果 | CAGR | MDD | Calmar | 說明 |
+|------|----------|------|-----|--------|------|
+| `max_stocks=120` | stocks=120 | +34.21% | -27.44% | **1.25** | Calmar 最佳，可接受的 trade-off |
+| `ema_aligned_max=30` | 只取新鮮排列 | +34.40% | -28.55% | **1.21** | 與 stocks=120 效果相似但機制不同 |
+| `ema_aligned_max=40` | 輕度過濾 | +36.97% | -38.20% | 0.97 | 幾乎免費的輕微改善，可納入基準 |
+
+---
+
+## 三、已確認最佳參數（當前基準）
+
+```
+--start 2009-01-01 --capital 1000000
+--strategies ema_trend
+--stop-loss 8 --trail-stop 0.15 --trail-stop-bull 0.18 --trail-stop-rs-bonus 0.08
+--trail-activation 0.02
+--max-positions 4 --position-pct 0.25
+--stocks 80 --max-price 2000
+--min-rs 0.13 --max-rs 0.40
+--rank-mode hybrid
+--rank-w-conf 0.00 --rank-w-rs 0.41 --rank-w-dev 0.20 --rank-w-rs-sweet 0.19
+--rank-rs-center 0.12 --rank-rs-span 0.25
+--rank-rs-sweet-spot 0.20 --rank-rs-sweet-tolerance 0.10
+--rank-dev-sweet-spot 0.05 --rank-dev-tolerance 0.03
+--rank-breadth-sweet-spot 0.60 --rank-breadth-tolerance 0.12
+--market-filter --market-ma 20 --market-bull-entry
+--time-stop-days 20 --time-stop-min-pct 0.05
+--breadth-filter --breadth-min 0.50 --breadth-max 1.00
+--slippage 0.002 --max-vol-pct 0.03
+--min-atr-pct 3.0 --min-ema-dev 0.04
+--dev-low-thr 0.03 --dev-high-thr 0.05 --dev-low-pct 0.10 --dev-high-mult 1.6
+--market-max-20d-gain 0.10 --market-max-10d-gain 0.07 --market-atr-max 0.015
+--pyramid-gain 0.15 --pyramid-gain2 0.35 --pyramid-rs-min 0.05 --pyramid-alloc 0.60
+--market-dd-threshold 0.10 --market-dd-max-positions 2
+--rs-pos-high-thr 0.15 --rs-pos-high-mult 2.00
+--rs-pos-low-thr 0.07 --rs-pos-low-mult 0.80
+--short-util-max 0.08 --rank-w-chip 0.25
+--vix-park-hi 30 --vix-park-lo 14
+--ema-slow 40
+--stop-atr-mult 2.5 --min-rank-score 0.38
+--d10-exit-pct 0.03
+```
+
+---
+
+## 四、尚未測試 / 待評估方向
+
+- [ ] 拉回買點邏輯（等價格靠近 EMA20 再進，與現有 min_ema_dev 相反）
+- [ ] Weekly EMA 確認（需週線資料）
+- [ ] 各年度績效分析（找出哪幾年表現差，針對那些年份優化）
+- [ ] `--ema-fast / --ema-mid` 微調（目前 fast=5, mid=20 未測試）
+
+---
+
+## 五、核心結論
+
+1. **MDD ~40% 是結構性的**：追蹤停損策略讓贏家充分跑，大回撤是必要代價，不能靠參數砍掉。
+2. **CAGR ~39-40% 接近這個策略架構的局部最優**：進一步提升需要策略層級改動，不是參數調整。
+3. **0.38 的 min_rank_score 是合理底線**：低於此的訊號期望值為負，降低門檻必然拖低 CAGR。
+4. **time_stop=20 天是最佳值**：縮短到 15/12 均顯著降低 CAGR，這 416 筆「時間停損」是系統在正確切死股。
+5. **加碼時機 15%/35% 是甜蜜點**：提早到 10%/25% 會在趨勢未確認時加碼，反而降低 CAGR。
+6. **ema_slow=40 優於 60**：更早確認趨勢排列，不等慢線完全跟上；30 則 MDD 惡化，40 是甜蜜點。

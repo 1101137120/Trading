@@ -366,6 +366,7 @@ def simulate_trades(
     trail_stop_rs_bonus: float = 0.0,
     min_rs_entry: float = 0.0,
     max_rs_entry: float = 0.0,
+    rs_accel: bool = False,        # True=要求近5日RS > 近20日RS（RS正在加速）
     market_max_20d_gain: float = 0.0,
     market_max_10d_gain: float = 0.0,
     market_atr_max: float = 0.0,
@@ -1104,6 +1105,19 @@ def simulate_trades(
                         rs_score = stock_ret
                 else:
                     rs_score = stock_ret
+
+            # RS 加速過濾：近5日RS > 近20日RS（動能正在增強）
+            if rs_accel and i >= 5 and _mkt_dates and df["Close"].iloc[i - 5] > 0:
+                _lb5 = 5
+                _sr5 = (current_price - df["Close"].iloc[i - _lb5]) / df["Close"].iloc[i - _lb5]
+                _mp5 = bisect.bisect_right(_mkt_dates, row_date) - 1
+                _mp5_past = _mp5 - _lb5
+                if _mp5 >= 0 and _mp5_past >= 0 and _mkt_closes[_mp5_past] > 0:
+                    _rs5 = _sr5 - (_mkt_closes[_mp5] - _mkt_closes[_mp5_past]) / _mkt_closes[_mp5_past]
+                else:
+                    _rs5 = _sr5
+                if _rs5 / _lb5 <= rs_score / lookback:  # 日均RS未加速，跳過
+                    continue
 
             # RS 過濾：跑輸大盤（下限）或趨勢末段（上限）皆不進場
             if min_rs_entry > 0 and rs_score < min_rs_entry:
@@ -2362,6 +2376,14 @@ def main():
                         help="信號日單日漲幅上限：超過此值視為假突破跳過（建議 0.05=5%%；None=停用）")
     parser.add_argument("--stop-atr-mult", type=float, default=0.0,
                         help="ATR 動態停損倍數（0=停用，用 --stop-loss 固定值；建議 2.0~3.0）")
+    parser.add_argument("--rs-accel", action="store_true", default=False,
+                        help="RS 加速過濾：要求近5日RS > 近20日RS，只買動能正在增強的股票")
+    parser.add_argument("--ema-slow", type=int, default=None,
+                        help="EMA 慢線週期（預設 60；縮短到 40/50 更早進場，延長到 80/100 更嚴格）")
+    parser.add_argument("--ema-fast", type=int, default=None,
+                        help="EMA 快線週期（預設 5）")
+    parser.add_argument("--ema-mid", type=int, default=None,
+                        help="EMA 中線週期（預設 20）")
     parser.add_argument("--trail-step-gains", type=float, nargs="+", default=None,
                         metavar="PCT",
                         help="獲利梯度收緊觸發點（漲幅），e.g. 0.5 1.0 2.0（50%%/100%%/200%%）")
@@ -2457,6 +2479,12 @@ def main():
         cfg.setdefault("portfolio", {})["rank_w_vol_surge"] = args.rank_w_vol_surge
     if args.signal_day_max_gain is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["signal_day_max_gain"] = args.signal_day_max_gain
+    if getattr(args, "ema_slow", None) is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["ema_slow"] = args.ema_slow
+    if getattr(args, "ema_fast", None) is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["ema_fast"] = args.ema_fast
+    if getattr(args, "ema_mid", None) is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["ema_mid"] = args.ema_mid
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
@@ -2846,6 +2874,7 @@ def main():
                 trail_stop_bull_pct=trail_stop_bull,
                 trail_stop_rs_bonus=trail_stop_rs_bonus,
                 min_rs_entry=args.min_rs,
+                rs_accel=getattr(args, "rs_accel", False),
                 max_rs_entry=args.max_rs,
                 market_max_20d_gain=args.market_max_20d_gain,
                 market_max_10d_gain=args.market_max_10d_gain,

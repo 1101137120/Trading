@@ -67,6 +67,7 @@
   --rank-vol-surge-tolerance  0.50 \
   --vix-park-hi         30 \
   --vix-park-lo         14 \
+  --ema-slow            40 \
   --stop-atr-mult           2.5 \
   --min-rank-score          0.38 \
   --d10-exit-pct            0.03 \
