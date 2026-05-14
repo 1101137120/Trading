@@ -68,6 +68,7 @@
   --vix-park-hi         30 \
   --vix-park-lo         14 \
   --ema-slow            40 \
+  --pullback-lo         0.01 \
   --stop-atr-mult           2.5 \
   --min-rank-score          0.38 \
   --d10-exit-pct            0.03 \

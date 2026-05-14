@@ -30,6 +30,8 @@ class EmaTrendStrategy(BaseStrategy):
         self.max_atr_pct = cfg.get("max_atr_pct", 0.0)  # ATR% 上限，過高為極端波動股（0=停用）
         self.signal_day_max_gain = cfg.get("signal_day_max_gain", 0.0)  # 信號日單日漲幅上限（0=停用）；大紅棒假突破過濾
         self.ema_aligned_max = cfg.get("ema_aligned_max", 0)  # 多頭排列連續天數上限（0=停用）；超過視為陳舊訊號跳過
+        self.pullback_lo = cfg.get("pullback_lo", 0.0)   # 拉回進場：ema_dev 下限（0=停用）
+        self.pullback_hi = cfg.get("pullback_hi", 0.038) # 拉回進場：ema_dev 上限（通常略低於 min_ema_dev）
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.ema_slow + self.adx_period + 5
@@ -85,10 +87,18 @@ class EmaTrendStrategy(BaseStrategy):
                 return None
 
         # 乖離率過濾：過貼（無動能）或過遠（追高）皆跳過
+        dev = (price - em_now) / em_now if em_now > 0 else 0
+        is_pullback = False
         if em_now > 0:
-            dev = (price - em_now) / em_now
             if self.min_ema_dev > 0 and dev < self.min_ema_dev:
-                return None
+                # 拉回進場：ema_dev 在拉回區間且今日反彈
+                if (self.pullback_lo > 0
+                        and self.pullback_lo <= dev <= self.pullback_hi
+                        and len(close) >= 2
+                        and close.iloc[-1] > close.iloc[-2]):
+                    is_pullback = True
+                else:
+                    return None
             if self.max_ema_dev > 0 and dev > self.max_ema_dev:
                 return None
 
@@ -111,11 +121,13 @@ class EmaTrendStrategy(BaseStrategy):
         vol_score = min(max(vol_ratio - 1.0, 0) * 0.15, 0.15)
         confidence = round(min(spread_score + adx_score + vol_score, 1.0), 2)
 
+        if is_pullback:
+            confidence = max(round(confidence - 0.05, 2), 0.25)
         return Signal(
             code=code, action="Buy", price=price,
             confidence=max(confidence, 0.30),
             reason=(
-                f"EMA多頭排列 "
+                f"{'EMA拉回反彈' if is_pullback else 'EMA多頭排列'} "
                 f"EMA{self.ema_fast}={ef_now:.2f}>"
                 f"EMA{self.ema_mid}={em_now:.2f}>"
                 f"EMA{self.ema_slow}={es_now:.2f} "
@@ -197,10 +209,17 @@ class EmaTrendStrategy(BaseStrategy):
                     if self.max_atr_pct > 0 and atr_pct > self.max_atr_pct:
                         continue
             # 乖離率
+            dev = (price - em_now) / em_now if em_now > 0 else 0
+            is_pullback = False
             if em_now > 0:
-                dev = (price - em_now) / em_now
                 if self.min_ema_dev > 0 and dev < self.min_ema_dev:
-                    continue
+                    if (self.pullback_lo > 0
+                            and self.pullback_lo <= dev <= self.pullback_hi
+                            and i >= 1
+                            and close_v[i] > close_v[i - 1]):
+                        is_pullback = True
+                    else:
+                        continue
                 if self.max_ema_dev > 0 and dev > self.max_ema_dev:
                     continue
             # 信號日單日漲幅過大 → 假突破過濾
@@ -219,15 +238,17 @@ class EmaTrendStrategy(BaseStrategy):
             spread_score = min(spread * 10, 0.50)
             adx_score    = min(adx_val / 100, 0.35) if adx_val is not None and not pd.isna(adx_val) else 0.15
             vol_score    = min(max(vol_ratio - 1.0, 0) * 0.15, 0.15)
-            dev_val      = (close_v[i] - em_now) / em_now if em_now > 0 else 0
             confidence   = round(min(spread_score + adx_score + vol_score, 1.0), 2)
+            if is_pullback:
+                confidence = max(round(confidence - 0.05, 2), 0.25)
             result[i] = Signal(
                 code=code, action="Buy", price=price,
                 confidence=max(confidence, 0.30),
-                reason=(f"EMA多頭排列 EMA{self.ema_fast}={ef_now:.2f}>"
+                reason=(f"{'EMA拉回反彈' if is_pullback else 'EMA多頭排列'} "
+                        f"EMA{self.ema_fast}={ef_now:.2f}>"
                         f"EMA{self.ema_mid}={em_now:.2f}>"
                         f"EMA{self.ema_slow}={es_now:.2f} "
-                        f"乖離{dev_val:.1%}"),
+                        f"乖離{dev:.1%}"),
                 strategy=self.name,
                 adx_val=round(float(adx_val), 1) if adx_val is not None and not pd.isna(adx_val) else 0.0,
             )

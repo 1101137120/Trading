@@ -2398,6 +2398,10 @@ def main():
                         help="EMA 快線週期（預設 5）")
     parser.add_argument("--ema-mid", type=int, default=None,
                         help="EMA 中線週期（預設 20）")
+    parser.add_argument("--pullback-lo", type=float, default=None,
+                        help="拉回進場：ema_dev 下限（e.g. 0.01=1%%；0或不設=停用）")
+    parser.add_argument("--pullback-hi", type=float, default=0.038,
+                        help="拉回進場：ema_dev 上限（預設 0.038，略低於 min_ema_dev=0.04）")
     parser.add_argument("--trail-step-gains", type=float, nargs="+", default=None,
                         metavar="PCT",
                         help="獲利梯度收緊觸發點（漲幅），e.g. 0.5 1.0 2.0（50%%/100%%/200%%）")
@@ -2507,6 +2511,10 @@ def main():
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["ema_fast"] = args.ema_fast
     if getattr(args, "ema_mid", None) is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["ema_mid"] = args.ema_mid
+    if getattr(args, "pullback_lo", None) is not None and args.pullback_lo > 0:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["pullback_lo"] = args.pullback_lo
+    if getattr(args, "pullback_hi", None) is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["pullback_hi"] = args.pullback_hi
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
