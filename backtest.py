@@ -414,6 +414,8 @@ def simulate_trades(
     reentry_ema_period: int = 20,         # 大贏家再進場：站回此 EMA 才補訊號（預設 EMA20）
     atr_target_pct: float = 0.0,          # ATR 反比定倉：目標 ATR%（0=停用）；此 ATR% 的股票享完整倉位
     atr_pos_max_mult: float = 1.0,        # ATR 反比定倉：低波動股最大倍率（1.0=不放大）
+    trail_atr_mult: float = 0.0,          # ATR 比例追蹤停損倍數（0=停用；e.g. 2.5=trail=ATR%×2.5）
+    trail_atr_floor: float = 0.08,        # ATR 追蹤停損下限（最窄不低於此值）
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -548,9 +550,9 @@ def simulate_trades(
         ).mean().values
     _proven_winner = False  # 本股曾出現大贏，可用 EMA 再進場
 
-    # ATR 動態停損：預先計算 ATR14 陣列（Wilder EMA）
+    # ATR 動態停損 / ATR 追蹤停損：預先計算 ATR14 陣列（Wilder EMA）
     _atr14_arr = None
-    if stop_atr_mult > 0 and "High" in df.columns and "Low" in df.columns:
+    if (stop_atr_mult > 0 or trail_atr_mult > 0) and "High" in df.columns and "Low" in df.columns:
         _hi = df["High"].astype(float)
         _lo = df["Low"].astype(float)
         _cl = df["Close"].astype(float)
@@ -676,11 +678,16 @@ def simulate_trades(
                 elif trail_stop_pct > 0:
                     # 追蹤停利模式：漲幅達 trail_activation_pct 後才啟動
                     if pnl_pct_cur >= trail_activation_pct:
-                        # 動態調寬：0050 MA20>MA60（持續上行）→ 用 bull trail
-                        is_bull = market_bull.get(row_date, False)
-                        eff_trail = (trail_stop_bull_pct
-                                     if (is_bull and trail_stop_bull_pct > 0)
-                                     else trail_stop_pct)
+                        # ATR 比例追蹤停損 or 固定追蹤停損
+                        if (trail_atr_mult > 0 and _atr14_arr is not None
+                                and i < len(_atr14_arr) and current_price > 0):
+                            _cur_atr_pct = _atr14_arr[i] / current_price
+                            eff_trail = max(trail_atr_floor, _cur_atr_pct * trail_atr_mult)
+                        else:
+                            is_bull = market_bull.get(row_date, False)
+                            eff_trail = (trail_stop_bull_pct
+                                         if (is_bull and trail_stop_bull_pct > 0)
+                                         else trail_stop_pct)
                         # 強勢個股加成：RS > 0.1 再多給一點空間
                         rs = position.get("rs_score", 0.0)
                         if trail_stop_rs_bonus > 0 and rs > 0.1:
@@ -2428,6 +2435,10 @@ def main():
                         help="ATR 反比定倉：目標 ATR%%（e.g. 5.0=5%%）；此波動率的股票享完整倉位，更高波動自動縮倉（0=停用）")
     parser.add_argument("--atr-pos-max-mult", type=float, default=1.0,
                         help="ATR 反比定倉：低波動股最大倍率（預設 1.0=不放大；設 1.5 允許低波動股用 1.5x 倉位）")
+    parser.add_argument("--trail-atr-mult", type=float, default=None,
+                        help="ATR 比例追蹤停損：trail = max(floor, ATR%%×倍數)；e.g. 2.5 表示 ATR=6%% 的股票 trail=15%%（0=停用，用固定 trail）")
+    parser.add_argument("--trail-atr-floor", type=float, default=0.08,
+                        help="ATR 追蹤停損下限（預設 0.08=8%%，最窄不低於此值）")
     parser.add_argument("--trail-step-gains", type=float, nargs="+", default=None,
                         metavar="PCT",
                         help="獲利梯度收緊觸發點（漲幅），e.g. 0.5 1.0 2.0（50%%/100%%/200%%）")
@@ -2981,6 +2992,8 @@ def main():
                 reentry_ema_period=args.reentry_ema_period if hasattr(args, "reentry_ema_period") else 20,
                 atr_target_pct=args.atr_target_pct if hasattr(args, "atr_target_pct") and args.atr_target_pct else 0.0,
                 atr_pos_max_mult=args.atr_pos_max_mult if hasattr(args, "atr_pos_max_mult") else 1.0,
+                trail_atr_mult=getattr(args, "trail_atr_mult", None) or 0.0,
+                trail_atr_floor=getattr(args, "trail_atr_floor", 0.08),
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
