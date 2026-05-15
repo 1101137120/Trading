@@ -21,6 +21,7 @@ class EmaTrendStrategy(BaseStrategy):
         self.ema_mid = cfg.get("ema_mid", 20)
         self.ema_slow = cfg.get("ema_slow", 60)
         self.vol_confirm = cfg.get("vol_confirm", True)
+        self.vol_min_ratio = cfg.get("vol_min_ratio", 0.7)  # 量能最低比率（相對5日均量）
         self.lookback = cfg.get("lookback_days", 70)
         self.adx_period  = cfg.get("adx_period", 14)
         self.adx_min     = cfg.get("adx_min", 20)    # < 20 視為橫盤，不進場
@@ -111,7 +112,7 @@ class EmaTrendStrategy(BaseStrategy):
         # 量能不得嚴重萎縮
         avg_vol = volume.iloc[-6:-1].mean()
         vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
-        if self.vol_confirm and vol_ratio < 0.7:
+        if self.vol_confirm and vol_ratio < self.vol_min_ratio:
             return None
 
         # 信心評分：EMA 差距（0–0.5）+ ADX 強度（0–0.35）+ 量能超量（0–0.15）
@@ -231,7 +232,7 @@ class EmaTrendStrategy(BaseStrategy):
             # 量能
             avg_v = vol_ma5[i]
             vol_ratio = volume.values[i] / avg_v if (avg_v and avg_v > 0) else 1.0
-            if self.vol_confirm and vol_ratio < 0.7:
+            if self.vol_confirm and vol_ratio < self.vol_min_ratio:
                 continue
             # 信心評分
             spread = (ef_now - es_now) / es_now if es_now > 0 else 0

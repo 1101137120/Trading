@@ -2402,6 +2402,8 @@ def main():
                         help="拉回進場：ema_dev 下限（e.g. 0.01=1%%；0或不設=停用）")
     parser.add_argument("--pullback-hi", type=float, default=0.038,
                         help="拉回進場：ema_dev 上限（預設 0.038，略低於 min_ema_dev=0.04）")
+    parser.add_argument("--vol-min-ratio", type=float, default=None,
+                        help="量能最低比率（相對5日均量）；預設 0.7，1.0=要求當日量超過均量")
     parser.add_argument("--trail-step-gains", type=float, nargs="+", default=None,
                         metavar="PCT",
                         help="獲利梯度收緊觸發點（漲幅），e.g. 0.5 1.0 2.0（50%%/100%%/200%%）")
@@ -2515,6 +2517,8 @@ def main():
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["pullback_lo"] = args.pullback_lo
     if getattr(args, "pullback_hi", None) is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["pullback_hi"] = args.pullback_hi
+    if getattr(args, "vol_min_ratio", None) is not None:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["vol_min_ratio"] = args.vol_min_ratio
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
