@@ -1307,14 +1307,26 @@ class TradingSystem:
             _dev_high_thr = _risk_cfg.get("dev_high_thr", 0.0)
             _rs_high_thr  = _risk_cfg.get("rs_pos_high_thr", 0.0)
             _rs_low_thr   = _risk_cfg.get("rs_pos_low_thr", 0.0)
+            _atr_target_pct  = _risk_cfg.get("atr_target_pct", 0.0)
+            _atr_pos_max_mult = _risk_cfg.get("atr_pos_max_mult", 1.0)
 
             _dev = 0.0
-            if _dev_low_thr or _dev_high_thr:
+            _atr_pct = 0.0
+            if _dev_low_thr or _dev_high_thr or _atr_target_pct:
                 _df_dev = self.feed.get_kbars(code, lookback_days=30)
                 if _df_dev is not None and len(_df_dev) >= 20:
-                    _ema20 = float(_df_dev["Close"].astype(float).ewm(span=20, adjust=False).mean().iloc[-1])
+                    _close_s = _df_dev["Close"].astype(float)
+                    _ema20 = float(_close_s.ewm(span=20, adjust=False).mean().iloc[-1])
                     if _ema20 > 0:
                         _dev = (price - _ema20) / _ema20
+                    if _atr_target_pct > 0 and "High" in _df_dev.columns and "Low" in _df_dev.columns:
+                        _hi = _df_dev["High"].astype(float)
+                        _lo = _df_dev["Low"].astype(float)
+                        _pc = _close_s.shift(1)
+                        _tr = (_hi - _lo).combine((_hi - _pc).abs(), max).combine((_lo - _pc).abs(), max)
+                        _atr14 = float(_tr.ewm(span=14, adjust=False).mean().iloc[-1])
+                        if price > 0:
+                            _atr_pct = (_atr14 / price) * 100
 
             pos_pct = _calc_position_pct(
                 _base_pct, _dev, signal.rs_score,
@@ -1326,6 +1338,9 @@ class TradingSystem:
                 rs_pos_high_mult=_risk_cfg.get("rs_pos_high_mult", 1.0),
                 rs_pos_low_thr=_rs_low_thr,
                 rs_pos_low_mult=_risk_cfg.get("rs_pos_low_mult", 1.0),
+                atr_pct=_atr_pct,
+                atr_target_pct=_atr_target_pct,
+                atr_pos_max_mult=_atr_pos_max_mult,
             )
             if pos_pct != _base_pct:
                 self.logger.info(

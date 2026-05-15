@@ -21,6 +21,9 @@ def calc_position_pct(
     rs_pos_high_mult: float = 1.0,
     rs_pos_low_thr: float = 0.0,
     rs_pos_low_mult: float = 1.0,
+    atr_pct: float = 0.0,
+    atr_target_pct: float = 0.0,
+    atr_pos_max_mult: float = 1.0,
 ) -> float:
     """
     根據 EMA20 乖離率與 RS 強弱決定倉位百分比（0~0.5）：
@@ -29,6 +32,7 @@ def calc_position_pct(
       中間               → base_pct（標準）
       RS > rs_pos_high_thr → 再乘 rs_pos_high_mult
       RS < rs_pos_low_thr  → 再乘 rs_pos_low_mult
+      ATR反比定倉：pct × min(atr_target_pct / stock_atr_pct, atr_pos_max_mult)
     """
     if dev_low_thr > 0 and ema_dev < dev_low_thr:
         pct = base_pct * dev_low_mult
@@ -41,5 +45,8 @@ def calc_position_pct(
         pct = min(pct * rs_pos_high_mult, 0.50)
     elif rs_pos_low_thr > 0 and rs_score < rs_pos_low_thr:
         pct *= rs_pos_low_mult
+
+    if atr_target_pct > 0 and atr_pct > 0:
+        pct *= min(atr_target_pct / atr_pct, atr_pos_max_mult)
 
     return pct
