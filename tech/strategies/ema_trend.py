@@ -33,6 +33,9 @@ class EmaTrendStrategy(BaseStrategy):
         self.ema_aligned_max = cfg.get("ema_aligned_max", 0)  # 多頭排列連續天數上限（0=停用）；超過視為陳舊訊號跳過
         self.pullback_lo = cfg.get("pullback_lo", 0.0)   # 拉回進場：ema_dev 下限（0=停用）
         self.pullback_hi = cfg.get("pullback_hi", 0.038) # 拉回進場：ema_dev 上限（通常略低於 min_ema_dev）
+        self.weekly_ema_confirm = cfg.get("weekly_ema_confirm", False)  # True=週線 EMA 也須多頭排列
+        self.weekly_ema_fast = cfg.get("weekly_ema_fast", 5)
+        self.weekly_ema_slow = cfg.get("weekly_ema_slow", 20)
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.ema_slow + self.adx_period + 5
@@ -166,6 +169,17 @@ class EmaTrendStrategy(BaseStrategy):
         vol_ma5 = volume.rolling(5).mean().shift(1).values
         close_v = close.values
 
+        # 週線 EMA 多頭排列確認（日線 resample → 週線，避免 lookahead bias）
+        _weekly_aligned_lookup = None
+        if self.weekly_ema_confirm and "ts" in df.columns:
+            _ts_idx = pd.to_datetime(df["ts"])
+            _wkly = pd.Series(close.values, index=_ts_idx).resample("W").last().dropna()
+            if len(_wkly) >= self.weekly_ema_slow + 5:
+                _wef = ema(_wkly, self.weekly_ema_fast)
+                _wes = ema(_wkly, self.weekly_ema_slow)
+                _weekly_aligned_lookup = (_wef > _wes)
+                _weekly_aligned_lookup.index = _weekly_aligned_lookup.index.normalize()
+
         # 多頭排列連續天數（streak）陣列
         import numpy as np
         aligned = np.array([ef_arr[j] > em_arr[j] > es_arr[j] for j in range(len(ef_arr))])
@@ -188,6 +202,12 @@ class EmaTrendStrategy(BaseStrategy):
             # 新鮮度過濾：排列持續超過上限 → 陳舊訊號跳過
             if self.ema_aligned_max > 0 and streak_arr[i] > self.ema_aligned_max:
                 continue
+            # 週線 EMA 確認：需最近完成週也是 EMA_fast > EMA_slow
+            if _weekly_aligned_lookup is not None:
+                _sig_date = pd.Timestamp(df["ts"].iloc[i]).normalize()
+                _past = _weekly_aligned_lookup.index[_weekly_aligned_lookup.index <= _sig_date]
+                if len(_past) == 0 or not _weekly_aligned_lookup.loc[_past[-1]]:
+                    continue
             price  = close_v[i]
             em_now = em_arr[i]
             ef_now = ef_arr[i]

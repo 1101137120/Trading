@@ -2439,6 +2439,10 @@ def main():
                         help="ATR 比例追蹤停損：trail = max(floor, ATR%%×倍數)；e.g. 2.5 表示 ATR=6%% 的股票 trail=15%%（0=停用，用固定 trail）")
     parser.add_argument("--trail-atr-floor", type=float, default=0.08,
                         help="ATR 追蹤停損下限（預設 0.08=8%%，最窄不低於此值）")
+    parser.add_argument("--weekly-ema-confirm", action="store_true", default=False,
+                        help="週線 EMA 確認：日線訊號須週線 EMA5W > EMA20W 才進場")
+    parser.add_argument("--weekly-ema-slow", type=int, default=20,
+                        help="週線慢線週期（預設 20）")
     parser.add_argument("--trail-step-gains", type=float, nargs="+", default=None,
                         metavar="PCT",
                         help="獲利梯度收緊觸發點（漲幅），e.g. 0.5 1.0 2.0（50%%/100%%/200%%）")
@@ -2554,6 +2558,9 @@ def main():
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["pullback_hi"] = args.pullback_hi
     if getattr(args, "vol_min_ratio", None) is not None:
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["vol_min_ratio"] = args.vol_min_ratio
+    if getattr(args, "weekly_ema_confirm", False):
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["weekly_ema_confirm"] = True
+        cfg["strategies"]["ema_trend"]["weekly_ema_slow"] = getattr(args, "weekly_ema_slow", 20)
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)
