@@ -412,6 +412,8 @@ def simulate_trades(
     trail_ema_exit_rs_thr: float = 0.15, # RS 超過此值的強勢股跳過 EMA 停利，保留原 trail
     reentry_proven_win_gain: float = 0.0, # 大贏家再進場：曾獲利超此值才標記（0=停用，e.g. 1.0=100%）
     reentry_ema_period: int = 20,         # 大贏家再進場：站回此 EMA 才補訊號（預設 EMA20）
+    atr_target_pct: float = 0.0,          # ATR 反比定倉：目標 ATR%（0=停用）；此 ATR% 的股票享完整倉位
+    atr_pos_max_mult: float = 1.0,        # ATR 反比定倉：低波動股最大倍率（1.0=不放大）
 ) -> list[dict]:
     """
     逐日掃描 df，在 start~end 範圍內模擬進出場。
@@ -825,6 +827,7 @@ def simulate_trades(
                     "trust_net": position.get("trust_net"),
                     "chip_score": position.get("chip_score", 0.5),
                     "vol_surge_score": position.get("vol_surge_score", 1.0),
+                    "atr_pct_at_entry": position.get("atr_pct_at_entry", 0.0),
                 })
                 if exit_reason in ("停損", "停損(跳空)") and loss_cooldown_days > 0:
                     from datetime import timedelta
@@ -871,6 +874,7 @@ def simulate_trades(
                         "day_volume": position.get("day_volume", 0),
                         "chip_score": position.get("chip_score", 0.5),
                         "rank_score": position.get("rank_score", 0.0),
+                        "atr_pct_at_entry": position.get("atr_pct_at_entry", 0.0),
                         "is_pyramid": True,
                         "pyramid_level": 1 if _pkey == "pyramid" else 2,
                     })
@@ -1069,6 +1073,10 @@ def simulate_trades(
             else:
                 stop = entry_price * (1 - stop_loss_pct)
             target = entry_price * (1 + take_profit_pct)
+            _atr_pct_entry = 0.0
+            if (_atr14_arr is not None and i < len(_atr14_arr)
+                    and _atr14_arr[i] > 0 and entry_price > 0):
+                _atr_pct_entry = (_atr14_arr[i] / entry_price) * 100
 
             # 開盤跳空過濾：次日開盤跳空 >= threshold 視為噴出，跳過進場
             # 與 live 的 _is_gap_up_blocked 邏輯一致（回測無法確認量能，保守全跳）
@@ -1244,6 +1252,7 @@ def simulate_trades(
                 "foreign_streak":       _chip.get("foreign_streak", 0),
                 "chip_score":           _calc_chip_score(_chip),
                 "vol_surge_score":      round(vol_surge_score, 2),
+                "atr_pct_at_entry":     round(_atr_pct_entry, 3),
             }
 
     return trades
@@ -1258,13 +1267,16 @@ def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
                    dev_low_pct: float = 0.15, dev_high_mult: float = 1.4,
                    rs_score: float = 0.0,
                    rs_pos_high_thr: float = 0.0, rs_pos_high_mult: float = 1.3,
-                   rs_pos_low_thr: float = 0.0,  rs_pos_low_mult: float = 0.8) -> float:
+                   rs_pos_low_thr: float = 0.0,  rs_pos_low_mult: float = 0.8,
+                   atr_pct: float = 0.0, atr_target_pct: float = 0.0,
+                   atr_pos_max_mult: float = 1.0) -> float:
     """
     根據進場當下 EMA20 乖離率決定倉位：
       乖離 < dev_low_thr  → 縮倉 dev_low_pct（貼近 EMA，動能不足）
       乖離 > dev_high_thr → 加碼 position_pct × dev_high_mult（強動能，上限 50%）
       中間               → 標準 position_pct
     可選 RS 調倉：RS >= rs_pos_high_thr 加倉，RS < rs_pos_low_thr 縮倉
+    可選 ATR 反比定倉：atr_target_pct > 0 時，按波動率縮放倉位使每筆預期波動金額一致
     """
     if dev_low_thr > 0 and ema_dev < dev_low_thr:
         base = capital * dev_low_pct
@@ -1276,6 +1288,9 @@ def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
         base = min(base * rs_pos_high_mult, capital * 0.50)
     elif rs_pos_low_thr > 0 and rs_score < rs_pos_low_thr:
         base *= rs_pos_low_mult
+    if atr_target_pct > 0 and atr_pct > 0:
+        atr_mult = min(atr_target_pct / atr_pct, atr_pos_max_mult)
+        base *= atr_mult
     return base
 
 
@@ -1444,6 +1459,8 @@ def portfolio_simulation(
     regime_rs_thr_weak: float = 0.0,    # 0050 20日報酬 < 此值 → 弱勢市況，收緊門檻（0=停用）
     regime_score_strong: float = 0.36,  # 強勢市況時的 min_rank_score
     regime_score_weak: float = 0.41,    # 弱勢市況時的 min_rank_score
+    atr_target_pct: float = 0.0,        # ATR 反比定倉：目標 ATR%（0=停用）
+    atr_pos_max_mult: float = 1.0,      # ATR 反比定倉：低波動股最大倍率
 ) -> dict:
     """
     依時間順序分配資金，計算每筆實際買幾張、損益金額，以及最終資金與最大回撤。
@@ -1764,7 +1781,10 @@ def portfolio_simulation(
                                dev_low_thr, dev_high_thr, dev_low_pct, dev_high_mult,
                                rs_score=trade.get("rs_score", 0.0),
                                rs_pos_high_thr=rs_pos_high_thr, rs_pos_high_mult=rs_pos_high_mult,
-                               rs_pos_low_thr=rs_pos_low_thr,   rs_pos_low_mult=rs_pos_low_mult)
+                               rs_pos_low_thr=rs_pos_low_thr,   rs_pos_low_mult=rs_pos_low_mult,
+                               atr_pct=trade.get("atr_pct_at_entry", 0.0),
+                               atr_target_pct=atr_target_pct,
+                               atr_pos_max_mult=atr_pos_max_mult)
         if is_pyramid:
             alloc *= pyramid_alloc_pct  # 加碼用半倉（或自訂比例）
         price = trade["entry_price"]
@@ -2404,6 +2424,10 @@ def main():
                         help="拉回進場：ema_dev 上限（預設 0.038，略低於 min_ema_dev=0.04）")
     parser.add_argument("--vol-min-ratio", type=float, default=None,
                         help="量能最低比率（相對5日均量）；預設 0.7，1.0=要求當日量超過均量")
+    parser.add_argument("--atr-target-pct", type=float, default=None,
+                        help="ATR 反比定倉：目標 ATR%%（e.g. 5.0=5%%）；此波動率的股票享完整倉位，更高波動自動縮倉（0=停用）")
+    parser.add_argument("--atr-pos-max-mult", type=float, default=1.0,
+                        help="ATR 反比定倉：低波動股最大倍率（預設 1.0=不放大；設 1.5 允許低波動股用 1.5x 倉位）")
     parser.add_argument("--trail-step-gains", type=float, nargs="+", default=None,
                         metavar="PCT",
                         help="獲利梯度收緊觸發點（漲幅），e.g. 0.5 1.0 2.0（50%%/100%%/200%%）")
@@ -2955,6 +2979,8 @@ def main():
                 trail_ema_exit_rs_thr=args.trail_ema_exit_rs_thr if hasattr(args, "trail_ema_exit_rs_thr") else 0.15,
                 reentry_proven_win_gain=args.reentry_proven_win_gain if hasattr(args, "reentry_proven_win_gain") else 0.0,
                 reentry_ema_period=args.reentry_ema_period if hasattr(args, "reentry_ema_period") else 20,
+                atr_target_pct=args.atr_target_pct if hasattr(args, "atr_target_pct") and args.atr_target_pct else 0.0,
+                atr_pos_max_mult=args.atr_pos_max_mult if hasattr(args, "atr_pos_max_mult") else 1.0,
             )
             for t in trades:
                 t["name"] = stock_meta.get(code, "")
@@ -3111,6 +3137,8 @@ def main():
         regime_rs_thr_weak=getattr(args, "regime_rs_thr_weak", 0.0),
         regime_score_strong=getattr(args, "regime_score_strong", 0.36),
         regime_score_weak=getattr(args, "regime_score_weak", 0.41),
+        atr_target_pct=getattr(args, "atr_target_pct", None) or 0.0,
+        atr_pos_max_mult=getattr(args, "atr_pos_max_mult", 1.0),
     )
 
     taken_df = pd.DataFrame(psim["taken_trades"]) if psim["taken_trades"] else pd.DataFrame()

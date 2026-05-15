@@ -72,4 +72,5 @@
   --stop-atr-mult           2.5 \
   --min-rank-score          0.38 \
   --d10-exit-pct            0.03 \
+  --atr-target-pct          4.0 \
   "$@"
