@@ -60,6 +60,8 @@ quick_order.py Interactive manual order testing
 
 ### Shared Infrastructure (`shared/`)
 
+**Broker / data / notifications (live trading)**
+
 | Module | Purpose |
 |--------|---------|
 | `broker.py` | Shioaji API wrapper: connect, place orders, subscribe ticks |
@@ -71,6 +73,19 @@ quick_order.py Interactive manual order testing
 | `notifier.py` | LINE Notify + Telegram, non-blocking background thread |
 | `market_schedule.py` | Taiwan trading hours (09:00–13:30) + 2025–2026 holiday calendar |
 | `exdiv_checker.py` | Ex-dividend date tracking |
+
+**Strategy logic (shared by `backtest.py` and `tech/main.py`)**
+
+| Module | Purpose |
+|--------|---------|
+| `exit_manager.py` | All exit rules: `ExitConfig` / `ExitState` / `BarContext` / `ExitManager`. Priority: gap-stop → intra-day stop → trail/fixed-TP → max_hold → vol_surge → D10 → early_exit → time_stop → last_bar |
+| `rank_scorer.py` | `trade_rank_score()` — multi-factor signal ranking (confidence, RS, EMA-dev, chip, vol_surge) |
+| `chip_analysis.py` | `get_chip_on_date()` + `calc_chip_score()` — institutional data lookup with short_util, margin_balance |
+| `market_scoring.py` | `rs_to_score()`, `ema_dev_to_score()`, `sweet_spot_score()`, `clamp01()` — pure scoring helpers |
+| `revenue_filter.py` | Monthly revenue YoY/MoM from DB (`monthly_revenue` table). `revenue_passes_filter()` respects Taiwan 10-day announcement rule |
+| `sector_rs.py` | `build_sector_rs_map()` — industry-group RS vs 0050. `sector_passes_filter()` for entry filtering |
+| `position_sizing.py` | `calc_position_pct()` — ATR-inverse sizing (`atr_target_pct`) |
+| `db_selector.py` | DuckDB vs API backend selector for K-bar fetching |
 
 ### Tech Strategy Flow (`tech/main.py`)
 
@@ -133,6 +148,30 @@ Runtime data (excluded from git):
 - `tech/data/heartbeat.json` / `value/data/heartbeat.json` — status written every 30 min
 - `tech/logs/trading.log` / `value/logs/trading.log` — rotating logs (10 MB × 5)
 - `certs/` — CA certificates for live trading
+
+Static DB:
+- `data/stocks.db` — DuckDB (NOT SQLite), ~3.8 GB. Tables: `daily_prices`, `institutional_net`, `foreign_holding`, `margin_balance`, `monthly_revenue`, `quarterly_eps`, `stocks`, `universe_snapshots`, `pe_pb_history`, `db_meta`. Connect with `duckdb.connect("data/stocks.db", read_only=True)`.
+- `data/finmind_tokens.md` — FinMind API tokens (NOT committed, local only)
+
+## Data Update
+
+```bash
+bash update_data.sh daily    # TWSE daily prices + institutional (chip) for today
+bash update_data.sh weekly   # daily + FinMind chip (current year) + perstock (revenue/EPS)
+bash update_data.sh monthly  # weekly + MOPS balance sheet
+bash update_data.sh full     # everything from scratch
+python3 build_db.py --update # rebuild K-bars in stocks.db (run after update_data.sh)
+```
+
+## Backtest
+
+Full baseline command (CAGR ~+32–40% depending on end date):
+```bash
+bash run_backtest_db100.sh
+```
+Key parameters: `--trail-stop 0.15 --trail-stop-bull 0.18 --trail-stop-rs-bonus 0.08 --min-rs 0.13 --atr-target-pct 5.0 --stop-atr-mult 2.5 --d10-exit-pct 0.03 --time-stop-days 20 --max-positions 4 --position-pct 0.25`
+
+Results logged to `backtest_runs/` (CSV) and `backtest_history.md`. Optimization notes in `OPTIMIZATION_LOG.md`.
 
 ## Taiwan Market Specifics
 
