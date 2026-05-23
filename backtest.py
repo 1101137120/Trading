@@ -40,6 +40,19 @@ from shared.db_selector import (
     fetch_code_close_history as _fetch_code_close_history,
     resolve_db_backend as _resolve_db_backend,
 )
+from shared.market_scoring import (
+    clamp01 as _clamp01,
+    safe_float as _safe_float,
+    rs_to_score as _rs_to_score,
+    ema_dev_to_score as _ema_dev_to_score,
+    sweet_spot_score as _sweet_spot_score,
+)
+from shared.chip_analysis import (
+    get_chip_on_date as _get_chip_on_date_fn,
+    calc_chip_score as _calc_chip_score,
+)
+from shared.rank_scorer import trade_rank_score as _trade_rank_score
+from shared.exit_manager import ExitConfig, ExitState, BarContext, ExitManager
 from tech.strategies.engine import StrategyEngine
 from tech.strategies.base import Signal as _ReentrySignal
 
@@ -454,61 +467,35 @@ def simulate_trades(
                 _chip_by_date[_d] = _row.to_dict()
 
     def _get_chip_on_date(d) -> dict:
-        """取 d 當日或之前最近一筆籌碼資料（最多往前找 7 日）"""
-        if not _chip_by_date:
-            return {}
-        available = [k for k in _chip_by_date if k <= d]
-        if not available:
-            return {}
-        last_d = max(available)
-        if (d - last_d).days > 7:
-            return {}
-        row = _chip_by_date[last_d]
-        sorted_dates = sorted(k for k in _chip_by_date if k <= d)
-        tail_dates = sorted_dates[-5:]
-        f_streak = 0
-        for _td in reversed(tail_dates):
-            if (_chip_by_date[_td].get("foreign_net") or 0) > 0:
-                f_streak += 1
-            else:
-                break
-        t_streak = 0
-        for _td in reversed(tail_dates):
-            if (_chip_by_date[_td].get("trust_net") or 0) > 0:
-                t_streak += 1
-            else:
-                break
-        _sl = row.get("short_limit")
-        _sb = row.get("short_balance")
-        _short_util = (_sb / _sl) if (_sl and _sl > 0 and _sb is not None) else None
-        return {
-            "foreign_net":        row.get("foreign_net"),
-            "trust_net":          row.get("trust_net"),
-            "margin_balance":     row.get("margin_balance"),
-            "short_balance":      _sb,
-            "short_limit":        _sl,
-            "short_util":         _short_util,   # 融券使用率 = short_balance / short_limit
-            "margin_short_ratio": row.get("margin_short_ratio"),
-            "holding_pct":        row.get("holding_pct"),
-            "foreign_streak":     f_streak,
-            "trust_streak":       t_streak,
-        }
+        return _get_chip_on_date_fn(_chip_by_date, d)
 
-    def _calc_chip_score(chip: dict) -> float:
-        """
-        組合籌碼排名分數 (0~1，高=好)：
-        - short_util 低 → 好（無人做空）：0%→1.0, 8%→0.47, ≥15%→0.0
-        - foreign_net 正 → 好（外資買超）：>2000張→1.0, 0→0.5, <-2000張→0.0
-        沒有資料的訊號跳過，全無資料回傳 0.5（中性，不影響排名）。
-        """
-        parts = []
-        _su = chip.get("short_util")
-        if _su is not None:
-            parts.append(max(0.0, 1.0 - _su / 0.15))
-        _fn = chip.get("foreign_net")
-        if _fn is not None:
-            parts.append(min(1.0, max(0.0, (_fn + 2000) / 4000)))
-        return sum(parts) / len(parts) if parts else 0.5
+    # ExitManager 建立（每支股票一個實例，配置來自 simulate_trades 參數）
+    _exit_cfg = ExitConfig(
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
+        trail_stop_pct=trail_stop_pct,
+        trail_activation_pct=trail_activation_pct,
+        trail_stop_bull_pct=trail_stop_bull_pct,
+        trail_stop_rs_bonus=trail_stop_rs_bonus,
+        trail_atr_mult=trail_atr_mult,
+        trail_atr_floor=trail_atr_floor,
+        time_stop_days=time_stop_days,
+        time_stop_min_pct=time_stop_min_pct,
+        early_exit_days=early_exit_days,
+        early_exit_lag=early_exit_lag,
+        d10_exit_pct=d10_exit_pct,
+        max_hold_days=max_hold_days,
+        vol_surge_fail_days=vol_surge_fail_days,
+        vol_surge_fail_pct=vol_surge_fail_pct,
+        vol_surge_entry_min=vol_surge_entry_min,
+        trail_ema_exit_gain=trail_ema_exit_gain,
+        trail_ema_exit_period=trail_ema_exit_period,
+        trail_ema_exit_rs_thr=trail_ema_exit_rs_thr,
+        stop_atr_mult=stop_atr_mult,
+        slippage_pct=slippage_pct,
+    )
+    _exit_mgr = ExitManager(_exit_cfg)
+    _exit_state: "ExitState | None" = None
 
     # 預先建立 0050 日期 -> 是否可做多 的 lookup
     market_allow: dict[date, bool] = {}
@@ -580,10 +567,15 @@ def simulate_trades(
             # ── 除息調整（須在停損檢查前執行，避免除息跌幅誤觸停損）──
             _div_today = _divs.get(row_date, 0.0)
             if _div_today > 0:
-                position["accumulated_div"] = position.get("accumulated_div", 0.0) + _div_today
-                position["stop"]       -= _div_today   # 停損線隨除息下移
-                position["target"]     -= _div_today   # 停利目標同步下移
-                position["peak_price"] -= _div_today   # 追蹤停利高點同步下移（等效調整）
+                _exit_state.accumulated_div += _div_today
+                _exit_state.stop       -= _div_today
+                _exit_state.target     -= _div_today
+                _exit_state.peak_price -= _div_today
+                # 同步回 position dict（供出場記錄使用）
+                position["accumulated_div"] = _exit_state.accumulated_div
+                position["stop"]       = _exit_state.stop
+                position["target"]     = _exit_state.target
+                position["peak_price"] = _exit_state.peak_price
 
             # ── 當日流動性滑價（出場用）──
             _day_vol = float(df["Volume"].iloc[i])
@@ -591,171 +583,119 @@ def simulate_trades(
 
             open_price = float(df["Open"].iloc[i])
             low_price  = float(df["Low"].iloc[i])
-            exit_reason = None
-            exit_price  = None
 
-            # 1. Gap stop：開盤已跳空穿停損線 → 以開盤成交（最壞情況）
-            if open_price > 0 and open_price <= position["stop"]:
-                exit_price  = open_price * (1 - _eff_exit_slip)
-                exit_reason = "停損(跳空)"
+            # 追蹤停利用 EMA（按需計算，避免每 bar 都算）
+            _ema_trail_val = 0.0
+            if trail_ema_exit_gain > 0:
+                _pnl_now = (current_price - _exit_state.entry_price) / _exit_state.entry_price
+                if _pnl_now >= trail_ema_exit_gain:
+                    _close_so_far = df["Close"].astype(float).iloc[: i + 1]
+                    _ema_trail_val = _close_so_far.ewm(
+                        span=trail_ema_exit_period, adjust=False
+                    ).mean().iloc[-1]
+
+            # 大盤當日收盤（early_exit 用）
+            _mp_cur = bisect.bisect_right(_mkt_dates, row_date) - 1
+            _mkt_close_cur = _mkt_closes[_mp_cur] if (_mkt_closes and _mp_cur >= 0) else 0.0
+
+            # ATR%（trail_atr_mult 用）
+            _bar_atr_pct = 0.0
+            if (trail_atr_mult > 0 and _atr14_arr is not None
+                    and i < len(_atr14_arr) and current_price > 0):
+                _bar_atr_pct = _atr14_arr[i] / current_price
+
+            bar_ctx = BarContext(
+                idx=i,
+                row_date=row_date,
+                open_price=open_price,
+                high_price=float(df["High"].iloc[i]),
+                low_price=low_price,
+                close_price=current_price,
+                slippage_pct=_eff_exit_slip,
+                is_bull=market_bull.get(row_date, False),
+                atr_pct=_bar_atr_pct,
+                ema_trail_value=_ema_trail_val,
+                mkt_close=_mkt_close_cur,
+                is_last_bar=(row_date == end or i == len(df) - 1),
+            )
+
+            # peak / trail activation 更新
+            _exit_mgr.update_peak(_exit_state, bar_ctx)
+            position["peak_price"] = _exit_state.peak_price
+            position["peak_idx"]   = _exit_state.peak_idx
+            position["peak_date"]  = _exit_state.peak_date
+            position["trail_activated_idx"] = _exit_state.trail_activated_idx
+
+            pnl_pct_cur = (current_price - _exit_state.entry_price) / _exit_state.entry_price
+
+            # 贏家加碼偵測
+            _pyr_level = position.get("pyramid_level", 0)
+            _pyr_cap = pyramid_max_times if (pyramid_use_ema and pyramid_max_times > 0) else 2
+            if _pyr_level < _pyr_cap and i + 1 < len(df):
+                trigger = False
+
+                if pyramid_use_ema:
+                    # EMA 回檔模式：每次回踩月線都可觸發，不限第幾次
+                    if pnl_pct_cur >= pyramid_min_gain:
+                        _close_so_far = df["Close"].astype(float).iloc[: i + 1]
+                        _ema_now = _close_so_far.ewm(
+                            span=pyramid_ema_period, adjust=False
+                        ).mean().iloc[-1]
+                        if _ema_now > 0:
+                            _dev = (current_price - _ema_now) / _ema_now
+                            if 0 <= _dev <= pyramid_pullback_pct:
+                                trigger = True
+                elif _pyr_level == 0 and pyramid_gain_pct > 0:
+                    # 固定漲幅第一次加碼
+                    if pnl_pct_cur >= pyramid_gain_pct:
+                        trigger = True
+                elif _pyr_level == 1 and pyramid_gain2_pct > 0:
+                    # 固定漲幅第二次加碼（含 RS 確認）
+                    if pnl_pct_cur >= pyramid_gain2_pct:
+                        trigger = True
+                        if pyramid_rs_min > 0 and _mkt_dates:
+                            _lookback = 20
+                            _stock_closes = df["Close"].astype(float)
+                            if i >= _lookback:
+                                _stk_ret = float(
+                                    (_stock_closes.iloc[i] - _stock_closes.iloc[i - _lookback])
+                                    / _stock_closes.iloc[i - _lookback]
+                                ) if _stock_closes.iloc[i - _lookback] > 0 else 0.0
+                                _rd = row_date
+                                _rd_idx = next(
+                                    (k for k, d in enumerate(_mkt_dates) if d >= _rd),
+                                    len(_mkt_dates) - 1
+                                )
+                                if _rd_idx >= _lookback and _mkt_closes[_rd_idx - _lookback] > 0:
+                                    _mkt_ret_now = (
+                                        _mkt_closes[_rd_idx] - _mkt_closes[_rd_idx - _lookback]
+                                    ) / _mkt_closes[_rd_idx - _lookback]
+                                else:
+                                    _mkt_ret_now = 0.0
+                                _rs_now = _stk_ret - _mkt_ret_now
+                                if _rs_now < pyramid_rs_min:
+                                    trigger = False
+
+                if trigger:
+                    position["pyramid_level"] = _pyr_level + 1
+                    _key = "pyramid" if _pyr_level == 0 else f"pyramid{_pyr_level + 1}"
+                    position[f"{_key}_date"]  = df["ts"].iloc[i + 1].date()
+                    nxt_open = float(df["Open"].iloc[i + 1])
+                    position[f"{_key}_price"] = nxt_open * (1 + slippage_pct)
+            # 向後相容：舊欄位
+            if position.get("pyramid_done") and not position.get("pyramid_level"):
+                position["pyramid_level"] = 1
+
+            # ── 出場判斷（委託 ExitManager）──
+            _exit_result = _exit_mgr.check(_exit_state, bar_ctx)
+            if _exit_result:
+                exit_price  = _exit_result.exit_price
+                exit_reason = _exit_result.reason
             else:
-                # 更新最高價（追蹤停利用）
-                if current_price > position["peak_price"]:
-                    position["peak_price"] = current_price
-                    position["peak_idx"]   = i
-                    position["peak_date"]  = row_date
-
-                pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
-
-                # 追蹤停利啟動偵測（記錄首次達到啟動門檻的 index）
-                if (position["trail_activated_idx"] == -1
-                        and trail_stop_pct > 0
-                        and pnl_pct_cur >= trail_activation_pct):
-                    position["trail_activated_idx"] = i
-
-                # 贏家加碼偵測
-                _pyr_level = position.get("pyramid_level", 0)
-                _pyr_cap = pyramid_max_times if (pyramid_use_ema and pyramid_max_times > 0) else 2
-                if _pyr_level < _pyr_cap and i + 1 < len(df):
-                    trigger = False
-
-                    if pyramid_use_ema:
-                        # EMA 回檔模式：每次回踩月線都可觸發，不限第幾次
-                        if pnl_pct_cur >= pyramid_min_gain:
-                            _close_so_far = df["Close"].astype(float).iloc[: i + 1]
-                            _ema_now = _close_so_far.ewm(
-                                span=pyramid_ema_period, adjust=False
-                            ).mean().iloc[-1]
-                            if _ema_now > 0:
-                                _dev = (current_price - _ema_now) / _ema_now
-                                if 0 <= _dev <= pyramid_pullback_pct:
-                                    trigger = True
-                    elif _pyr_level == 0 and pyramid_gain_pct > 0:
-                        # 固定漲幅第一次加碼
-                        if pnl_pct_cur >= pyramid_gain_pct:
-                            trigger = True
-                    elif _pyr_level == 1 and pyramid_gain2_pct > 0:
-                        # 固定漲幅第二次加碼（含 RS 確認）
-                        if pnl_pct_cur >= pyramid_gain2_pct:
-                            trigger = True
-                            if pyramid_rs_min > 0 and _mkt_dates:
-                                _lookback = 20
-                                _stock_closes = df["Close"].astype(float)
-                                if i >= _lookback:
-                                    _stk_ret = float(
-                                        (_stock_closes.iloc[i] - _stock_closes.iloc[i - _lookback])
-                                        / _stock_closes.iloc[i - _lookback]
-                                    ) if _stock_closes.iloc[i - _lookback] > 0 else 0.0
-                                    _rd = row_date
-                                    _rd_idx = next(
-                                        (k for k, d in enumerate(_mkt_dates) if d >= _rd),
-                                        len(_mkt_dates) - 1
-                                    )
-                                    if _rd_idx >= _lookback and _mkt_closes[_rd_idx - _lookback] > 0:
-                                        _mkt_ret_now = (
-                                            _mkt_closes[_rd_idx] - _mkt_closes[_rd_idx - _lookback]
-                                        ) / _mkt_closes[_rd_idx - _lookback]
-                                    else:
-                                        _mkt_ret_now = 0.0
-                                    _rs_now = _stk_ret - _mkt_ret_now
-                                    if _rs_now < pyramid_rs_min:
-                                        trigger = False
-
-                    if trigger:
-                        position["pyramid_level"] = _pyr_level + 1
-                        _key = "pyramid" if _pyr_level == 0 else f"pyramid{_pyr_level + 1}"
-                        position[f"{_key}_date"]  = df["ts"].iloc[i + 1].date()
-                        nxt_open = float(df["Open"].iloc[i + 1])
-                        position[f"{_key}_price"] = nxt_open * (1 + slippage_pct)
-                # 向後相容：舊欄位
-                if position.get("pyramid_done") and not position.get("pyramid_level"):
-                    position["pyramid_level"] = 1
-
-                # 2. 盤中觸停損（用 Low 近似，假設在停損價成交）
-                if low_price > 0 and low_price <= position["stop"]:
-                    exit_price  = position["stop"] * (1 - _eff_exit_slip)
-                    exit_reason = "停損"
-                elif trail_stop_pct > 0:
-                    # 追蹤停利模式：漲幅達 trail_activation_pct 後才啟動
-                    if pnl_pct_cur >= trail_activation_pct:
-                        # ATR 比例追蹤停損 or 固定追蹤停損
-                        if (trail_atr_mult > 0 and _atr14_arr is not None
-                                and i < len(_atr14_arr) and current_price > 0):
-                            _cur_atr_pct = _atr14_arr[i] / current_price
-                            eff_trail = max(trail_atr_floor, _cur_atr_pct * trail_atr_mult)
-                        else:
-                            is_bull = market_bull.get(row_date, False)
-                            eff_trail = (trail_stop_bull_pct
-                                         if (is_bull and trail_stop_bull_pct > 0)
-                                         else trail_stop_pct)
-                        # 強勢個股加成：RS > 0.1 再多給一點空間
-                        rs = position.get("rs_score", 0.0)
-                        if trail_stop_rs_bonus > 0 and rs > 0.1:
-                            eff_trail += trail_stop_rs_bonus
-                        # 大贏家 EMA 停利：獲利超門檻後改用 EMA 跌破出場
-                        # 強勢股（RS > trail_ema_exit_rs_thr）保留原 trail，不受 EMA 停利干擾
-                        _ema_exit_triggered = False
-                        if (trail_ema_exit_gain > 0
-                                and pnl_pct_cur >= trail_ema_exit_gain
-                                and trail_ema_exit_period > 0
-                                and rs <= trail_ema_exit_rs_thr):
-                            _close_so_far = df["Close"].astype(float).iloc[: i + 1]
-                            _ema_exit = _close_so_far.ewm(
-                                span=trail_ema_exit_period, adjust=False
-                            ).mean().iloc[-1]
-                            if current_price < _ema_exit:
-                                exit_price  = current_price * (1 - _eff_exit_slip)
-                                exit_reason = "EMA停利"
-                                _ema_exit_triggered = True
-                        if not _ema_exit_triggered:
-                            trail_floor = position["peak_price"] * (1 - eff_trail)
-                            if current_price <= trail_floor:
-                                exit_price  = current_price * (1 - _eff_exit_slip)
-                                exit_reason = "追蹤停利"
-                elif current_price >= position["target"]:
-                    # 固定停利（僅在未使用追蹤停利時有效）
-                    exit_price  = current_price * (1 - _eff_exit_slip)
-                    exit_reason = "停利"
+                exit_price  = None
+                exit_reason = None
 
             hold = (row_date - position["entry_date"]).days
-            if exit_reason is None:
-                pnl_pct_cur = (current_price - position["entry_price"]) / position["entry_price"]
-                if max_hold_days > 0 and hold >= max_hold_days:
-                    exit_price  = current_price * (1 - _eff_exit_slip)
-                    exit_reason = "到期出場"
-                elif (vol_surge_fail_days > 0
-                      and position.get("vol_surge_score", 1.0) >= vol_surge_entry_min
-                      and hold <= vol_surge_fail_days
-                      and pnl_pct_cur <= -vol_surge_fail_pct):
-                    # 暴量進場後快速反跌 → 假突破/出貨，早出止損
-                    exit_price  = current_price * (1 - _eff_exit_slip)
-                    exit_reason = "暴量反轉"
-                elif (d10_exit_pct > 0
-                      and (i - position["entry_idx"]) == 10
-                      and pnl_pct_cur < -d10_exit_pct
-                      and position["trail_activated_idx"] == -1):
-                    # D10 早出場：第10交易日仍深度虧損（追蹤停利未啟動）→ 進場錯誤，直接出
-                    exit_price  = current_price * (1 - _eff_exit_slip)
-                    exit_reason = "D10停損"
-                elif (early_exit_days > 0 and hold >= early_exit_days
-                      and pnl_pct_cur < 0 and _mkt_dates):
-                    # 早出場：持倉 N 天仍虧損且跑輸大盤超過門檻 → 廢訊號，不必等時間停損
-                    mkt_entry = position.get("mkt_close_at_entry")
-                    if mkt_entry and mkt_entry > 0:
-                        _mp = bisect.bisect_right(_mkt_dates, row_date) - 1
-                        if _mp >= 0:
-                            mkt_ret = (_mkt_closes[_mp] - mkt_entry) / mkt_entry
-                            if pnl_pct_cur - mkt_ret < -early_exit_lag:
-                                exit_price  = current_price * (1 - _eff_exit_slip)
-                                exit_reason = "時間停損(跑輸大盤)"
-                elif (time_stop_days > 0 and hold >= time_stop_days
-                      and pnl_pct_cur < time_stop_min_pct):
-                    # 持倉超過 N 天但漲幅未達門檻 → 佔位不賺，強制出場
-                    exit_price  = current_price * (1 - _eff_exit_slip)
-                    exit_reason = "時間停損"
-                elif row_date == end or i == len(df) - 1:
-                    exit_price  = current_price * (1 - _eff_exit_slip)
-                    exit_reason = "回測結束"
 
             if exit_reason:
                 _ep  = position["entry_price"]
@@ -892,6 +832,7 @@ def simulate_trades(
                         and pnl_pct >= reentry_proven_win_gain):
                     _proven_winner = True
                 position = None
+                _exit_state = None
             continue  # 持倉中不找新訊號
 
         # ── 空倉：大盤過濾 ──
@@ -1261,6 +1202,21 @@ def simulate_trades(
                 "vol_surge_score":      round(vol_surge_score, 2),
                 "atr_pct_at_entry":     round(_atr_pct_entry, 3),
             }
+            _exit_state = ExitState(
+                entry_price=entry_price,
+                entry_date=next_date,
+                entry_idx=i + 1,
+                stop=stop,
+                target=target,
+                peak_price=entry_price,
+                peak_idx=i + 1,
+                peak_date=next_date,
+                rs_score=rs_score,
+                trail_activated_idx=-1,
+                vol_surge_score=round(vol_surge_score, 2),
+                accumulated_div=0.0,
+                mkt_close_at_entry=mkt_close_at_entry or 0.0,
+            )
 
     return trades
 
@@ -1301,109 +1257,6 @@ def _resolve_alloc(capital: float, ema_dev: float, position_pct: float,
     return base
 
 
-def _clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
-
-
-def _safe_float(v, default: float = 0.0) -> float:
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return default
-
-
-def _rs_to_score(rs: float, rs_center: float = 0.05, rs_span: float = 0.25) -> float:
-    if rs_span <= 0:
-        return _clamp01(rs)
-    return _clamp01((rs - rs_center) / rs_span)
-
-
-def _ema_dev_to_score(dev: float, sweet_spot: float = 0.05, tolerance: float = 0.03) -> float:
-    if tolerance <= 0:
-        return 0.0
-    distance = abs(dev - sweet_spot)
-    return _clamp01(1.0 - distance / tolerance)
-
-
-def _sweet_spot_score(v: float, sweet_spot: float, tolerance: float, default: float = 0.5) -> float:
-    if v is None:
-        return default
-    if tolerance <= 0:
-        return default
-    distance = abs(float(v) - sweet_spot)
-    return _clamp01(1.0 - distance / tolerance)
-
-
-def _trade_rank_score(
-    trade: dict,
-    rank_mode: str = "confidence",
-    rank_w_conf: float = 0.35,
-    rank_w_rs: float = 0.45,
-    rank_w_dev: float = 0.20,
-    rank_w_rs_sweet: float = 0.0,
-    rank_w_breadth: float = 0.0,
-    rank_w_chip: float = 0.0,
-    rank_w_vol_surge: float = 0.0,
-    rank_rs_center: float = 0.05,
-    rank_rs_span: float = 0.25,
-    rank_rs_sweet_spot: float = 0.20,
-    rank_rs_sweet_tolerance: float = 0.10,
-    rank_dev_sweet_spot: float = 0.05,
-    rank_dev_tolerance: float = 0.03,
-    rank_breadth_sweet_spot: float = 0.60,
-    rank_breadth_tolerance: float = 0.12,
-    rank_vol_surge_sweet_spot: float = 0.75,
-    rank_vol_surge_tolerance: float = 0.50,
-) -> float:
-    conf = _clamp01(_safe_float(trade.get("confidence", 0.0)))
-    rs_raw = _safe_float(trade.get("rs_score", 0.0))
-    dev_raw = _safe_float(trade.get("ema_dev", 0.0))
-    breadth_raw = trade.get("market_breadth_at_entry", None)
-    try:
-        breadth_raw = float(breadth_raw) if breadth_raw not in ("", None) else None
-    except (TypeError, ValueError):
-        breadth_raw = None
-    rs_score = _rs_to_score(rs_raw, rs_center=rank_rs_center, rs_span=rank_rs_span)
-    rs_sweet_score = _sweet_spot_score(
-        rs_raw, sweet_spot=rank_rs_sweet_spot, tolerance=rank_rs_sweet_tolerance, default=0.5
-    )
-    dev_score = _ema_dev_to_score(dev_raw, sweet_spot=rank_dev_sweet_spot, tolerance=rank_dev_tolerance)
-    breadth_score = _sweet_spot_score(
-        breadth_raw, sweet_spot=rank_breadth_sweet_spot, tolerance=rank_breadth_tolerance, default=0.5
-    )
-    chip_score_val = _safe_float(trade.get("chip_score", 0.5))
-    # vol_surge_score: sweet spot 計分（低量進場較佳，0.75x 最高分）
-    _raw_surge = _safe_float(trade.get("vol_surge_score", 1.0))
-    vol_surge_score_val = _sweet_spot_score(
-        _raw_surge, sweet_spot=rank_vol_surge_sweet_spot,
-        tolerance=rank_vol_surge_tolerance, default=0.5
-    )
-
-    mode = (rank_mode or "confidence").lower()
-    if mode == "confidence":
-        return conf
-    if mode == "rs":
-        return rs_score
-
-    w_conf = max(0.0, rank_w_conf)
-    w_rs = max(0.0, rank_w_rs)
-    w_dev = max(0.0, rank_w_dev)
-    w_rs_sweet = max(0.0, rank_w_rs_sweet)
-    w_breadth = max(0.0, rank_w_breadth)
-    w_chip = max(0.0, rank_w_chip)
-    w_vol_surge = max(0.0, rank_w_vol_surge)
-    total_w = w_conf + w_rs + w_dev + w_rs_sweet + w_breadth + w_chip + w_vol_surge
-    if total_w <= 0:
-        return conf
-    return (
-        w_conf * conf
-        + w_rs * rs_score
-        + w_dev * dev_score
-        + w_rs_sweet * rs_sweet_score
-        + w_breadth * breadth_score
-        + w_chip * chip_score_val
-        + w_vol_surge * vol_surge_score_val
-    ) / total_w
 
 
 def portfolio_simulation(
@@ -2439,6 +2292,10 @@ def main():
                         help="ATR 比例追蹤停損：trail = max(floor, ATR%%×倍數)；e.g. 2.5 表示 ATR=6%% 的股票 trail=15%%（0=停用，用固定 trail）")
     parser.add_argument("--trail-atr-floor", type=float, default=0.08,
                         help="ATR 追蹤停損下限（預設 0.08=8%%，最窄不低於此值）")
+    parser.add_argument("--min-momentum-bars", type=int, default=0,
+                        help="短期動能：要求 signal day 收盤 > N 天前收盤（0=停用；e.g. 5=5天前）")
+    parser.add_argument("--require-bullish-candle", action="store_true", default=False,
+                        help="陽線確認：要求 signal day 收盤 > 開盤，確認當日買盤（預設關閉）")
     parser.add_argument("--weekly-ema-confirm", action="store_true", default=False,
                         help="週線 EMA 確認：日線訊號須週線 EMA5W > EMA20W 才進場")
     parser.add_argument("--weekly-ema-slow", type=int, default=20,
@@ -2561,6 +2418,10 @@ def main():
     if getattr(args, "weekly_ema_confirm", False):
         cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["weekly_ema_confirm"] = True
         cfg["strategies"]["ema_trend"]["weekly_ema_slow"] = getattr(args, "weekly_ema_slow", 20)
+    if getattr(args, "min_momentum_bars", 0) > 0:
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["min_momentum_bars"] = args.min_momentum_bars
+    if getattr(args, "require_bullish_candle", False):
+        cfg.setdefault("strategies", {}).setdefault("ema_trend", {})["require_bullish_candle"] = True
     sl  = args.stop_loss   / 100 if args.stop_loss   else base_cfg["risk"]["stop_loss_pct"]
     tp  = args.take_profit / 100 if args.take_profit else base_cfg["risk"]["take_profit_pct"]
     max_pos = args.max_positions or base_cfg.get("risk", {}).get("max_positions", 5)

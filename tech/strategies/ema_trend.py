@@ -36,6 +36,8 @@ class EmaTrendStrategy(BaseStrategy):
         self.weekly_ema_confirm = cfg.get("weekly_ema_confirm", False)  # True=週線 EMA 也須多頭排列
         self.weekly_ema_fast = cfg.get("weekly_ema_fast", 5)
         self.weekly_ema_slow = cfg.get("weekly_ema_slow", 20)
+        self.min_momentum_bars = cfg.get("min_momentum_bars", 0)  # >0: require close > close[N bars ago]
+        self.require_bullish_candle = cfg.get("require_bullish_candle", False)  # require close > open on signal day
 
     def generate_signal(self, code: str, df: pd.DataFrame) -> Optional[Signal]:
         min_rows = self.ema_slow + self.adx_period + 5
@@ -112,6 +114,16 @@ class EmaTrendStrategy(BaseStrategy):
             if prev_close > 0 and (price - prev_close) / prev_close > self.signal_day_max_gain:
                 return None
 
+        # 短期動能：signal day 收盤需高於 N 天前（過濾下行趨勢中的 EMA 假對齊）
+        if self.min_momentum_bars > 0 and len(close) > self.min_momentum_bars:
+            if close.iloc[-1] <= close.iloc[-1 - self.min_momentum_bars]:
+                return None
+
+        # 陽線確認：signal day 收盤需高於開盤（確認當日買盤）
+        if self.require_bullish_candle and "Open" in df.columns:
+            if close.iloc[-1] <= df["Open"].astype(float).iloc[-1]:
+                return None
+
         # 量能不得嚴重萎縮
         avg_vol = volume.iloc[-6:-1].mean()
         vol_ratio = volume.iloc[-1] / avg_vol if avg_vol > 0 else 1.0
@@ -152,6 +164,7 @@ class EmaTrendStrategy(BaseStrategy):
         volume = df["Volume"].astype(float)
         high   = df["High"].astype(float) if "High" in df.columns else None
         low    = df["Low"].astype(float)  if "Low"  in df.columns else None
+        open_  = df["Open"].astype(float).values if "Open" in df.columns else None
 
         ef_arr = ema(close, self.ema_fast).values
         em_arr = ema(close, self.ema_mid).values
@@ -249,6 +262,14 @@ class EmaTrendStrategy(BaseStrategy):
                 if prev_c > 0 and (price - prev_c) / prev_c > self.signal_day_max_gain:
                     continue
 
+            # 短期動能：signal day 收盤需高於 N 天前
+            if self.min_momentum_bars > 0 and i >= self.min_momentum_bars:
+                if close_v[i] <= close_v[i - self.min_momentum_bars]:
+                    continue
+            # 陽線確認：signal day 收盤需高於開盤
+            if self.require_bullish_candle and open_ is not None:
+                if close_v[i] <= open_[i]:
+                    continue
             # 量能
             avg_v = vol_ma5[i]
             vol_ratio = volume.values[i] / avg_v if (avg_v and avg_v > 0) else 1.0

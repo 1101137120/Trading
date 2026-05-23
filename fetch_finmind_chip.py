@@ -202,6 +202,17 @@ def main():
     skip = args.skip_existing and not args.no_skip
     force_years = set(args.force_years or [])
 
+    # 等 DB 寫鎖釋放
+    import duckdb as _duckdb
+    while True:
+        try:
+            _test = _duckdb.connect(str(DB_PATH))
+            _test.close()
+            break
+        except _duckdb.IOException:
+            logger.info("DB 被鎖，等 60s 後重試...")
+            time.sleep(60)
+
     # 決定股票清單
     with get_conn(DB_PATH, read_only=True) as conn:
         if args.codes:
@@ -237,10 +248,14 @@ def main():
         for year in years:
             force = year in force_years
             if skip and not force:
-                with get_conn(DB_PATH, read_only=True) as ro_conn:
-                    if _already_fetched(ro_conn, code, year):
-                        skip_cnt += 1
-                        continue
+                try:
+                    with get_conn(DB_PATH, read_only=True) as ro_conn:
+                        if _already_fetched(ro_conn, code, year):
+                            skip_cnt += 1
+                            continue
+                except Exception:
+                    # DB 被鎖時跳過 skip check，直接執行（fetch_year 本身有鎖保護）
+                    pass
 
             try:
                 ni, nm, nh = fetch_year(args.token, code, year)

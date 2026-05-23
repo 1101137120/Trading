@@ -34,9 +34,16 @@ def get_chip_on_date(chip_by_date: dict, d, lookback_days: int = 7) -> dict:
             t_streak += 1
         else:
             break
+    _sl = row.get("short_limit")
+    _sb = row.get("short_balance")
+    _short_util = (_sb / _sl) if (_sl and _sl > 0 and _sb is not None) else None
     return {
         "foreign_net":        row.get("foreign_net"),
         "trust_net":          row.get("trust_net"),
+        "margin_balance":     row.get("margin_balance"),
+        "short_balance":      _sb,
+        "short_limit":        _sl,
+        "short_util":         _short_util,
         "margin_short_ratio": row.get("margin_short_ratio"),
         "holding_pct":        row.get("holding_pct"),
         "foreign_streak":     f_streak,

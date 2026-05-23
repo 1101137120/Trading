@@ -16,7 +16,7 @@
   --stocks              80 \
   --max-price           2000 \
   --min-rs              0.13 \
-  --max-rs              0.40 \
+  --max-rs              0.45 \
   --rank-mode           hybrid \
   --rank-w-conf         0.00 \
   --rank-w-rs           0.41 \
@@ -34,7 +34,7 @@
   --early-exit-days     0 \
   --market-ma           20 \
   --time-stop-days      20 \
-  --time-stop-min-pct   0.05 \
+  --time-stop-min-pct   0.02 \
   --breadth-filter \
   --breadth-min         0.50 \
   --breadth-max         1.00 \
@@ -72,5 +72,5 @@
   --stop-atr-mult           2.5 \
   --min-rank-score          0.38 \
   --d10-exit-pct            0.03 \
-  --atr-target-pct          4.0 \
+  --atr-target-pct          5.0 \
   "$@"

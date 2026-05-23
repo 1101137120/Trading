@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 把 benchmark ETF（00631L、0050）的歷史日 K 存入 stocks.db。
-解決 backtest 每次從 yfinance live 抓導致結果不可重現的問題。
+使用 FinMind 取得未調整原始價格（無虛假分割問題）。
 
 用法：
   python update_bench_etf.py            # 更新所有 benchmark ETF
@@ -16,48 +16,42 @@ import pandas as pd
 
 CODES = ["00631L", "0050"]
 DB_PATH = Path(__file__).parent / "data" / "stocks.db"
-# 00631L 上市日期 2014-10-23；0050 從 2003 年就有，但 yfinance 有更早資料
 START_MAP = {
     "00631L": "2014-10-01",
     "0050":   "2007-01-01",
 }
 
 
-def fetch_yf(code: str, start: str) -> pd.DataFrame | None:
+def fetch_finmind(code: str, start: str) -> pd.DataFrame | None:
     try:
-        import yfinance as yf
+        from FinMind.data import DataLoader
     except ImportError:
-        print("需要安裝 yfinance：pip install yfinance")
+        print("需要安裝 FinMind：pip install FinMind tqdm")
         return None
 
-    end_str = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
-    for suffix in (".TW", ".TWO"):
-        ticker = f"{code}{suffix}"
-        try:
-            raw = yf.download(
-                ticker, start=start, end=end_str,
-                auto_adjust=False, progress=False, threads=False,
-            )
-            if raw is None or raw.empty:
-                continue
-            if isinstance(raw.columns, pd.MultiIndex):
-                raw.columns = [c[0] for c in raw.columns]
-            raw = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
-            raw.index = pd.to_datetime(raw.index)
-            raw = raw[raw["Close"] > 0].reset_index()
-            raw.rename(columns={"Date": "ts", "index": "ts"}, inplace=True)
-            if "ts" not in raw.columns:
-                raw.insert(0, "ts", raw.index)
-            raw["ts"] = pd.to_datetime(raw["ts"])
-            raw["Volume"] = (raw["Volume"] // 1000).astype(int)
-            for col in ["Open", "High", "Low", "Close"]:
-                raw[col] = raw[col].round(2)
-            print(f"  [{ticker}] 取得 {len(raw)} 筆，"
-                  f"{raw['ts'].iloc[0].date()} ~ {raw['ts'].iloc[-1].date()}")
-            return raw.sort_values("ts").reset_index(drop=True)
-        except Exception as e:
-            print(f"  [{ticker}] 失敗: {e}")
-    return None
+    end_str = date.today().strftime("%Y-%m-%d")
+    try:
+        dl = DataLoader()
+        raw = dl.taiwan_stock_daily(stock_id=code, start_date=start, end_date=end_str)
+        if raw is None or raw.empty:
+            print(f"  [{code}] FinMind 無資料")
+            return None
+
+        df = pd.DataFrame({
+            "ts":     pd.to_datetime(raw["date"]),
+            "Open":   raw["open"].astype(float).round(2),
+            "High":   raw["max"].astype(float).round(2),
+            "Low":    raw["min"].astype(float).round(2),
+            "Close":  raw["close"].astype(float).round(2),
+            "Volume": (raw["Trading_Volume"].astype(float) / 1000).round(0).astype(int),
+        })
+        df = df[df["Close"] > 0].sort_values("ts").reset_index(drop=True)
+        print(f"  [{code}] 取得 {len(df)} 筆，"
+              f"{df['ts'].iloc[0].date()} ~ {df['ts'].iloc[-1].date()}")
+        return df
+    except Exception as e:
+        print(f"  [{code}] FinMind 失敗: {e}")
+        return None
 
 
 def upsert(con: duckdb.DuckDBPyConnection, code: str, df: pd.DataFrame):
@@ -88,14 +82,12 @@ def main():
 
     for code in targets:
         print(f"\n=== {code} ===")
-        # 查 DB 目前最新日期
         row = con.execute(
             "SELECT MAX(date) FROM daily_prices WHERE code=?", [code]
         ).fetchone()
         db_max = row[0] if row and row[0] else None
 
         if db_max:
-            # 從最新日期往前 5 天重抓（避免遺漏）
             start = (
                 pd.to_datetime(db_max) - timedelta(days=5)
             ).strftime("%Y-%m-%d")
@@ -104,7 +96,7 @@ def main():
             start = START_MAP.get(code, "2009-01-01")
             print(f"  DB 無資料，從 {start} 全量抓取")
 
-        df = fetch_yf(code, start)
+        df = fetch_finmind(code, start)
         if df is None or df.empty:
             print(f"  [{code}] 無法取得資料，跳過")
             continue
